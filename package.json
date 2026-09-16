@@ -7,7 +7,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && node scripts/build-web.mjs",
-    "build:dev": "node scripts/build-web.mjs --no-minify"
+    "build:dev": "node scripts/build-web.mjs --no-minify",
+    "dev": "node scripts/build-web.mjs --watch"
   },
   "license": "ISC",
   "devDependencies": {
