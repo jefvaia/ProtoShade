@@ -184,7 +184,7 @@ Then in **Tools**:
 | Setting | Value |
 | --- | --- |
 | Board | ESP32S3 Dev Module |
-| Flash Size | **8MB** - `partitions.csv` is laid out for 8 MB and the upload fails if the table does not fit |
+| Flash Size | what your board actually has, and **at least 8MB** - `partitions.csv` covers 8 MB, so a board set to 4MB rejects the table (a 16MB board is fine, the tail is just unused) |
 | Partition Scheme | **Custom** - it uses the `partitions.csv` sitting next to the `.ino` |
 | PSRAM | whatever your board has; the framebuffers are small and stay in internal SRAM |
 
