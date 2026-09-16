@@ -127,6 +127,31 @@ void swapCanvases() {
 // Program mode: the actual face
 // ---------------------------------------------------------------------------
 
+// Frame timing, split into the two things that can be the bottleneck. If render is the big
+// number the shader is too heavy for this resolution; if panels is, the display driver is
+// holding the frame up and the extra push task is already earning its keep.
+struct Stats {
+  uint32_t frames = 0;
+  uint32_t render_us = 0;  // inside renderer.render(), both cores
+  uint32_t wait_us = 0;    // blocked in submit(), i.e. waiting for the previous push
+  uint32_t since = 0;
+} stats;
+
+float fps = 0.0f;  // last measured, also what reportStats prints
+
+void reportStats() {
+  const uint32_t now = millis();
+  const uint32_t elapsed = now - stats.since;
+  if (STATS_INTERVAL_MS == 0 || elapsed < STATS_INTERVAL_MS || stats.frames == 0) return;
+
+  fps = float(stats.frames) * 1000.0f / float(elapsed);
+  Serial.printf("stats: %.1f fps  render %.2f ms  panels %.2f ms\n", double(fps),
+                double(stats.render_us) / 1000.0 / stats.frames,
+                double(stats.wait_us) / 1000.0 / stats.frames);
+  stats = Stats{};
+  stats.since = now;
+}
+
 void renderFace() {
   readSensors(SENSORS, SENSOR_COUNT, sensorValues, SENSOR_SLOTS);
 
@@ -135,7 +160,9 @@ void renderFace() {
   const Sensors sensors{sensorValues, SENSOR_SLOTS};
   const Frame frame = runtime.beginFrame(millis(), sensors);
 
+  const uint32_t started = micros();
   const bool within_budget = renderer.render(runtime, frame, back);
+  const uint32_t rendered = micros();
   if (!within_budget) {
     Serial.println("step budget exceeded - the shader is too heavy for this frame rate");
   }
@@ -148,6 +175,12 @@ void renderFace() {
   // done, so rendering the next frame overlaps sending this one.
   pusher.submit(back);
   swapCanvases();
+
+  // micros() wraps every ~71 minutes; unsigned subtraction wraps with it and stays right.
+  stats.render_us += rendered - started;
+  stats.wait_us += micros() - rendered;
+  stats.frames++;
+  reportStats();
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +250,7 @@ void setup() {
     fail("pusher.begin() failed - out of memory?");
   }
 
+  stats.since = millis();
   Serial.printf("face running at %ux%u. Press the button within %lu s for upload mode, or\n"
                 "type u here at any time.\n",
                 CANVAS_W, CANVAS_H, (unsigned long)(UPLOAD_WINDOW_MS / 1000));

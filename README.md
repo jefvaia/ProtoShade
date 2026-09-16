@@ -266,6 +266,25 @@ power loss because it is in flash, not RAM.
 LittleFS partition, so the head serves the editor itself at `http://192.168.4.1/` with no
 computer involved. Skip it and `/upload` still works.
 
+### Frame timings
+
+Every two seconds (`STATS_INTERVAL_MS` in `head_config.h`, 0 to silence it) face mode prints:
+
+```
+stats: 143.2 fps  render 5.94 ms  panels 0.81 ms
+```
+
+Split into the two things that can be the bottleneck, because "it is slow" on its own tells
+you nothing:
+
+- **render** - inside `renderer.render()`, both cores. Big here means the shader is too
+  heavy for this canvas: fewer instructions, or fewer pixels.
+- **panels** - blocked in `pusher.submit()`, waiting for the *previous* frame to finish
+  going out. Big here means the display driver is the limit, not the shader, and the push
+  task is already doing its job of overlapping the two.
+
+Both are per frame, averaged over the window.
+
 ### The status LED
 
 The devkit's built-in RGB LED is the mode light, which is the only thing telling you

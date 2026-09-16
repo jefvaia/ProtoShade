@@ -65,7 +65,10 @@ public:
   explicit SerialDisplay(const char* name) : name_(name) {}
 
   void push(const Pixel* rgb, uint16_t width, uint16_t height) override {
-    if (++frames_ % 120 != 0) return;  // every couple of seconds, not every frame
+    // Throttled by time, not by frame count: at 200 fps a per-120-frames print is three
+    // lines a second, and it would talk over the stats line at a drifting rate.
+    if (millis() - last_ < 2000) return;
+    last_ = millis();
     uint32_t r = 0, g = 0, b = 0;
     const size_t count = size_t(width) * height;
     for (size_t i = 0; i < count; i++) {
@@ -79,7 +82,7 @@ public:
 
 private:
   const char* name_;
-  uint32_t frames_ = 0;
+  uint32_t last_ = 0;
 };
 
 // --- HUB75 over I2S DMA ----------------------------------------------------
@@ -172,6 +175,9 @@ constexpr int STATUS_LED_PIN = -1;
 #endif
 // 0..255. These are blinding at full brightness and this one sits inside a head.
 constexpr uint8_t STATUS_LED_BRIGHTNESS = 24;
+
+// How often to print frame timings on serial. 0 is silent.
+constexpr uint32_t STATS_INTERVAL_MS = 2000;
 
 // ---------------------------------------------------------------------------
 // 6. Sensors
