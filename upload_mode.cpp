@@ -19,6 +19,7 @@ const esp_partition_t* partition = nullptr;
 esp_partition_mmap_handle_t mapping = 0;
 bool mapped = false;
 String address_;
+bool last_failed = false;
 
 // Upload state. The handler is called chunk by chunk from loop(), never concurrently.
 // Named `state`, not `upload`: a variable with the same name as the enclosing namespace
@@ -230,6 +231,7 @@ void handleUploadChunk() {
 }
 
 void handleUploadDone() {
+  last_failed = state.failed || state.declared == 0;
   if (state.failed) {
     server.send(400, "text/plain", String("upload rejected: ") + state.error);
     loadProgram();  // whatever was there before, if the erase never happened
@@ -242,6 +244,7 @@ void handleUploadDone() {
   }
 
   if (!loadProgram()) {
+    last_failed = true;
     server.send(400, "text/plain",
                 String("stored, but the runtime refused it (status ") + int(runtime_->status()) +
                     "). The head is showing its test pattern.");
@@ -295,6 +298,8 @@ bool begin(ProtoShadeRuntime& runtime, const char* ap_ssid, const char* ap_passw
 }
 
 void handle() { server.handleClient(); }
+
+bool lastUploadFailed() { return last_failed; }
 
 const char* address() { return address_.c_str(); }
 

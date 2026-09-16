@@ -152,7 +152,29 @@ constexpr size_t PANEL_COUNT = sizeof(PANELS) / sizeof(PANELS[0]);
 constexpr size_t PANEL_SCRATCH_PIXELS = 64 * 32;
 
 // ---------------------------------------------------------------------------
-// 5. Sensors
+// 5. Status LED
+// ---------------------------------------------------------------------------
+//
+// The devkit's built-in RGB LED as a mode light, because a head with no panels wired yet
+// has nothing else to tell you what it is doing:
+//
+//   green   rendering your program
+//   blue    upload mode, waiting for a .bin
+//   red     something is wrong, or nothing is loaded - serial says which
+//
+// Set STATUS_LED_PIN to -1 if your board has no RGB LED, or once the panels themselves are
+// the status light.
+
+#ifdef RGB_BUILTIN
+constexpr int STATUS_LED_PIN = RGB_BUILTIN;
+#else
+constexpr int STATUS_LED_PIN = -1;
+#endif
+// 0..255. These are blinding at full brightness and this one sits inside a head.
+constexpr uint8_t STATUS_LED_BRIGHTNESS = 24;
+
+// ---------------------------------------------------------------------------
+// 6. Sensors
 // ---------------------------------------------------------------------------
 //
 // slot is the index the editor's Sensor node points at. read() returns the value in the

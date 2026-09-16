@@ -25,4 +25,8 @@ void handle();
 // Where to point a browser, once begin() has run.
 const char* address();
 
+// True when the last upload attempt was rejected. The sketch turns the status LED red on
+// it, so a refused .bin is visible from across the room and not only in a browser tab.
+bool lastUploadFailed();
+
 }  // namespace upload

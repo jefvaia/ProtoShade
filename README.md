@@ -266,9 +266,29 @@ power loss because it is in flash, not RAM.
 LittleFS partition, so the head serves the editor itself at `http://192.168.4.1/` with no
 computer involved. Skip it and `/upload` still works.
 
+### The status LED
+
+The devkit's built-in RGB LED is the mode light, which is the only thing telling you
+anything before panels are wired:
+
+| Colour | Means |
+| --- | --- |
+| green | rendering your program |
+| blue | upload mode, waiting for a `.bin` |
+| red | something is wrong, **or nothing is loaded** - serial says which |
+
+Red covers more than failures on purpose: a head running its built-in test pattern because
+no program was ever uploaded is not doing what you asked, and green should mean it is. It
+also comes on while `setup()` runs, so a board that hangs on the way up says so instead of
+sitting dark and looking dead. A heavy frame flickers it red and back; a driver that failed
+to start latches it.
+
+Pin and brightness are in `head_config.h` - set `STATUS_LED_PIN` to -1 for a board without
+one.
+
 ### Wiring a head: `head_config.h`
 
-One file per head, and `protoshade.ino` never changes. It holds five things:
+One file per head, and `protoshade.ino` never changes. It holds six things:
 
 1. **The canvas** - the whole face as one drawing, at the resolution you author at.
 2. **The button** - pin, polarity, how long the window stays open.
@@ -280,7 +300,8 @@ One file per head, and `protoshade.ino` never changes. It holds five things:
    rectangle: that is how one drawing feeds both sides of a face, mirrored. Canvas no panel
    reads is simply never displayed - nothing has to be masked off - and a panel mapped past
    the edge shows black there rather than whatever is next to the framebuffer.
-5. **The sensors** - slot number plus a function returning that sensor's value in the range
+5. **The status LED** - pin and brightness, or -1 for a board without one.
+6. **The sensors** - slot number plus a function returning that sensor's value in the range
    its Sensor node declares. A slot nothing is wired to reads 0; a slot the program wants
    but this head lacks falls back to the value baked into the `.bin`, so a half-wired head
    still renders.

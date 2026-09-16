@@ -48,6 +48,40 @@ enum class Mode : uint8_t { Face, Upload };
 Mode mode = Mode::Face;
 
 // ---------------------------------------------------------------------------
+// Status LED
+// ---------------------------------------------------------------------------
+
+enum class Status : uint8_t { Running, Upload, Error };
+
+// Latched: something is structurally wrong and will not fix itself - a driver that did not
+// start, no partition to load from. A heavy frame or a missing program is NOT latched, so
+// the light goes back to green on its own when it recovers.
+bool fault = false;
+
+void fail(const char* why) {
+  Serial.printf("error: %s\n", why);
+  fault = true;
+}
+
+// Only writes when the colour actually changes: this runs every frame, and rgbLedWrite bangs
+// out an RMT sequence each time it is called.
+void setStatus(Status status) {
+  static Status shown = Status::Running;
+  static bool written = false;
+  if (written && status == shown) return;
+  shown = status;
+  written = true;
+  if (STATUS_LED_PIN < 0) return;
+
+  const uint8_t b = STATUS_LED_BRIGHTNESS;
+  switch (status) {
+    case Status::Running: rgbLedWrite(STATUS_LED_PIN, 0, b, 0); break;
+    case Status::Upload:  rgbLedWrite(STATUS_LED_PIN, 0, 0, b); break;
+    case Status::Error:   rgbLedWrite(STATUS_LED_PIN, b, 0, 0); break;
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 bool buttonDown() {
   const int level = digitalRead(BUTTON_PIN);
@@ -101,9 +135,14 @@ void renderFace() {
   const Sensors sensors{sensorValues, SENSOR_SLOTS};
   const Frame frame = runtime.beginFrame(millis(), sensors);
 
-  if (!renderer.render(runtime, frame, back)) {
+  const bool within_budget = renderer.render(runtime, frame, back);
+  if (!within_budget) {
     Serial.println("step budget exceeded - the shader is too heavy for this frame rate");
   }
+
+  // Green means it is rendering YOUR program. A head with nothing uploaded is running the
+  // built-in test pattern, which is not the same thing and is worth a red light.
+  setStatus(fault || !within_budget || !runtime.hasProgram() ? Status::Error : Status::Running);
 
   // Hands the frame to the push task and returns; it blocks only until the PREVIOUS push is
   // done, so rendering the next frame overlaps sending this one.
@@ -125,7 +164,7 @@ void enterUploadMode() {
   renderer.end();
 
   if (!upload::begin(runtime, AP_SSID, AP_PASSWORD)) {
-    Serial.println("upload mode failed to start");
+    fail("upload mode failed to start");
   }
 }
 
@@ -145,6 +184,10 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  // Red until setup finishes: if it hangs or crashes on the way, the light says so instead
+  // of staying dark and looking like a dead board.
+  setStatus(Status::Error);
+
   pinMode(BUTTON_PIN, BUTTON_ACTIVE_LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
   delay(10);  // let the pull settle before reading it
   // Reads PRESSED with nothing touched means the pin or the polarity is wrong, and that is
@@ -156,18 +199,22 @@ void setup() {
   for (size_t i = 0; i < PANEL_COUNT; i++) {
     if (PANELS[i].display && !PANELS[i].display->begin()) {
       Serial.printf("display %u failed to start\n", unsigned(i));
+      fault = true;
     }
   }
 
   runtime.setResolution(CANVAS_W, CANVAS_H);
-  upload::loadProgramFromFlash(runtime);
+  if (!upload::loadProgramFromFlash(runtime)) {
+    // Not fatal: the head renders its test pattern and waits for you to upload something.
+    Serial.println("no program loaded - the light stays red until one is");
+  }
 
   // Nothing needs the radio to render a face, and it costs power and core 0 time.
   WiFi.mode(WIFI_OFF);
 
-  if (!renderer.begin()) Serial.println("renderer.begin() failed - out of memory?");
+  if (!renderer.begin()) fail("renderer.begin() failed - out of memory?");
   if (!pusher.begin(PANELS, PANEL_COUNT, CANVAS_W, CANVAS_H, panelScratch)) {
-    Serial.println("pusher.begin() failed - out of memory?");
+    fail("pusher.begin() failed - out of memory?");
   }
 
   Serial.printf("face running at %ux%u. Press the button within %lu s for upload mode, or\n"
@@ -178,6 +225,9 @@ void setup() {
 void loop() {
   if (mode == Mode::Upload) {
     upload::handle();
+    // Blue while it waits; red if the last .bin was refused, so you can see a bad upload
+    // without going back to the browser tab.
+    setStatus(fault || upload::lastUploadFailed() ? Status::Error : Status::Upload);
     showUploadIndicator();
     delay(10);
     return;
