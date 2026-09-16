@@ -6,8 +6,10 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "npm run typecheck && node scripts/build-web.mjs",
+    "test": "node test/graph.test.mjs && node test/crosscheck.mjs",
+    "build": "npm run typecheck && npm test && node scripts/build-web.mjs",
     "build:dev": "node scripts/build-web.mjs --no-minify",
+    "build:device": "npm run build && node scripts/build-web.mjs --device",
     "dev": "node scripts/build-web.mjs --watch"
   },
   "license": "ISC",

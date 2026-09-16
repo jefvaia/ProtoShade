@@ -11,6 +11,7 @@ export const enum Status {
   BadVersion = 4,
   BadLayout = 5,
   BadResolution = 6,
+  BadProgram = 7,
 }
 
 export interface ProtoShadeRuntime {
@@ -23,6 +24,10 @@ export interface ProtoShadeRuntime {
   width(): number;
   height(): number;
   assetCount(): number;
+  instructionCount(): number;
+  sensorCount(): number;
+  /** Sensor readings by slot, standing in for what the head's firmware supplies. */
+  setSensors(values: ArrayLike<number>): void;
   /** Render a frame at time `ms`. false means a program blew its step budget. */
   render(ms: number): boolean;
   /**

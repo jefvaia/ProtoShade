@@ -80,6 +80,79 @@ bool ParallelRenderer::render(const ProtoShadeRuntime& rt, const Frame& frame, P
   return !halves_[0].ctx.budget_exceeded && !halves_[1].ctx.budget_exceeded;
 }
 
+// ---------------------------------------------------------------------------
+// PanelPusher
+// ---------------------------------------------------------------------------
+
+bool PanelPusher::begin(const Panel* panels, size_t count, uint16_t canvas_w, uint16_t canvas_h,
+                        Pixel* scratch, BaseType_t core, uint32_t stack_words,
+                        UBaseType_t priority) {
+  if (running_) return true;
+  if (!panels || count == 0) return false;
+
+  panels_ = panels;
+  count_ = count;
+  canvas_w_ = canvas_w;
+  canvas_h_ = canvas_h;
+  scratch_ = scratch;
+  frame_ = nullptr;
+
+  start_ = xSemaphoreCreateBinary();
+  idle_ = xSemaphoreCreateBinary();
+  if (!start_ || !idle_) {
+    end();
+    return false;
+  }
+  xSemaphoreGive(idle_);  // nothing in flight yet
+
+  if (xTaskCreatePinnedToCore(taskEntry, "psh_push", stack_words, this, priority, &task_, core) !=
+      pdPASS) {
+    end();
+    return false;
+  }
+  running_ = true;
+  return true;
+}
+
+void PanelPusher::end() {
+  if (task_) {
+    vTaskDelete(task_);
+    task_ = nullptr;
+  }
+  if (start_) {
+    vSemaphoreDelete(start_);
+    start_ = nullptr;
+  }
+  if (idle_) {
+    vSemaphoreDelete(idle_);
+    idle_ = nullptr;
+  }
+  running_ = false;
+}
+
+void PanelPusher::taskEntry(void* arg) {
+  PanelPusher* self = static_cast<PanelPusher*>(arg);
+  for (;;) {
+    xSemaphoreTake(self->start_, portMAX_DELAY);
+    pushPanels(self->panels_, self->count_, self->frame_, self->canvas_w_, self->canvas_h_,
+               self->scratch_);
+    xSemaphoreGive(self->idle_);
+  }
+}
+
+void PanelPusher::submit(const Pixel* frame) {
+  if (!running_ || !frame) return;
+  xSemaphoreTake(idle_, portMAX_DELAY);  // wait out the previous push
+  frame_ = frame;
+  xSemaphoreGive(start_);
+}
+
+void PanelPusher::wait() {
+  if (!running_) return;
+  xSemaphoreTake(idle_, portMAX_DELAY);
+  xSemaphoreGive(idle_);
+}
+
 }  // namespace protoshade
 
 #endif  // ESP32

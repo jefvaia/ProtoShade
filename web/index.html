@@ -6,10 +6,62 @@
   <title>ProtoShade</title>
   <link rel="stylesheet" href="./styles.css">
 </head>
-<body class="min-h-screen bg-neutral-900 text-neutral-100 flex flex-col items-center justify-center gap-6 font-mono">
-  <h1 class="text-2xl tracking-widest uppercase">ProtoShade</h1>
-  <canvas id="c" width="8" height="8" class="w-80 h-80 [image-rendering:pixelated] rounded ring-1 ring-neutral-700"></canvas>
-  <p class="text-sm text-neutral-400">ProtoShade-Runtime, compiled to wasm.</p>
+<body class="h-screen overflow-hidden bg-neutral-900 text-neutral-100 font-mono text-sm flex flex-col">
+
+  <header class="flex items-center gap-4 px-4 py-2 border-b border-neutral-800 shrink-0">
+    <h1 class="text-base tracking-widest uppercase">ProtoShade</h1>
+
+    <label class="flex items-center gap-1 text-neutral-400">
+      res
+      <input id="res-w" type="number" min="1" max="512" value="64"
+             class="w-16 bg-neutral-800 rounded px-2 py-1 text-neutral-100 tabular-nums">
+      <span>×</span>
+      <input id="res-h" type="number" min="1" max="512" value="32"
+             class="w-16 bg-neutral-800 rounded px-2 py-1 text-neutral-100 tabular-nums">
+    </label>
+
+    <select id="res-preset" class="bg-neutral-800 rounded px-2 py-1">
+      <option value="">preset…</option>
+      <option value="8x8">8 × 8</option>
+      <option value="16x16">16 × 16</option>
+      <option value="32x8">32 × 8</option>
+      <option value="32x32">32 × 32</option>
+      <option value="64x32">64 × 32</option>
+      <option value="64x64">64 × 64</option>
+      <option value="128x64">128 × 64</option>
+    </select>
+
+    <span class="flex-1"></span>
+    <button id="download" class="bg-emerald-700 hover:bg-emerald-600 rounded px-3 py-1">download .bin</button>
+    <button id="reset" class="bg-neutral-800 hover:bg-neutral-700 rounded px-3 py-1">reset graph</button>
+    <span id="status" class="text-neutral-500 tabular-nums"></span>
+  </header>
+
+  <main class="flex-1 flex min-h-0">
+    <div id="graph-wrap" class="flex-1 min-w-0 relative">
+      <canvas id="graph" class="absolute inset-0"></canvas>
+      <p class="absolute bottom-2 left-3 text-neutral-600 pointer-events-none">
+        right-click the canvas to add a node · drag from a socket to wire · double-click a number to type it
+      </p>
+    </div>
+
+    <aside class="w-96 shrink-0 border-l border-neutral-800 p-4 flex flex-col gap-3 overflow-y-auto">
+      <h2 class="text-neutral-400 uppercase tracking-widest text-xs">preview</h2>
+      <canvas id="led" class="self-center max-w-full h-auto bg-black rounded ring-1 ring-neutral-700 [image-rendering:pixelated]"></canvas>
+      <p id="preview-info" class="text-neutral-500 text-xs tabular-nums"></p>
+      <p id="bin-info" class="text-neutral-500 text-xs tabular-nums"></p>
+      <p id="hint" class="text-amber-500 text-xs leading-relaxed"></p>
+      <p class="text-neutral-600 text-xs leading-relaxed mt-auto">
+        Every value is RGBA. A single number is that number in R, G and B with alpha 1, and a
+        node that wants one number reads R. Unconnected inputs fall back to the node's own
+        widget. The LED Output flattens alpha against black - the panel has nothing behind it.
+        <br><br>
+        The preview runs the compiled program, not the nodes: download .bin ships exactly
+        this, images included, and the head's upload page takes it from there.
+      </p>
+    </aside>
+  </main>
+
   <!-- Classic script, not bundled: litegraph's IIFEs end in })(this) to reach the global
        object, and inside an ES module top-level this is undefined. Module scripts are
        deferred, so main.js always runs after this one. -->
