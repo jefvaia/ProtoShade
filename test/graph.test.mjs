@@ -22,11 +22,11 @@ writeFileSync(
   entry,
   `export { compile, Runner, packImage } from ${JSON.stringify(join(root, "web/graph.ts"))};\n` +
     `export { pack, packedSize, instructionCount, HEADER_SIZE, FORMAT_VERSION } from ${JSON.stringify(join(root, "web/pack.ts"))};\n` +
-    `export { OP, INSTR_SIZE, MAX_REGISTERS } from ${JSON.stringify(join(root, "web/nodes.ts"))};\n`,
+    `export { OP, INSTR_SIZE, MAX_REGISTERS, MAX_PARTICLES } from ${JSON.stringify(join(root, "web/nodes.ts"))};\n`,
 );
 const bundle = join(work, "bundle.mjs");
 await esbuild.build({ entryPoints: [entry], outfile: bundle, bundle: true, format: "esm", logLevel: "warning" });
-const { compile, Runner, packImage, pack, packedSize, instructionCount, HEADER_SIZE, FORMAT_VERSION, OP, INSTR_SIZE, MAX_REGISTERS } =
+const { compile, Runner, packImage, pack, packedSize, instructionCount, HEADER_SIZE, FORMAT_VERSION, OP, INSTR_SIZE, MAX_REGISTERS, MAX_PARTICLES } =
   await import(pathToFileURL(bundle));
 
 const env = (over = {}) => ({ x: 0, y: 0, u: 0.25, v: 0.5, w: 64, h: 32, t: 2, frame: 0, ...over });
@@ -272,6 +272,118 @@ const near = (got, want, what) => {
   const dataLen = view.getUint32(table + 4, true);
   assert.ok(dataAt + dataLen <= bin.length, "asset data is inside the file");
   assert.equal(view.getUint16(table + 8, true), 2, "asset width");
+}
+
+// --- a strip, and the two ways to read its phase -----------------------------
+//
+// Four frames, one solid grey each: 0, 0.25, 0.5, 0.75. Whatever comes out has to be one of
+// those four numbers - anything in between would be a frame nobody drew.
+{
+  const levels = [0, 64, 128, 191];
+  // Four rows of four pixels: one row is one frame.
+  const data = new Uint8ClampedArray(4 * 4 * 4);
+  for (let f = 0; f < 4; f++) {
+    for (let i = 0; i < 4; i++) {
+      const p = (f * 4 + i) * 4;
+      data[p] = data[p + 1] = data[p + 2] = levels[f];
+      data[p + 3] = 255;
+    }
+  }
+  const strip = new Map([[1, { w: 4, h: 4, frames: 4, data }]]);
+  const anim = (props, t) =>
+    shade(
+      graph([[1, "texture/animation", { wrap: "clamp", filter: "nearest", ...props }, null, null], out(2, 10)], {
+        10: [1, 0],
+      }),
+      strip,
+      { t },
+    ).colour[0];
+
+  // hold: the phase is 0..1 across the strip. Frame 1 at 0.4, frame 3 at 1 and beyond.
+  const hold = { frames: 4, loop: false, crossfade: false, speed: 1 };
+  assert.ok(Math.abs(anim(hold, 0) - 0) < 0.02, "hold at 0 is the first frame");
+  assert.ok(Math.abs(anim(hold, 0.4) - 0.25) < 0.02, "0.4 snaps to frame 1, it does not blend");
+  assert.ok(Math.abs(anim(hold, 1) - 0.75) < 0.02, "hold at 1 is the last frame");
+  assert.ok(Math.abs(anim(hold, 5) - 0.75) < 0.02, "and it holds there");
+
+  // loop: the phase counts whole cycles.
+  const loop = { frames: 4, loop: true, crossfade: false, speed: 1 };
+  assert.ok(Math.abs(anim(loop, 0.3) - 0.25) < 0.02, "0.3 of a cycle is frame 1");
+  assert.ok(Math.abs(anim(loop, 1.3) - 0.25) < 0.02, "a cycle later, the same frame");
+
+  // Every phase lands on a frame that exists - that is the whole contract.
+  for (let i = 0; i <= 40; i++) {
+    const v = anim(hold, i / 40);
+    assert.ok(levels.some((l) => Math.abs(v * 255 - l) < 5), `phase ${i / 40} gave ${v}, which is not one of the four frames`);
+  }
+  // Unless crossfade is asked for, which is how you get an in-between image on purpose.
+  const mid = anim({ frames: 4, loop: false, crossfade: true, speed: 1 }, 0.5);
+  assert.ok(Math.abs(mid - 0.375) < 0.02, "crossfade halfway is halfway between two frames");
+}
+
+// --- particles: bounded, and a count that is always a constant ---------------
+{
+  const dot = new Map([[1, { w: 1, h: 1, frames: 1, data: new Uint8ClampedArray([255, 255, 255, 255]) }]]);
+  const { program } = shade(
+    graph([[1, "texture/particles", { count: 1e6, size: 1, life: 1, seed: 3 }, null, null], out(2, 10)], { 10: [1, 0] }),
+    dot,
+  );
+  const instr = [...program.code.filter((_, i) => i % INSTR_SIZE === 0)];
+  assert.ok(instr.includes(OP.PARTICLES), "a Particles instruction is emitted");
+  const at = instr.indexOf(OP.PARTICLES) * INSTR_SIZE;
+  const params = program.code[at + 4];
+  assert.ok(params & 0x80, "the parameter quad is a constant, so the cost is known at load");
+  assert.equal(program.consts[(params & 0x7f) * 4], MAX_PARTICLES, "a silly count is clamped");
+}
+
+// --- bake: the branch is rendered here, and what ships must still be it -------
+//
+// The branch is Time * 0.5, so its value at t seconds is t/2. Baked over 2 seconds into 4
+// frames, then read back through the strip: what the head shows at t has to be what the
+// branch showed at t, to within what RGB565 can hold.
+{
+  const branch = (extra, links) =>
+    graph(
+      [
+        [1, "input/time", { speed: 0.5 }],
+        [2, "bake/bake", { driver: "time", frames: 4, seconds: 2, crossfade: false }, 10],
+        ...extra,
+      ],
+      { 10: [1, 0], ...links },
+    );
+
+  const g = branch([out(3, 20)], { 20: [2, 0] });
+  const { program } = shade(g, new Map());
+  assert.equal(program.assets.length, 1, "the branch became one asset");
+  assert.equal(program.assets[0].frames, 4);
+  assert.equal(program.assets[0].h, 32 * 4, "one frame per panel-height slice");
+  const ops = [...program.code.filter((_, i) => i % INSTR_SIZE === 0)];
+  assert.deepEqual(ops, [OP.UV, OP.TIME, OP.ANIM, OP.OUTPUT], "and the branch itself is gone");
+
+  const runner = new Runner(program);
+  const colour = [0, 0, 0, 1];
+  for (const [t, want] of [[0, 0], [0.5, 0.25], [1, 0.5], [1.5, 0.75], [2.5, 0.25]]) {
+    runner.run(env({ t }), colour);
+    assert.ok(Math.abs(colour[0] - want) < 0.02, `baked t=${t} gave ${colour[0]}, wanted ${want}`);
+  }
+
+  // Baking one branch does not freeze the graph. A live sensor multiplying the baked strip
+  // still moves, because only what was wired INTO the Bake node was rendered away.
+  const live = branch(
+    [
+      [4, "input/sensor", { range: "0..1", index: 0, test: 1 }],
+      [5, "math/math", { op: "multiply", a: 0, b: 1 }, 20, 30],
+      out(6, 40),
+    ],
+    { 20: [2, 0], 30: [4, 0], 40: [5, 0] },
+  );
+  const lit = compile(live, new Map(), 64, 32);
+  assert.ok(lit.ok, lit.ok ? "" : lit.reason);
+  const r2 = new Runner(lit.program);
+  r2.run(env({ t: 1, sensors: [1] }), colour);
+  const full = colour[0];
+  r2.run(env({ t: 1, sensors: [0.5] }), colour);
+  assert.ok(Math.abs(colour[0] - full / 2) < 0.02, "the unbaked half of the graph is still live");
 }
 
 console.log("graph: ok");

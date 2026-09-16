@@ -39,6 +39,8 @@ declare global {
     ): { name: string; value: unknown };
     /** Sets the property AND any widget bound to it. Prefer it over properties[name] = v. */
     setProperty(name: string, value: unknown): void;
+    /** Called by setProperty and by a widget the property is bound to. */
+    onPropertyChanged?: (name: string, value: unknown) => void;
     connect(slot: number | string, target: LGraphNode, targetSlot: number | string): boolean;
   }
 

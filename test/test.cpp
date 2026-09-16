@@ -36,6 +36,7 @@ struct AssetSpec {
   uint16_t w, h;
   AssetFormat format;
   std::vector<uint8_t> data;
+  uint16_t frames = 1;  // h / frames rows per frame; 1 is a still
 };
 
 // Builds a container the way the web app does: pool a constant, emit an instruction, ship.
@@ -104,6 +105,7 @@ struct Builder {
       put16(v, e + 8, assets[i].w);
       put16(v, e + 10, assets[i].h);
       v[e + 12] = uint8_t(assets[i].format);
+      put16(v, e + 13, assets[i].frames);
       std::memcpy(v.data() + at, assets[i].data.data(), assets[i].data.size());
       at += uint32_t(assets[i].data.size());
     }
@@ -487,6 +489,109 @@ void testTexture() {
   assert(near(renderOne(r.blob()).r, 128));
 }
 
+// A strip of frames, indexed by a phase. The point of the op is that a phase between two
+// frames picks ONE OF THEM - it does not invent an image nobody drew - unless crossfade is
+// asked for explicitly.
+void testAnimation() {
+  // Four frames, one row each: red, green, blue, white.
+  std::vector<uint8_t> rows;
+  for (uint16_t v : {0xF800, 0x07E0, 0x001F, 0xFFFF}) {
+    rows.push_back(uint8_t(v & 0xFF));
+    rows.push_back(uint8_t(v >> 8));
+  }
+  const AssetSpec strip{1, 4, AssetFormat::RGB565, rows, 4};
+
+  // flags: clamp wrap, plus whatever the case is testing. A 1x1 panel samples the middle of
+  // whichever frame the phase picks.
+  auto frameAt = [&](float phase, uint8_t flags) {
+    Builder p;
+    p.addAsset(strip);
+    const uint8_t uv = p.emit(Op::UV);
+    p.emit(Op::Output, p.emit(Op::Anim, uv, p.scalar(phase), 0, 0, 0, uint8_t(1 | flags)), p.scalar(1));
+    return renderOne(p.blob(), 0, 0, 0, 1, 1);
+  };
+
+  // Hold: 0..1 spans the strip and stops at both ends. This is the blend-shape reading.
+  assert(frameAt(0.0f, 0).r == 255 && frameAt(0.0f, 0).g == 0);       // frame 0, red
+  assert(frameAt(1.0f, 0).r == 255 && frameAt(1.0f, 0).b == 255);     // frame 3, white
+  assert(frameAt(2.0f, 0).b == 255);                                  // past the end, held
+  const Pixel middle = frameAt(0.4f, 0);  // 0.4 * 3 = 1.2 -> frame 1
+  assert(middle.g == 255 && middle.r == 0 && middle.b == 0);          // green, NOT a blend
+
+  // Loop: the phase counts whole cycles and wraps. This is the animation reading.
+  assert(frameAt(0.3f, 32).g == 255);   // 0.3 * 4 = 1.2 -> frame 1
+  assert(frameAt(1.3f, 32).g == 255);   // a cycle later, the same frame
+  assert(frameAt(0.9f, 32).b == 255 && frameAt(0.9f, 32).r == 255);  // 3.6 -> frame 3
+
+  // Crossfade is the one way to get an image that is not in the strip: halfway between
+  // frame 1 and frame 2 is half green, half blue.
+  const Pixel blend = frameAt(0.5f, 16);  // 0.5 * 3 = 1.5
+  assert(near(blend.g, 128) && near(blend.b, 128) && blend.r == 0);
+
+  // More frames than rows would leave a frame with no pixels in it.
+  Builder bad;
+  bad.addAsset({1, 4, AssetFormat::RGB565, rows, 5});
+  const uint8_t buv = bad.emit(Op::UV);
+  bad.emit(Op::Output, bad.emit(Op::Anim, buv, bad.scalar(0), 0, 0, 0, 1), bad.scalar(1));
+  auto bad_blob = bad.blob();
+  ProtoShadeRuntime rt;
+  assert(!rt.load(bad_blob.data(), bad_blob.size()) && rt.status() == Status::BadLayout);
+}
+
+// The one loop in the VM. Its trip count comes from a constant so the cost of a pixel stays
+// knowable at load, which is what the step budget is built on.
+void testParticles() {
+  const AssetSpec dot{1, 1, AssetFormat::RGBA8888, {255, 255, 255, 255}};
+
+  auto build = [&](uint8_t count_operand_is_const, float count) {
+    Builder p;
+    p.addAsset(dot);
+    const uint8_t pos = p.emit(Op::Centered);
+    const uint8_t pa = p.konst(count, 1.0f, 0.0f, 0.0f);  // count, size, speed, spread
+    const uint8_t pb = p.konst(0.0f, 0.0f, 1.0f, 0.0f);   // gravity, seed, life, fade
+    const uint8_t src2 = count_operand_is_const ? pa : p.emit(Op::Time, p.scalar(0));
+    p.emit(Op::Output, p.emit(Op::Particles, pos, p.scalar(0), src2, pb, 0, 0), p.scalar(1));
+    return p.blob();
+  };
+
+  // One still particle, a sprite as wide as the space: the middle pixel is covered.
+  assert(renderOne(build(1, 1.0f), 0, 0, 0, 1, 1).r == 255);
+  // No particles is transparent, which the output flattens to black.
+  assert(renderOne(build(1, 0.0f), 0, 0, 0, 1, 1).r == 0);
+
+  // A count that is not a constant could be anything by the time the pixel runs, so the
+  // budget could not be proven at load. Refused there rather than clamped at run time.
+  {
+    auto blob = build(0, 1.0f);
+    ProtoShadeRuntime rt;
+    assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
+  }
+  // An asset index that was never packed.
+  {
+    Builder p;
+    const uint8_t pos = p.emit(Op::Centered);
+    p.emit(Op::Output,
+           p.emit(Op::Particles, pos, p.scalar(0), p.konst(1, 1, 0, 0), p.konst(0, 0, 1, 0), 0, 0),
+           p.scalar(1));
+    auto blob = p.blob();
+    ProtoShadeRuntime rt;
+    assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
+  }
+  // A silly count is clamped to kMaxParticles, so the per-pixel cost stays bounded however
+  // the .bin was built - and the program still runs.
+  {
+    auto blob = build(1, 1e9f);
+    ProtoShadeRuntime rt(1, 1);
+    assert(rt.load(blob.data(), blob.size()));
+    ExecContext ctx;
+    rt.renderFrame(ctx, rt.beginFrame(0), nullptr);
+    assert(!ctx.budget_exceeded);
+    Pixel px{};
+    rt.renderRows(ctx, rt.beginFrame(0), 0, 1, &px);
+    assert(ctx.steps_used <= format::kMaxParticles * 14 && !ctx.budget_exceeded);
+  }
+}
+
 // Frame-uniform instructions - time, sensors, constants, anything derived from them - are
 // hoisted out of the per-pixel loop. A shader driving a sine from time alone was paying for
 // that sine on every pixel.
@@ -768,6 +873,8 @@ int main() {
   testCombineMixOverHsv();
   testTimeAndSensors();
   testTexture();
+  testAnimation();
+  testParticles();
   testUniformHoisting();
   testStepBudget();
   testRowSplitMatchesWholeFrame();

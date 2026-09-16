@@ -36,11 +36,15 @@ enum class AssetFormat : uint8_t {
   A8 = 2,       // 1 byte/px, masks: reads as white with that alpha
 };
 
+// An asset is one image, or a strip of them: `frames` frames of height/frames rows each,
+// stacked top to bottom. A still is just frames == 1, which is what a plain image packs as,
+// so every sampler works in frame space and there is no second code path for stills.
 struct Asset {
   const uint8_t* data;
   uint32_t length;
   uint16_t width, height;
   AssetFormat format;
+  uint16_t frames;
 };
 
 // Sensor readings, by slot, exactly as the program's Sensor nodes indexed them. Borrowed:
@@ -67,7 +71,7 @@ struct Frame {
 
 namespace format {
 constexpr uint8_t kMagic[4] = {'P', 'S', 'H', 'D'};
-constexpr uint16_t kVersion = 3;       // bump on every layout change; old firmware then refuses new bins
+constexpr uint16_t kVersion = 4;       // bump on every layout change; old firmware then refuses new bins
 constexpr size_t kHeaderSize = 48;
 constexpr size_t kAssetEntrySize = 16;
 constexpr size_t kInstrSize = 8;
@@ -79,6 +83,10 @@ constexpr uint16_t kMaxConstants = 128;  // operand encoding is 7 bits + the con
 // few KB on a chip with 512 KB of SRAM.
 constexpr uint16_t kMaxInstructions = 256;
 constexpr uint16_t kMaxAssets = 32;
+// Sprites one Particles instruction may draw. It is the only loop in the VM, so this is
+// what keeps "cost of a pixel" knowable: 64 sprites is 64 texel fetches, still well inside
+// ExecContext::step_limit, and the count in the program is clamped to it at load.
+constexpr uint8_t kMaxParticles = 64;
 }  // namespace format
 
 // The instruction set. Mirrored in web/nodes.ts (OP) - the numbering IS the format, so
@@ -97,6 +105,9 @@ enum class Op : uint8_t {
   Hsv,        // src0..3 = hue, sat, val, alpha
   Tex,        // aux = asset, aux2 = wrap | filter << 2 | alpha-out << 3; src0 = uv
   Output,     // src0 = colour, src1 = brightness. Always the last instruction.
+  Anim,       // aux = asset, aux2 = tex flags | crossfade << 4 | loop << 5; src0 = uv, src1 = phase
+  Particles,  // aux = asset, aux2 = filter << 2; src0 = position, src1 = time,
+              // src2 = (count, size, speed, spread), src3 = (gravity, seed, life, fade)
   kCount,
 };
 
@@ -152,9 +163,11 @@ struct ExecContext {
 //   0       4     data_offset
 //   4       4     data_length
 //   8       2     width
-//   10      2     height
+//   10      2     height            the WHOLE strip; one frame is height / frames rows
 //   12      1     format (AssetFormat)
-//   13      3     reserved
+//   13      2     frames            0 and 1 both mean "a still"; frames * (height/frames)
+//                                   must fit in height, so a frame is always inside the blob
+//   15      1     reserved
 //
 // Instruction (8 bytes): op, dst, src0, src1, src2, src3, aux, aux2.
 // An operand byte is a register index, or a constant index with bit 7 set.
@@ -223,8 +236,20 @@ private:
             uint16_t count) const;
   // Per-pixel pass only. Valid once the uniform pass has run into the same ExecContext.
   Pixel shade(ExecContext& ctx, const Frame& frame, uint16_t x, uint16_t y) const;
-  // Reads one asset texel into rgba (0..1). Bounds are already validated at load().
-  void texel(uint16_t asset, int32_t x, int32_t y, Wrap wrap, float* rgba) const;
+  // Reads one texel of one FRAME into rgba (0..1). Coordinates are frame-local: y runs
+  // 0..rows(frame)-1, and `base` is the row that frame starts at. Bounds are already
+  // validated at load().
+  void texel(uint16_t asset, int32_t x, int32_t y, int32_t base, int32_t rows, Wrap wrap,
+             float* rgba) const;
+  // One frame of one asset, sampled at (u, v) in 0..1 of that frame. flags are the Tex
+  // flags: wrap in bits 0-1, bilinear in bit 2. Tex, Anim and Particles all come through
+  // here, so there is exactly one bilinear fetch in the VM.
+  void sampleFrame(uint16_t asset, uint16_t frame, float u, float v, uint8_t flags,
+                   float* rgba) const;
+  // Sprites a Particles instruction draws, clamped to kMaxParticles. Its operand is
+  // required to be a constant (validateCode enforces it), so this is known at load - which
+  // is what keeps the per-pixel budget a number rather than a guess.
+  uint8_t particleCount(const uint8_t* instruction) const;
 
   // Asset header, copied out of the blob at load. Four fields the sampler needs per texel,
   // in RAM, instead of re-parsing a 16-byte table entry out of mapped flash every time.
@@ -232,6 +257,8 @@ private:
     const uint8_t* data;
     int32_t w, h;
     AssetFormat format;
+    uint16_t frames;
+    int32_t rows;  // h / frames, precomputed: the one integer divide a texel fetch would cost
   };
 
   const uint8_t* blob_ = nullptr;

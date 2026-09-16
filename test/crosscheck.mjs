@@ -67,8 +67,9 @@ function graph(nodes, links) {
 
 const out = (id, link) => [id, "output/led", { brightness: 1 }, link];
 
-/** An image whose pixels vary in all four channels, so a wrong swizzle cannot hide. */
-function testImage(w, h, opaque) {
+/** An image whose pixels vary in all four channels, so a wrong swizzle cannot hide.
+    With frames > 1 it is a strip: h rows in total, h / frames of them per frame. */
+function testImage(w, h, opaque, frames = 1) {
   const data = new Uint8ClampedArray(w * h * 4);
   for (let i = 0; i < w * h; i++) {
     data[i * 4] = (i * 37) % 256;
@@ -76,7 +77,7 @@ function testImage(w, h, opaque) {
     data[i * 4 + 2] = (i * 13) % 256;
     data[i * 4 + 3] = opaque ? 255 : (i * 57) % 256;
   }
-  return { w, h, data };
+  return { w, h, frames, data };
 }
 
 const W = 17; // odd and not a power of two, so nothing divides evenly by accident
@@ -218,6 +219,120 @@ check(
   new Map([[1, testImage(4, 4, false)]]),
 );
 check("image:missing", graph([[1, "texture/image", {}, null], out(2, 10)], { 10: [1, 0] }));
+
+// --- animation: both readings of the phase, both filters, with and without crossfade -----
+//
+// The phase is wired to Time, so `ms` is what picks the frame - and at 1234 ms with speed 1
+// that is not frame 0, which is the point: a wrong frame index here is a wrong picture.
+for (const loop of [true, false]) {
+  for (const crossfade of [true, false]) {
+    for (const filter of ["nearest", "linear"]) {
+      check(
+        `anim:${loop ? "loop" : "hold"}:${crossfade ? "crossfade" : "snap"}:${filter}`,
+        graph(
+          [
+            [1, "texture/animation", { frames: 4, loop, crossfade, speed: 0.37, wrap: "clamp", filter }, null, 10],
+            [2, "input/time", { speed: 0.21 }],
+            out(3, 20),
+          ],
+          { 10: [2, 0], 20: [1, 0] },
+        ),
+        new Map([[1, testImage(5, 8, false, 4)]]),
+      );
+    }
+  }
+}
+
+// A strip driven by a sensor instead: the blend-shape wiring, where the reading picks which
+// of the frames that exist gets shown.
+check(
+  "anim:blend-shape",
+  graph(
+    [
+      [1, "texture/animation", { frames: 4, loop: false, crossfade: false, wrap: "clip", filter: "nearest" }, null, 10],
+      [2, "input/sensor", { range: "0..1", index: 0, test: 0.6 }],
+      out(3, 20),
+    ],
+    { 10: [2, 1], 20: [1, 0] },
+  ),
+  new Map([[1, testImage(5, 8, true, 4)]]),
+  0,
+  [0.72],
+);
+check(
+  "anim:alpha-out",
+  graph([[1, "texture/animation", { frames: 2, loop: true, speed: 3, wrap: "repeat" }, null, null], out(2, 10)], {
+    10: [1, 1],
+  }),
+  new Map([[1, testImage(4, 6, false, 2)]]),
+);
+
+// --- particles: the loop inside one instruction ------------------------------
+//
+// Every particle's position is +, - and * on floats. The preview does that arithmetic in
+// Math.fround steps precisely so these cases can demand the same texel as the device, and
+// not "near enough" - under nearest filtering a last-bit difference is a wrong sprite pixel.
+for (const filter of ["nearest", "linear"]) {
+  check(
+    `particles:${filter}`,
+    graph(
+      [
+        [
+          1,
+          "texture/particles",
+          { count: 12, size: 0.45, rise: 0.8, spread: 0.6, gravity: 0.5, life: 1.7, fade: 0.8, seed: 7, speed: 1, filter },
+          null,
+          10,
+        ],
+        [2, "input/time", { speed: 1 }],
+        out(3, 20),
+      ],
+      { 10: [2, 0], 20: [1, 0] },
+    ),
+    new Map([[1, testImage(6, 6, false)]]),
+  );
+}
+// Sprites cut from a strip: a particle picks a frame from its own hash, so one upload gives
+// a swarm of different shapes.
+check(
+  "particles:from-strip",
+  graph(
+    [
+      [1, "texture/particles", { count: 20, size: 0.3, rise: 0.4, spread: 1, gravity: -0.3, life: 3, fade: 0, seed: 2, speed: 0.5 }, null, null],
+      out(2, 10),
+    ],
+    { 10: [1, 0] },
+  ),
+  new Map([[1, testImage(4, 12, false, 3)]]),
+  900,
+);
+check("particles:empty", graph([[1, "texture/particles", { count: 0 }, null, null], out(2, 10)], { 10: [1, 0] }));
+
+// --- bake: the branch is rendered here, the strip is what the head runs -------
+//
+// What is checked is what always mattered: the .bin the bake produces renders the same in
+// both VMs. That the strip resembles the graph it came from is bake's own business, and
+// test/graph.test.mjs holds it to that.
+for (const driver of ["time", "sensor"]) {
+  check(
+    `bake:${driver}`,
+    graph(
+      [
+        [1, "input/coordinates", {}],
+        [2, "vector/separate", {}, 10],
+        [3, "input/time", { speed: 0.3 }],
+        [4, "math/math", { op: "add", a: 0, b: 1 }, 20, 30],
+        [5, "color/hsv", { hue: 0, sat: 1, val: 1, alpha: 1 }, 40, null, null, null],
+        [6, "bake/bake", { driver, frames: 8, seconds: 2, slot: 0, range: "0..1", crossfade: false }, 50],
+        out(7, 60),
+      ],
+      { 10: [1, 0], 20: [2, 0], 30: [3, 0], 40: [4, 0], 50: [5, 0], 60: [6, 0] },
+    ),
+    new Map(),
+    1234,
+    [0.4],
+  );
+}
 
 // --- sensors: every range, raw and unit, with and without a live feed ---------
 for (let r = 0; r < 5; r++) {

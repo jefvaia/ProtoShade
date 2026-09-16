@@ -10,7 +10,7 @@ import type { Program } from "./graph.js";
 
 export const HEADER_SIZE = 48;
 export const ASSET_ENTRY_SIZE = 16;
-export const FORMAT_VERSION = 3;
+export const FORMAT_VERSION = 4;
 
 export function pack(p: Program): Uint8Array {
   const constBytes = p.consts.length * 4;
@@ -50,6 +50,8 @@ export function pack(p: Program): Uint8Array {
     view.setUint16(e + 8, a.w, true);
     view.setUint16(e + 10, a.h, true);
     out[e + 12] = a.format;
+    // Frames stacked top to bottom; the runtime reads one frame as h / frames rows.
+    view.setUint16(e + 13, Math.max(1, a.frames), true);
     out.set(a.data, at);
     at += a.data.length;
   });

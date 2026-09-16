@@ -130,7 +130,8 @@ async function restoreImages(): Promise<void> {
       const src = node.properties.file;
       if (typeof src !== "string" || !src) return;
       try {
-        await decodeInto(node.id, src);
+        // The saved data URL is already the assembled strip; `frames` is how to cut it up.
+        await decodeInto(node.id, src, Math.max(1, Math.round(Number(node.properties.frames) || 1)));
         const widget = node.widgets?.[0];
         if (widget) widget.name = imageLabel(node.id);
       } catch {
@@ -177,6 +178,9 @@ el<HTMLButtonElement>("reset").onclick = () => {
 
 let W = 64;
 let H = 32;
+
+/** The head's `protoshade` partition, from partitions.csv. A bake can reach it. */
+const PARTITION_BYTES = 2 * 1024 * 1024;
 
 function setResolution(w: number, h: number): void {
   const clamp = (n: number): number => Math.min(512, Math.max(1, Math.round(n) || 1));
@@ -432,10 +436,17 @@ function render(now: number): void {
           : "connected, waiting for frames...",
       );
     }
-    hint.textContent = result.ok ? "" : result.reason;
+    const size = current ? packedSize(current) : 0;
+    // Baking buys instructions with flash, so both numbers have to be on screen at once -
+    // and the partition it has to fit in is 2 MB (partitions.csv).
+    hint.textContent = !result.ok
+      ? result.reason
+      : size > PARTITION_BYTES
+        ? `${(size / 1048576).toFixed(2)} MB will not fit the head's 2 MB partition - fewer baked frames, or a smaller panel`
+        : "";
     binInfo.textContent = current
       ? `${instructionCount(current)} instructions · ${current.assets.length} image${current.assets.length === 1 ? "" : "s"} · ` +
-        `${(packedSize(current) / 1024).toFixed(1)} KB .bin` +
+        `${(size / 1024).toFixed(1)} KB .bin` +
         (current.sensorCount ? ` · ${current.sensorCount} sensor slot${current.sensorCount === 1 ? "" : "s"}` : "")
       : "";
   }

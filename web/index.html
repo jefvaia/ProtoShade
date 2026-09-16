@@ -69,6 +69,13 @@
         <br><br>
         The preview runs the compiled program, not the nodes: download .bin ships exactly
         this, images included, and the head's upload page takes it from there.
+        <br><br>
+        <b>Animation</b> takes a GIF, several PNGs at once, or one sprite sheet, and Phase
+        picks the frame: wire Time for an animation, a Sensor for a blend shape. A phase
+        between two frames picks one of them - turn crossfade on if you want a dissolve.
+        <b>Particles</b> scatters an image with no state and no flash cost. <b>Bake</b>
+        renders whatever is wired into it here in the browser and ships the frames as an
+        image, so the head stops computing that branch - the rest of the graph keeps running.
       </p>
     </aside>
   </main>

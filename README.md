@@ -45,13 +45,20 @@ into a head - rotation, mirroring, which rectangle goes where - and is portable 
 
 ### The shader VM
 
-A program is **straight-line code**: no jumps, no loops, one 8-byte instruction per used node
-output, ordered so every operand is written before it is read. Thirteen opcodes (`UV`,
-`MATH`, `MIX`, `OVER`, `HSV`, `TEX`, `SENSOR`, ...), one value type - an RGBA quad of floats.
+A program is **straight-line code**: no jumps, one 8-byte instruction per used node output,
+ordered so every operand is written before it is read. Fifteen opcodes (`UV`, `MATH`, `MIX`,
+`OVER`, `HSV`, `TEX`, `ANIM`, `PARTICLES`, `SENSOR`, ...), one value type - an RGBA quad of
+floats.
 
 That shape is the point. The cost of a pixel is known before the first one is drawn, so the
 step budget is one comparison instead of accounting inside a loop, and a `.bin` from a web
 page cannot spin a head into a watchdog reset.
+
+`PARTICLES` is the one loop in the whole VM, and it keeps that property rather than breaking
+it: its trip count is required to be a **constant operand** and is clamped to
+`kMaxParticles`, so the work it adds is still a number `load()` can add up. A particle has no
+state - its position is a closed form of its index and the time - which is also why two cores
+rendering the same frame can never disagree about where one is.
 
 It also makes one optimisation free. `load()` splits the program in two: an instruction is
 **uniform** when nothing it reads varies across the frame - time, sensors, constants, and
@@ -103,7 +110,10 @@ author left in the node.
 ### The .bin container
 
 One file holds everything: the compiled program plus the images (PNGs converted at pack time
-to RGB565, or RGBA8888 when they actually use alpha - the ESP32 never decodes PNG). Layout is
+to RGB565, or RGBA8888 when they actually use alpha - the ESP32 never decodes PNG). An image
+carries a **frame count**: frames stacked top to bottom, one frame being `height / frames`
+rows, so an animation, a sprite sheet and a still are all the same kind of thing and a still
+is just the `frames == 1` case. Layout is
 documented at the top of `ProtoShadeRuntime.h`; `test/test.cpp` builds one byte by byte and is
 the arbiter if the packer and the runtime ever disagree.
 
@@ -163,8 +173,64 @@ that wants a single number reads R. Alpha survives from an uploaded PNG through 
 to `LED Output`, which flattens it against black - the panel has nothing behind it.
 
 Nodes: `Coordinates` (UV / centered / pixel), `Time`, `Sensor`, `Value`, `Color`, `Math` (21
-component-wise ops), `Mix`, `Alpha Over`, `Separate`/`Combine RGBA`, `HSV`, `Image` and
-`LED Output`. An unconnected input falls back to the node's own widget.
+component-wise ops), `Mix`, `Alpha Over`, `Separate`/`Combine RGBA`, `HSV`, `Image`,
+`Animation`, `Particles`, `Bake` and `LED Output`. An unconnected input falls back to the
+node's own widget.
+
+#### Animation, and blend shapes
+
+`Animation` is an `Image` with more than one frame in it. Upload **several PNGs at once**
+(they are sorted by filename and become one frame each), a **GIF / APNG / animated WebP**
+(unpacked frame by frame through `ImageDecoder`, so Chrome and Edge only), or **one tall
+sprite sheet** and say how many frames it is cut into. Whatever you give it is assembled into
+a single strip, and that strip is what gets saved and packed - one image, not n.
+
+The **Phase** input picks the frame, and there are two readings of it:
+
+- **loop on** - Phase counts whole cycles, so `frac(phase) * frames` walks the strip and
+  starts over. Wire `Time` in (or leave it unwired and use the node's own speed) and it is an
+  animation.
+- **loop off** - Phase is `0..1` across the strip and holds at both ends. Wire a `Sensor`, or
+  anything else that moves between 0 and 1, and the strip is a **blend shape**: 0 is the
+  first drawing, 1 is the last, and everything between picks the nearest one.
+
+Interpolating the phase **picks between frames you drew - it does not invent new ones**. A
+phase of 0.5 with four frames is frame 1, not half of frame 1 and half of frame 2. If you do
+want the dissolve, turn **crossfade** on; it fetches both neighbours and lerps, and costs
+twice as much per pixel.
+
+#### Particles
+
+`Particles` scatters an image across the panel: one instruction, no state, nothing stored
+between frames. Every particle's whole life is a function of its index and the clock, so
+sixty-four of them cost sixty-four texel fetches and not one byte of RAM. The knobs are
+count, size, rise, spread, gravity, life, fade and seed; the position input decides the space
+they live in (aspect-corrected by default, so a round sprite stays round). Hand it a strip
+and each particle picks its own frame from it, which is a swarm of different shapes from one
+upload.
+
+#### Bake: trading flash for instructions
+
+`Bake` renders whatever is wired into it **here, in the browser**, over a driver you choose,
+and packs the frames as a strip; the node itself becomes a lookup into that strip. The branch
+above it stops costing the head anything at all - a twenty-instruction gradient becomes one
+texture fetch.
+
+It is a **partial** bake, not a pre-rendered face:
+
+- the driver is still live. `time` loops the strip over `seconds`; `sensor` indexes it by a
+  reading, exactly the way a blend shape does. The head picks the frame every frame.
+- everything outside that one branch is untouched. Composite a baked branch with live nodes,
+  bake two branches on different drivers, react to a second sensor after the lookup - all of
+  that still runs on the device.
+
+What it freezes is the branch's *shape*: anything it depends on that is not the driver (a
+second sensor, another clock) is sampled once, at the value it had while baking. The cost is
+flash, and it adds up fast - `frames x width x height x 2` bytes - so the editor prints the
+`.bin` size and says so when it outgrows the head's 2 MB partition.
+
+Bake is also the way out of a graph that will not fit: the register file is 64 instructions
+wide, and a branch that is too big to ship is usually still fine to *render*.
 
 The `Image` node's **wrap** decides what happens outside the image, which matters the moment
 you scale the UV to place a sprite:
@@ -468,12 +534,16 @@ g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
 
 - `test/visor.test.mjs` - the visor mesh: the canvas split, the nose, the normals.
 - `test/graph.test.mjs` - the compiler: what a graph turns into, dead branches dropped,
-  cycles cut, pooled constants, alpha, sensors, and the container header.
-- `test/crosscheck.mjs` - **the important one.** Compiles 55 programs, renders every pixel
+  cycles cut, pooled constants, alpha, sensors, the container header, that a strip's phase
+  only ever lands on a frame that exists, and that a baked branch still renders what it
+  replaced while the rest of the graph stays live.
+- `test/crosscheck.mjs` - **the important one.** Compiles 75 programs, renders every pixel
   with the TypeScript interpreter, packs the same Program to a `.bin`, renders that with the
-  C++ VM, and compares. Currently 99.4% of channels are bit-identical and nothing differs by
+  C++ VM, and compares. Currently 99.5% of channels are bit-identical and nothing differs by
   more than 1/255, which is float-vs-double rounding of the last bit. A drifting opcode shows
-  up here as a wrong pixel. Needs a host C++ compiler; skips without one.
+  up here as a wrong pixel. It is also why the interpreter rounds through `Math.fround` where
+  the device would round in single precision: a last-bit difference in a particle's position
+  or a texture coordinate is not a rounding difference, it is a different texel. Needs a host C++ compiler; skips without one.
 - `test/test.cpp` - the runtime: container validation against malformed input, every opcode,
   the step budget, that two half-frames equal one whole one, and the panel mapping - every
   rotation and mirror against a canvas tagged with its own coordinates, because that is what

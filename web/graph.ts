@@ -15,6 +15,7 @@ import {
   INSTR_SIZE,
   MATH_OPS,
   MAX_CONSTS,
+  MAX_PARTICLES,
   MAX_REGISTERS,
   NODES,
   OP,
@@ -71,7 +72,31 @@ const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);
 export function compile(graph: GraphLike, images: Map<number, ImageBuf>, w = 64, h = 32): CompileResult {
   const out = graph._nodes.find((n) => n.type === OUTPUT_TYPE);
   if (!out) return { ok: false, reason: "no LED Output node - add one and wire a colour into it" };
+  // A baked strip is megabytes, and a deleted node would otherwise keep one alive for the
+  // rest of the session. This is the one place that knows which nodes still exist.
+  if (bakeCache.size > 0) {
+    const live = new Set(graph._nodes.map((n) => n.id));
+    for (const id of bakeCache.keys()) if (!live.has(id)) bakeCache.delete(id);
+  }
+  return compileFrom(graph, images, w, h, out, 0);
+}
 
+/**
+ * The program that computes `slot` of `root`, ending with that node's own instruction.
+ *
+ * With the LED Output as the root that is the whole shader, which is what compile() asks
+ * for. With any other node it is the branch feeding it, which is what a Bake node asks for
+ * so it can render that branch here instead of shipping it - the sub-program is only ever
+ * run by Runner, never packed, so it does not need to end in an OUTPUT.
+ */
+function compileFrom(
+  graph: GraphLike,
+  images: Map<number, ImageBuf>,
+  w: number,
+  h: number,
+  root: NodeLike,
+  rootSlot: number,
+): CompileResult {
   const byId = new Map(graph._nodes.map((n) => [n.id, n]));
   const code: number[] = [];
   const consts: number[] = [];
@@ -115,7 +140,7 @@ export function compile(graph: GraphLike, images: Map<number, ImageBuf>, w = 64,
   function fromFallback(f: Fallback | undefined, p: Props): number {
     if (!f) return scalar(0);
     if ("value" in f) return scalar(f.value);
-    if ("uv" in f) return emit(OP.UV, []);
+    if ("emit" in f) return emit(f.emit, f.arg === undefined ? [] : [scalar(num(p[f.arg]))]);
     return scalar(num(p[f.prop]));
   }
 
@@ -126,11 +151,71 @@ export function compile(graph: GraphLike, images: Map<number, ImageBuf>, w = 64,
     const img = images.get(node.id);
     // No upload: still a valid asset index, just a 1x1 transparent one. Keeps the VM free
     // of a "missing texture" branch, and the node renders clear exactly like the preview.
-    const packed = img ? (img.packed ??= packImage(img)) : { w: 1, h: 1, format: ASSET.RGBA8888, data: new Uint8Array(4) };
+    return use(node.id, img ? (img.packed ??= packImage(img)) : EMPTY_ASSET);
+  }
+
+  /** Puts a packed asset in the table and remembers which node it came from. */
+  function use(nodeId: number, packed: PackedAsset): number {
     const at = assets.length;
     assets.push(packed);
-    assetOf.set(node.id, at);
+    assetOf.set(nodeId, at);
     return at;
+  }
+
+  /**
+   * A Bake node: render the branch above it here, pack the frames as a strip, and leave the
+   * head an ANIM lookup into it. The driver - the clock, or a sensor - is NOT baked: it is
+   * still read live on every device frame, and everything else in the graph is untouched.
+   * What the bake freezes is the branch's shape, which is the expensive part.
+   */
+  function bakeFor(node: NodeLike, slot: number): number {
+    const p = node.properties;
+    const link = node.inputs?.[0]?.link;
+    const l = link == null ? null : graph.links[link];
+    const from = l ? byId.get(l.origin_id) : undefined;
+    if (!from || visiting.has(from.id)) return scalar(0); // nothing wired in: nothing to bake
+
+    const frames = Math.max(2, Math.min(256, Math.round(num(p.frames)) || 2));
+    if (h * frames > MAX_STRIP_ROWS) {
+      overflow ||= `baked strip is ${h * frames} rows - drop the frame count or the resolution`;
+      return scalar(0);
+    }
+    const sub = compileFrom(graph, images, w, h, from, l!.origin_slot);
+    if (!sub.ok) {
+      overflow ||= sub.reason;
+      return scalar(0);
+    }
+
+    const byTime = p.driver !== "sensor";
+    const range = Math.max(0, RANGES.indexOf(String(p.range) as never));
+    const slotIndex = Math.max(0, Math.min(255, Math.round(num(p.slot))));
+    const seconds = num(p.seconds) > 0 ? num(p.seconds) : 1;
+    const settings = `${byTime}|${frames}|${seconds}|${slotIndex}|${range}|${w}|${h}`;
+
+    let at = assetOf.get(node.id);
+    if (at === undefined) {
+      const key = `${settings}|${subKey(sub.program)}`;
+      // Rendering thousands of pixels per frame of the strip is not something to redo on
+      // every editor frame, and the only thing that can change what comes out is the
+      // sub-program plus these settings - so that pair is the cache key.
+      let hit = bakeCache.get(node.id);
+      if (!hit || hit.key !== key) {
+        hit = { key, asset: bakeStrip(sub.program, { frames, w, h, byTime, seconds, range, slot: slotIndex }) };
+        bakeCache.set(node.id, hit);
+      }
+      at = use(node.id, hit.asset);
+    }
+
+    const uv = emit(OP.UV, []);
+    // Time in cycles of `seconds`, or the sensor reading squashed to 0..1 - the same unit
+    // the strip was swept over, so frame k on the head is the frame k that was rendered.
+    const phase = byTime
+      ? emit(OP.TIME, [scalar(1 / seconds)])
+      : emit(OP.SENSOR, [scalar(0)], slotIndex, (range << 1) | 1);
+    if (!byTime) sensorCount = Math.max(sensorCount, slotIndex + 1);
+    // clamp, nearest: the strip is the panel, sampled 1:1. loop only when time drives it.
+    const flags = 1 | (p.crossfade ? 16 : 0) | (byTime ? 32 : 0) | (slot === 1 ? 8 : 0);
+    return emit(OP.ANIM, [uv, phase], at, flags);
   }
 
   /** Emits the instruction producing `slot` of `node`, and returns its operand byte. */
@@ -144,6 +229,13 @@ export function compile(graph: GraphLike, images: Map<number, ImageBuf>, w = 64,
     if (!def) return scalar(0);
     if (visiting.has(node.id)) return scalar(0);  // belt and braces; the loop below cuts cycles
     if (def.konst) return constant(def.konst(node.properties));
+    if (def.bake) {
+      visiting.add(node.id);
+      const reg = bakeFor(node, slot);
+      visiting.delete(node.id);
+      done.set(key, reg);
+      return reg;
+    }
 
     const spec = def.outs?.[slot];
     if (!spec) return scalar(0);
@@ -162,6 +254,7 @@ export function compile(graph: GraphLike, images: Map<number, ImageBuf>, w = 64,
       );
     });
     for (const name of def.args ?? []) src.push(scalar(num(node.properties[name])));
+    for (const v of def.argsVec?.(node.properties) ?? []) src.push(constant(v));
     visiting.delete(node.id);
 
     const aux = def.asset ? assetFor(node) : (spec.aux?.(node.properties) ?? 0);
@@ -171,7 +264,7 @@ export function compile(graph: GraphLike, images: Map<number, ImageBuf>, w = 64,
     return reg;
   }
 
-  visit(out, 0);
+  visit(root, rootSlot);
   if (overflow) return { ok: false, reason: overflow };
 
   return {
@@ -195,10 +288,11 @@ export function compile(graph: GraphLike, images: Map<number, ImageBuf>, w = 64,
  */
 export function packImage(img: ImageBuf): PackedAsset {
   const px = img.w * img.h;
+  const frames = Math.max(1, img.frames || 1);
   let opaque = true;
   for (let i = 3; i < px * 4 && opaque; i += 4) opaque = img.data[i] === 255;
 
-  if (!opaque) return { w: img.w, h: img.h, format: ASSET.RGBA8888, data: Uint8Array.from(img.data) };
+  if (!opaque) return { w: img.w, h: img.h, frames, format: ASSET.RGBA8888, data: Uint8Array.from(img.data) };
 
   const data = new Uint8Array(px * 2);
   for (let i = 0, o = 0; i < px; i++, o += 2) {
@@ -206,7 +300,113 @@ export function packImage(img: ImageBuf): PackedAsset {
     data[o] = v & 0xff;
     data[o + 1] = v >> 8;
   }
-  return { w: img.w, h: img.h, format: ASSET.RGB565, data };
+  return { w: img.w, h: img.h, frames, format: ASSET.RGB565, data };
+}
+
+// ---------------------------------------------------------------------------
+// Bake. Spend the browser's CPU and some flash so the head does not have to compute the
+// same picture over and over. What comes out is a strip of frames and an ANIM that indexes
+// it live - a partial bake, not a pre-rendered face: the driver, and every other branch of
+// the graph, still run per frame on the device.
+// ---------------------------------------------------------------------------
+
+/** An uploadless Image node. One object, not one per compile, so a bake key stays stable. */
+const EMPTY_ASSET: PackedAsset = { w: 1, h: 1, frames: 1, format: ASSET.RGBA8888, data: new Uint8Array(4) };
+
+/** A strip's height is a uint16 in the container. */
+const MAX_STRIP_ROWS = 65535;
+
+const bakeCache = new Map<number, { key: string; asset: PackedAsset }>();
+
+// Packed assets are cached on the ImageBuf, so the same upload is the same object every
+// compile: identity is a cheap stand-in for hashing megabytes of pixels once a frame.
+const assetIds = new WeakMap<PackedAsset, number>();
+let nextAssetId = 0;
+function idOf(a: PackedAsset): number {
+  let id = assetIds.get(a);
+  if (id === undefined) assetIds.set(a, (id = ++nextAssetId));
+  return id;
+}
+
+/** Everything about a sub-program that could change what baking it produces. */
+function subKey(p: Program): string {
+  return `${p.code.join(",")}/${Array.from(p.consts).join(",")}/${p.assets.map(idOf).join(",")}`;
+}
+
+/**
+ * Inverse of the UNIT squash below: the raw reading whose Unit output is `u`. Sweeping the
+ * raw value through here and indexing the strip by Unit means frame k on the head is
+ * exactly the frame k that was rendered, for every range including the unbounded ones.
+ */
+export function sweepRaw(range: number, u: number): number {
+  const c = Math.min(Math.max(u, 0), 0.98); // the saturating ranges only reach 1 at infinity
+  switch (range) {
+    case 1:
+      return c * 2 - 1;
+    case 2:
+      return c / (1 - c);
+    case 3: {
+      const y = c * 2 - 1;
+      return y / (1 - Math.abs(y));
+    }
+    case 4:
+      return u * 360;
+    default:
+      return u;
+  }
+}
+
+export interface BakeOptions {
+  frames: number;
+  w: number;
+  h: number;
+  /** true: sweep the clock over `seconds`. false: sweep sensor `slot` across its range. */
+  byTime: boolean;
+  seconds: number;
+  range: number;
+  slot: number;
+}
+
+/**
+ * Renders `program` once per frame into one tall strip. Alpha survives - the sub-program
+ * ends at the baked branch, not at an LED Output, so a baked sprite still composites.
+ */
+export function bakeStrip(program: Program, o: BakeOptions): PackedAsset {
+  const runner = new Runner(program);
+  const env: Env = { x: 0, y: 0, u: 0, v: 0, w: o.w, h: o.h, t: 0, frame: 0 };
+  const colour: Vec = [0, 0, 0, 1];
+  const data = new Uint8ClampedArray(o.w * o.h * o.frames * 4);
+  const sensors: number[] = [];
+
+  for (let f = 0, p = 0; f < o.frames; f++) {
+    if (o.byTime) {
+      // The START of the frame's slice, not its middle: with crossfade on, that is what the
+      // lerp between frame f and f+1 assumes, and it makes the loop close exactly at
+      // `seconds`. Without crossfade it is half a frame early, which no eye will find.
+      env.t = (f * o.seconds) / o.frames;
+      env.frame = f;
+      env.sensors = undefined;
+    } else {
+      // Hold mode maps 0..1 across the strip with both ends included, so the last frame is
+      // the one the sensor shows at full scale.
+      sensors[o.slot] = sweepRaw(o.range, f / (o.frames - 1));
+      env.sensors = sensors;
+    }
+    for (let y = 0; y < o.h; y++) {
+      for (let x = 0; x < o.w; x++, p += 4) {
+        env.x = x;
+        env.y = y;
+        env.u = (x + 0.5) / o.w;
+        env.v = (y + 0.5) / o.h;
+        runner.run(env, colour);
+        data[p] = Math.round(colour[0] * 255);
+        data[p + 1] = Math.round(colour[1] * 255);
+        data[p + 2] = Math.round(colour[2] * 255);
+        data[p + 3] = Math.round(clamp01(colour[3]) * 255);
+      }
+    }
+  }
+  return packImage({ w: o.w, h: o.h * o.frames, frames: o.frames, data });
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +571,24 @@ export class Runner {
         case OP.TEX:
           texture(regs, d, assets[aux], a0[i0], a0[i0 + 1], aux2);
           break;
+        case OP.ANIM:
+          animation(regs, d, assets[aux], a0[i0], a0[i0 + 1], of(code[b + 3])[at(code[b + 3])], aux2);
+          break;
+        case OP.PARTICLES:
+          particles(
+            regs,
+            d,
+            assets[aux],
+            a0[i0],
+            a0[i0 + 1],
+            of(code[b + 3])[at(code[b + 3])],
+            of(code[b + 4]),
+            at(code[b + 4]),
+            of(code[b + 5]),
+            at(code[b + 5]),
+            aux2,
+          );
+          break;
         case OP.OUTPUT: {
           // An LED is on or off; there is nothing behind it to show through, so alpha
           // composites against black here - the one place transparency gets resolved.
@@ -410,13 +628,14 @@ function hsv(r: Float32Array, d: number, h: number, s: number, v: number, a: num
   r[d + 3] = a;
 }
 
-/** Reads the packed asset bytes - the same ones the .bin carries and the ESP32 samples. */
-function texel(a: PackedAsset, xi: number, yi: number, wrap: number, out: Vec): void {
+/** Reads the packed asset bytes - the same ones the .bin carries and the ESP32 samples.
+    Coordinates are frame-local: yi runs 0..rows-1, and `base` is the frame's first row. */
+function texel(a: PackedAsset, xi: number, yi: number, base: number, rows: number, wrap: number, out: Vec): void {
   const fold = (t: number, n: number): number => (wrap !== 0 ? Math.min(Math.max(t, 0), n - 1) : ((t % n) + n) % n);
-  const i = fold(yi, a.h) * a.w + fold(xi, a.w);
+  const i = (base + fold(yi, rows)) * a.w + fold(xi, a.w);
   // clip keeps the edge COLOUR but drops the alpha, so a linear fetch at the boundary fades
   // out instead of fading to black and leaving a dark fringe round the sprite.
-  const clipped = wrap === 2 && (xi < 0 || yi < 0 || xi >= a.w || yi >= a.h);
+  const clipped = wrap === 2 && (xi < 0 || yi < 0 || xi >= a.w || yi >= rows);
   if (a.format === ASSET.RGBA8888) {
     out[0] = a.data[i * 4] / 255;
     out[1] = a.data[i * 4 + 1] / 255;
@@ -434,41 +653,159 @@ function texel(a: PackedAsset, xi: number, yi: number, wrap: number, out: Vec): 
   }
 }
 
+// Scratch quads, reused so a frame does not allocate once per texel fetch.
 const t0: Vec = [0, 0, 0, 0];
 const t1: Vec = [0, 0, 0, 0];
 const t2: Vec = [0, 0, 0, 0];
 const t3: Vec = [0, 0, 0, 0];
+const t4: Vec = [0, 0, 0, 0];
+const tex: Vec = [0, 0, 0, 0];
+
+/** One frame of one asset at (u, v) in 0..1 of that frame, into `out`. Mirrors
+    ProtoShadeRuntime::sampleFrame - every fetch in the VM comes through here. */
+function sampleFrame(a: PackedAsset, frame: number, u: number, v: number, flags: number, out: Vec): void {
+  const f = Math.fround;
+  const frames = Math.max(1, a.frames);
+  const rows = (a.h / frames) | 0;
+  const base = Math.min(Math.max(frame, 0), frames - 1) * rows;
+  const wrap = flags & 3;
+  // fround, not the plain product: the device multiplies in single precision, and when the
+  // exact product sits a hair under a texel boundary the two rounding modes land on
+  // different texels. That is a whole wrong pixel, not a rounding difference.
+  if ((flags & 4) === 0) {
+    texel(a, Math.floor(f(u * a.w)), Math.floor(f(v * rows)), base, rows, wrap, out);
+    return;
+  }
+  const x = f(f(u * a.w) - 0.5);
+  const y = f(f(v * rows) - 0.5);
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const fx = f(x - x0);
+  const fy = f(y - y0);
+  texel(a, x0, y0, base, rows, wrap, t0);
+  texel(a, x0 + 1, y0, base, rows, wrap, t1);
+  texel(a, x0, y0 + 1, base, rows, wrap, t2);
+  texel(a, x0 + 1, y0 + 1, base, rows, wrap, t3);
+  for (let c = 0; c < 4; c++) {
+    const top = t0[c] + (t1[c] - t0[c]) * fx;
+    out[c] = top + (t2[c] + (t3[c] - t2[c]) * fx - top) * fy;
+  }
+}
+
+/** Writes an RGBA quad to a register, or just its alpha when the alpha-out flag is set. */
+function writeTexel(r: Float32Array, d: number, rgba: Vec, flags: number): void {
+  if ((flags & 8) !== 0) {
+    broadcast(r, d, rgba[3]);
+    return;
+  }
+  r[d] = rgba[0];
+  r[d + 1] = rgba[1];
+  r[d + 2] = rgba[2];
+  r[d + 3] = rgba[3];
+}
 
 function texture(r: Float32Array, d: number, a: PackedAsset | undefined, u: number, v: number, flags: number): void {
   if (!a) {
     r[d] = r[d + 1] = r[d + 2] = r[d + 3] = 0;
     return;
   }
-  const wrap = flags & 3;
-  if ((flags & 4) === 0) {
-    texel(a, Math.floor(u * a.w), Math.floor(v * a.h), wrap, t0);
-  } else {
-    const x = u * a.w - 0.5;
-    const y = v * a.h - 0.5;
-    const x0 = Math.floor(x);
-    const y0 = Math.floor(y);
-    const fx = x - x0;
-    const fy = y - y0;
-    texel(a, x0, y0, wrap, t0);
-    texel(a, x0 + 1, y0, wrap, t1);
-    texel(a, x0, y0 + 1, wrap, t2);
-    texel(a, x0 + 1, y0 + 1, wrap, t3);
-    for (let c = 0; c < 4; c++) {
-      const top = t0[c] + (t1[c] - t0[c]) * fx;
-      t0[c] = top + (t2[c] + (t3[c] - t2[c]) * fx - top) * fy;
-    }
-  }
-  if ((flags & 8) !== 0) {
-    broadcast(r, d, t0[3]);
+  sampleFrame(a, 0, u, v, flags, tex);
+  writeTexel(r, d, tex, flags);
+}
+
+/** Frame `phase` of a strip. flags bit 4 crossfades between neighbours, bit 5 loops. */
+function animation(r: Float32Array, d: number, a: PackedAsset | undefined, u: number, v: number, phase: number, flags: number): void {
+  if (!a) {
+    r[d] = r[d + 1] = r[d + 2] = r[d + 3] = 0;
     return;
   }
-  r[d] = t0[0];
-  r[d + 1] = t0[1];
-  r[d + 2] = t0[2];
-  r[d + 3] = t0[3];
+  const frames = Math.max(1, a.frames);
+  // loop: phase counts whole cycles. hold: phase is 0..1 across the strip, clamped.
+  // Either way the index is floored onto a frame that exists - a phase between two frames
+  // picks one of them, it does not conjure an image that was never drawn. Crossfade (bit 4)
+  // is how you ask for that dissolve on purpose.
+  const f = Math.fround;
+  const t = (flags & 32) !== 0 ? f(f(phase - Math.floor(phase)) * frames) : f(clamp01(phase) * (frames - 1));
+  const f0 = Math.min(Math.floor(t), frames - 1);
+  sampleFrame(a, f0, u, v, flags, tex);
+  if ((flags & 16) !== 0) {
+    const f1 = (flags & 32) !== 0 ? (f0 + 1) % frames : Math.min(f0 + 1, frames - 1);
+    sampleFrame(a, f1, u, v, flags, t4);
+    const k = f(t - f0);
+    for (let c = 0; c < 4; c++) tex[c] += (t4[c] - tex[c]) * k;
+  }
+  writeTexel(r, d, tex, flags);
+}
+
+/**
+ * The particle system, pixel by pixel. Mirrors the Particles case in the C++ VM step for
+ * step, including Math.fround around every arithmetic operation: the device does this in
+ * single precision, and a particle position that differs in the last bit picks a different
+ * texel under nearest filtering, which is a visibly wrong pixel rather than a rounding
+ * difference. Doubles here would be the preview quietly lying.
+ */
+function particles(r: Float32Array, d: number, a: PackedAsset | undefined, px: number, py: number, t: number, pa: Float32Array, ia: number, pb: Float32Array, ib: number, flags: number): void {
+  r[d] = r[d + 1] = r[d + 2] = r[d + 3] = 0;
+  const size = pa[ia + 1];
+  const n = Math.min(MAX_PARTICLES, Math.max(0, Math.floor(pa[ia]) || 0));
+  if (!a || n === 0 || !(size > 0)) return;
+
+  const f = Math.fround;
+  const speed = pa[ia + 2];
+  const spread = pa[ia + 3];
+  const gravity = pb[ib];
+  const seed = Math.min(65535, Math.max(0, pb[ib + 1])) >>> 0;
+  const life = pb[ib + 2] > 0 ? pb[ib + 2] : 1;
+  const fade = clamp01(pb[ib + 3]);
+  const invSize = f(1 / size);
+  const invLife = f(1 / life);
+  const frames = Math.max(1, a.frames);
+
+  for (let i = 0; i < n; i++) {
+    const h0 = hashU32((Math.imul(i, 0x9e3779b9) + seed) >>> 0);
+    const h1 = hashU32(h0);
+    const h2 = hashU32(h1);
+    const h3 = hashU32(h2);
+    const phase = f(f(t * invLife) + unitOf(h0));
+    const age = f(phase - Math.floor(phase)); // staggered, so the swarm does not restart as one
+    const lived = f(age * life);
+    const vx = f(f(f(f(unitOf(h1) * 2) - 1) * spread) * speed);
+    const vy = f(-speed * f(0.5 + f(0.5 * unitOf(h2))));
+    const cx = f(vx * lived);
+    const cy = f(f(vy * lived) + f(f(0.5 * gravity) * f(lived * lived)));
+    sampleFrame(
+      a,
+      Math.floor(unitOf(h3) * frames),
+      f(f(f(px - cx) * invSize) + 0.5),
+      f(f(f(py - cy) * invSize) + 0.5),
+      (flags & 4) | 2, // clip: a particle is its sprite and nothing else
+      t4,
+    );
+    overInto(r, d, t4, f(1 - f(fade * age)));
+  }
+}
+
+/** Murmur3's finaliser. Must agree with hashU32 in the C++ VM bit for bit. */
+function hashU32(x: number): number {
+  x = (x ^ (x >>> 16)) >>> 0;
+  x = Math.imul(x, 0x7feb352d) >>> 0;
+  x = (x ^ (x >>> 15)) >>> 0;
+  x = Math.imul(x, 0x846ca68b) >>> 0;
+  return (x ^ (x >>> 16)) >>> 0;
+}
+
+/** 0..1 from the top sixteen bits - exact in a float as well as a double. */
+const unitOf = (h: number): number => (h >>> 16) / 65536;
+
+/** Straight-alpha source-over into a register, in place. */
+function overInto(r: Float32Array, d: number, fg: Vec, fa: number): void {
+  const af = clamp01(fg[3]) * clamp01(fa);
+  const ab = clamp01(r[d + 3]);
+  const alpha = af + ab * (1 - af);
+  if (alpha === 0) {
+    r[d] = r[d + 1] = r[d + 2] = r[d + 3] = 0;
+    return;
+  }
+  for (let c = 0; c < 3; c++) r[d + c] = (fg[c] * af + r[d + c] * ab * (1 - af)) / alpha;
+  r[d + 3] = alpha;
 }

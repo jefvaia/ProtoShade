@@ -34,6 +34,8 @@ export const OP = {
   HSV: 10, // src0..3 = hue, sat, val, alpha
   TEX: 11, // aux = asset, aux2 = wrap | filter << 2 | alpha-out << 3; src0 = uv
   OUTPUT: 12, // src0 = colour, src1 = brightness. Always the last instruction.
+  ANIM: 13, // aux = asset, aux2 = tex flags | crossfade << 4 | loop << 5; src0 = uv, src1 = phase
+  PARTICLES: 14, // aux = asset, aux2 = filter << 2; src0 = position, src1 = time, src2/src3 = params
 } as const;
 export type OpCode = (typeof OP)[keyof typeof OP];
 
@@ -89,10 +91,16 @@ export const RANGES = ["0..1", "-1..1", "0..inf", "-inf..inf", "0..360"] as cons
 /** Asset pixel formats, matching protoshade::AssetFormat. */
 export const ASSET = { RGB565: 0, RGBA8888: 1, A8: 2 } as const;
 
+/** Sprites one PARTICLES instruction may draw. Mirrors format::kMaxParticles. */
+export const MAX_PARTICLES = 64;
+
 export interface PackedAsset {
   w: number;
+  /** The whole strip. One frame is h / frames rows. */
   h: number;
   format: number;
+  /** Frames stacked top to bottom. 1 is a still, and a still is all a plain Image packs. */
+  frames: number;
   /** Exactly the bytes that go into the .bin, and exactly what TEX samples in the preview. */
   data: Uint8Array;
 }
@@ -101,6 +109,7 @@ export interface PackedAsset {
 export interface ImageBuf {
   w: number;
   h: number;
+  frames: number;
   data: Uint8ClampedArray;
   packed?: PackedAsset;
 }
@@ -134,7 +143,8 @@ export interface PropDef {
 export type Fallback =
   | { prop: string } // the node's own widget
   | { value: number } // a literal
-  | { uv: true }; // synthesise a UV instruction (only the Image node needs this)
+  | { emit: OpCode; arg?: string }; // synthesise an instruction - a UV for an unwired image,
+// a Time for an unwired animation phase. `arg` names the widget that becomes its operand.
 
 export interface OutSpec {
   op: OpCode;
@@ -152,6 +162,9 @@ export interface NodeDef {
   fallback?: Fallback[];
   /** Extra operands taken straight from widgets, appended after `in`. */
   args?: string[];
+  /** Extra operands as packed quads, appended after `args`. Four knobs for one operand byte
+      is how a particle system fits its parameters into an eight-byte instruction. */
+  argsVec?: (p: Props) => Vec[];
   out: string[];
   /** One entry per output. Absent on a node that is purely a constant. */
   outs?: OutSpec[];
@@ -159,6 +172,9 @@ export interface NodeDef {
   konst?: (p: Props) => Vec;
   /** TEX nodes: the compiler fills aux with the asset slot it assigned this node. */
   asset?: true;
+  /** The node's input branch is rendered here in the browser and packed as a strip, and the
+      node itself becomes an ANIM lookup into it. See bake.ts. */
+  bake?: true;
   props?: Record<string, PropDef>;
 }
 
@@ -166,6 +182,7 @@ const num = (v: unknown): number => (typeof v === "number" ? v : Number(v) || 0)
 const pick = (list: readonly string[], v: unknown): number => Math.max(0, list.indexOf(String(v) as never));
 const slotOf = (p: Props): number => Math.max(0, Math.round(num(p.index)));
 const texFlags = (p: Props): number => pick(WRAPS, p.wrap) | (p.filter === "linear" ? 4 : 0);
+const animFlags = (p: Props): number => texFlags(p) | (p.crossfade ? 16 : 0) | (p.loop === false ? 0 : 32);
 
 export const OUTPUT_TYPE = "output/led";
 
@@ -315,7 +332,7 @@ export const NODES: Record<string, NodeDef> = {
     color: "#a63",
     desc: "Upload a PNG/JPG; it is packed into the .bin. Color carries the image's alpha",
     in: ["Vector"],
-    fallback: [{ uv: true }],
+    fallback: [{ emit: OP.UV }],
     out: ["Color", "Alpha"],
     asset: true,
     outs: [
@@ -326,6 +343,106 @@ export const NODES: Record<string, NodeDef> = {
       file: { type: "image", value: "" },
       wrap: { type: "combo", value: "clip", options: { values: WRAPS } },
       filter: { type: "combo", value: "nearest", options: { values: ["nearest", "linear"] } },
+    },
+  },
+
+  "texture/animation": {
+    title: "Animation",
+    color: "#a63",
+    desc:
+      "A strip of frames: a GIF/APNG/WebP, several PNGs at once, or one tall sprite sheet. " +
+      "Phase picks the frame - wire Time for an animation, a Sensor for a blend shape",
+    in: ["Vector", "Phase"],
+    // Nothing wired into Phase: run it off time at the node's own speed, so an animation
+    // plays the moment you drop it in.
+    fallback: [{ emit: OP.UV }, { emit: OP.TIME, arg: "speed" }],
+    out: ["Color", "Alpha"],
+    asset: true,
+    outs: [
+      { op: OP.ANIM, aux2: animFlags },
+      { op: OP.ANIM, aux2: (p) => animFlags(p) | 8 },
+    ],
+    props: {
+      file: { type: "image", value: "" },
+      // Set by the import, editable by hand for a sprite sheet that was already one file.
+      frames: { type: "number", value: 1, options: { min: 1, max: 1024, step: 10 } },
+      // loop: Phase counts whole cycles and wraps - an animation.
+      // off:  Phase is 0..1 across the strip and holds at both ends - a blend shape, where
+      //       0.5 means "the middle frame", not "half of frame 1 and half of frame 2".
+      loop: { type: "toggle", value: true },
+      // Off, a phase between two frames picks one of them. On, it dissolves between them -
+      // which invents in-between images, costs a second fetch, and is usually not what a
+      // blend shape wants.
+      crossfade: { type: "toggle", value: false },
+      speed: { type: "number", value: 1, options: { step: 10 } },
+      wrap: { type: "combo", value: "clip", options: { values: WRAPS } },
+      filter: { type: "combo", value: "nearest", options: { values: ["nearest", "linear"] } },
+    },
+  },
+
+  "texture/particles": {
+    title: "Particles",
+    color: "#a63",
+    desc:
+      "Sprites from the image, drifting. One instruction, no state: every particle is a " +
+      "function of its index and the time, so it costs flash nothing and RAM nothing",
+    in: ["Vector", "Time"],
+    // Centered, not UV: particles live in aspect-corrected space, so a round sprite on a
+    // 64x32 panel stays round. Offset the input to move the emitter off the middle.
+    fallback: [{ emit: OP.CENTERED }, { emit: OP.TIME, arg: "speed" }],
+    out: ["Color", "Alpha"],
+    asset: true,
+    outs: [
+      { op: OP.PARTICLES, aux2: (p) => (p.filter === "linear" ? 4 : 0) },
+      { op: OP.PARTICLES, aux2: (p) => (p.filter === "linear" ? 4 : 0) | 8 },
+    ],
+    // Two quads, in the order the VM reads them. Eight knobs, two operand bytes.
+    argsVec: (p) => [
+      [Math.min(MAX_PARTICLES, Math.max(0, Math.round(num(p.count)))), num(p.size), num(p.rise), num(p.spread)],
+      [num(p.gravity), Math.round(num(p.seed)), num(p.life), num(p.fade)],
+    ],
+    props: {
+      file: { type: "image", value: "" },
+      // A strip works here too: each particle picks one frame and keeps it, so one upload
+      // of several drawings is a swarm of different shapes rather than one repeated.
+      frames: { type: "number", value: 1, options: { min: 1, max: 1024, step: 10 } },
+      count: { type: "number", value: 16, options: { min: 0, max: MAX_PARTICLES, step: 10 } },
+      size: { type: "number", value: 0.25, options: { min: 0.01, max: 4, step: 1 } },
+      rise: { type: "number", value: 0.6, options: { step: 1 } },
+      spread: { type: "number", value: 0.5, options: { step: 1 } },
+      gravity: { type: "number", value: 0.4, options: { step: 1 } },
+      life: { type: "number", value: 2, options: { min: 0.01, max: 60, step: 1 } },
+      fade: { type: "number", value: 1, options: { min: 0, max: 1, step: 1 } },
+      seed: { type: "number", value: 1, options: { min: 0, max: 65535, step: 10 } },
+      // Only used when nothing is wired into Time: 1 is real time.
+      speed: { type: "number", value: 1, options: { step: 10 } },
+      filter: { type: "combo", value: "nearest", options: { values: ["nearest", "linear"] } },
+    },
+  },
+
+  "bake/bake": {
+    title: "Bake",
+    color: "#63a",
+    desc:
+      "Renders its input here in the browser, over time or over a sensor, and ships the " +
+      "frames as an image. The branch above it stops costing the head anything; everything " +
+      "else in the graph stays live",
+    in: ["Color"],
+    fallback: [{ value: 0 }],
+    out: ["Color", "Alpha"],
+    bake: true,
+    props: {
+      // What the baked strip is indexed BY. That driver stays live on the head - the frame
+      // is picked per frame from the real clock or the real sensor.
+      driver: { type: "combo", value: "time", options: { values: ["time", "sensor"] } },
+      frames: { type: "number", value: 16, options: { min: 2, max: 256, step: 10 } },
+      // driver = time: the span baked, and the period it loops over.
+      seconds: { type: "number", value: 2, options: { min: 0.01, max: 600, step: 1 } },
+      // driver = sensor: which slot, and what it reports. The frame is picked by that
+      // reading squashed to 0..1, the same squash the Sensor node's Unit output does.
+      slot: { type: "number", value: 0, options: { min: 0, max: 255, step: 10 } },
+      range: { type: "combo", value: "0..1", options: { values: RANGES } },
+      crossfade: { type: "toggle", value: false },
     },
   },
 
@@ -351,54 +468,150 @@ export const NODES: Record<string, NodeDef> = {
 /** Decoded uploads, by node id. Lives here because both the widget and the compiler need it. */
 export const images = new Map<number, ImageBuf>();
 
-/** The panel is at most 512 px a side (format::kMaxDimension); above that is dead weight in
-    a flash partition. */
+/** One FRAME is at most 512 px a side (format::kMaxDimension); above that is dead weight in
+    a flash partition. A strip of n frames is n times as tall as that, and no taller than the
+    uint16 the container stores a height in. */
 const MAX_IMAGE = 512;
+const MAX_STRIP = 65535;
 
-/** Decode a data URL into `images`. Rejects if the browser cannot decode it. */
-export async function decodeInto(id: number, src: string): Promise<void> {
+/**
+ * Decode a data URL into `images`. A strip of `frames` frames stacked top to bottom - one
+ * image is the frames = 1 case, which is what a plain Image node always is.
+ * Rejects if the browser cannot decode it.
+ */
+export async function decodeInto(id: number, src: string, frames = 1): Promise<void> {
   const img = new Image();
   img.src = src;
   await img.decode();
-  const scale = Math.min(1, MAX_IMAGE / Math.max(img.naturalWidth, img.naturalHeight));
+  const n = Math.max(1, Math.min(MAX_STRIP, Math.round(frames)));
+  // Scale by the FRAME, not the strip: eight 64x64 frames is a legitimate 64x512 image, and
+  // shrinking it to fit 512 overall would throw away seven eighths of the animation.
+  const scale = Math.min(1, MAX_IMAGE / img.naturalWidth, (MAX_IMAGE * n) / img.naturalHeight);
   const w = Math.max(1, Math.round(img.naturalWidth * scale));
-  const h = Math.max(1, Math.round(img.naturalHeight * scale));
+  // Rounded to a whole number of frames, so a frame is an exact number of rows on both
+  // sides of the wire - the runtime divides height by frames and expects no remainder.
+  const rows = Math.max(1, Math.round((img.naturalHeight * scale) / n));
+  const h = rows * n;
   const c = document.createElement("canvas");
   c.width = w;
   c.height = h;
   const g = c.getContext("2d");
   if (!g) throw new Error("2d context unavailable");
   g.drawImage(img, 0, 0, w, h);
-  images.set(id, { w, h, data: g.getImageData(0, 0, w, h).data });
+  images.set(id, { w, h, frames: n, data: g.getImageData(0, 0, w, h).data });
 }
 
-/** What the Image node's button says: the decoded size, so you can see what is loaded. */
+/** What the upload button says: what is loaded, so you can see it took. */
 export function imageLabel(id: number): string {
   const img = images.get(id);
-  return img ? `${img.w} x ${img.h}` : "upload image";
+  if (!img) return "upload image";
+  return img.frames > 1 ? `${img.w} x ${img.h / img.frames} x ${img.frames}f` : `${img.w} x ${img.h}`;
 }
 
-/** Ask for a file, decode it, and keep the data URL in node.properties[key] for the save. */
+/** WebCodecs, for the frames inside an animated GIF / APNG / WebP. Chrome and Edge have it;
+    everywhere else an animation is still several PNGs, or one sprite sheet. */
+interface ImageDecoderLike {
+  tracks: { ready: Promise<void>; selectedTrack?: { frameCount: number } };
+  completed: Promise<void>;
+  decode(o: { frameIndex: number }): Promise<{ image: CanvasImageSource }>;
+}
+const ImageDecoderCtor = (globalThis as { ImageDecoder?: new (o: { data: ArrayBuffer; type: string }) => ImageDecoderLike })
+  .ImageDecoder;
+
+/** Draws `sources` into one vertical strip and returns it as a PNG data URL. */
+function strip(sources: CanvasImageSource[], w: number, h: number): string {
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h * sources.length;
+  const g = c.getContext("2d");
+  if (!g) throw new Error("2d context unavailable");
+  sources.forEach((s, i) => g.drawImage(s, 0, i * h, w, h));
+  return c.toDataURL("image/png");
+}
+
+/** An <img> reports naturalWidth, a decoded VideoFrame reports displayWidth. */
+function sizeOf(s: CanvasImageSource): [number, number] {
+  const v = s as { naturalWidth?: number; displayWidth?: number; width?: number; naturalHeight?: number; displayHeight?: number; height?: number };
+  return [v.naturalWidth || v.displayWidth || Number(v.width) || 1, v.naturalHeight || v.displayHeight || Number(v.height) || 1];
+}
+
+const readDataUrl = (file: File): Promise<string> =>
+  new Promise((ok, fail) => {
+    const r = new FileReader();
+    r.onload = () => ok(String(r.result));
+    r.onerror = () => fail(r.error);
+    r.readAsDataURL(file);
+  });
+
+async function decodeFile(file: File): Promise<HTMLImageElement> {
+  const img = new Image();
+  img.src = await readDataUrl(file);
+  await img.decode();
+  return img;
+}
+
+/** Every frame of an animated file, or [] when it is not one (or the browser cannot say). */
+async function animationFrames(file: File): Promise<CanvasImageSource[]> {
+  if (!ImageDecoderCtor) return [];
+  try {
+    const decoder = new ImageDecoderCtor({ data: await file.arrayBuffer(), type: file.type });
+    await decoder.tracks.ready;
+    await decoder.completed; // frameCount is only final once the whole file is in
+    const count = decoder.tracks.selectedTrack?.frameCount ?? 1;
+    if (count < 2) return [];
+    const out: CanvasImageSource[] = [];
+    for (let i = 0; i < Math.min(count, MAX_STRIP); i++) out.push((await decoder.decode({ frameIndex: i })).image);
+    return out;
+  } catch {
+    return []; // not an animation, or a codec this browser will not open
+  }
+}
+
+/**
+ * Ask for files and turn whatever comes back into one strip:
+ *   several files    one frame each, in filename order - export a sequence from anywhere
+ *   one animation    its own frames, via WebCodecs
+ *   one still        a single frame, or a sprite sheet if the node's frame count says so
+ * The strip is what gets saved in node.properties[key], not the originals: one data URL to
+ * restore instead of n, and it is already the layout the .bin wants.
+ */
 function pickImage(node: LGraphNode, key: string, widget: { name: string }): void {
   const input = document.createElement("input");
   input.type = "file";
   input.accept = "image/*";
+  // Only where frames mean something. Picking four files for a plain Image node would give
+  // you one image four times as tall, which is nobody's intent.
+  input.multiple = "frames" in node.properties;
   input.onchange = async () => {
-    const file = input.files?.[0];
-    if (!file) return;
-    const src = await new Promise<string>((ok, fail) => {
-      const r = new FileReader();
-      r.onload = () => ok(String(r.result));
-      r.onerror = () => fail(r.error);
-      r.readAsDataURL(file);
-    });
+    const files = [...(input.files ?? [])].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    if (files.length === 0) return;
+    const wantsFrames = "frames" in node.properties;
     try {
-      await decodeInto(node.id, src);
+      const frames: CanvasImageSource[] =
+        files.length > 1 ? await Promise.all(files.map(decodeFile)) : wantsFrames ? await animationFrames(files[0]) : [];
+      let src: string;
+      let count: number;
+      if (frames.length > 1) {
+        // Everything is drawn at the first frame's size; a sequence of mismatched images is
+        // a mistake, and scaling them into line is friendlier than refusing the lot.
+        const [w, h] = sizeOf(frames[0]);
+        src = strip(frames, w, h);
+        count = frames.length;
+        // A decoded VideoFrame holds memory the garbage collector will not reclaim for you.
+        for (const f of frames) (f as { close?: () => void }).close?.();
+      } else {
+        src = await readDataUrl(files[0]);
+        // One still: honour a frame count already set on the node, so an existing sprite
+        // sheet can be re-uploaded without losing how it is cut up.
+        count = wantsFrames ? Math.max(1, Math.round(Number(node.properties.frames) || 1)) : 1;
+      }
+      await decodeInto(node.id, src, count);
+      node.properties[key] = src;
+      if (wantsFrames) node.setProperty("frames", count);
     } catch {
       widget.name = "decode failed";
       return;
     }
-    node.properties[key] = src;
     widget.name = imageLabel(node.id);
   };
   input.click();
@@ -427,6 +640,15 @@ export function register(): void {
       if (def.color) {
         this.color = def.color;
         this.bgcolor = "#222";
+      }
+      // Typing a frame count re-cuts a sprite sheet that is already loaded: the strip on
+      // disk does not change, only how many rows one frame is.
+      if (def.props?.file && def.props?.frames) {
+        this.onPropertyChanged = (name: string, value: unknown): void => {
+          const src = this.properties.file;
+          if (name !== "frames" || typeof src !== "string" || !src) return;
+          void decodeInto(this.id, src, Number(value) || 1);
+        };
       }
     } as unknown as { new (): LGraphNode; title: string; desc?: string };
     Node.title = def.title;
