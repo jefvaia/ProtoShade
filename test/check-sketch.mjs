@@ -14,6 +14,8 @@
 
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -49,6 +51,31 @@ for (const unit of units) {
   if (result.status !== 0) {
     failed = true;
     console.error(result.stderr);
+  }
+}
+
+// One piece of the sketch is worth running rather than parsing: the button latch, which is
+// what stands between a press and upload mode. test/button-check.cpp links the sketch
+// against a clock and a pin it owns and drives it.
+if (!failed) {
+  const binary = join(mkdtempSync(join(tmpdir(), "protoshade-sketch-")), "button-check");
+  const build = spawnSync(
+    cxx,
+    [
+      "-std=gnu++11", "-Wall", "-Wextra", "-Wno-unused-parameter",
+      "-DARDUINO_ARCH_ESP32=1", `-I${join(root, "test/arduino-stubs")}`,
+      join(root, "test/button-check.cpp"),
+      join(root, "src/ProtoShadeRuntime.cpp"),
+      join(root, "src/ProtoShadeDisplay.cpp"),
+      "-o", binary,
+    ],
+    { encoding: "utf8" },
+  );
+  if (build.status !== 0) {
+    failed = true;
+    console.error(build.stderr);
+  } else if (spawnSync(binary, { stdio: "inherit" }).status !== 0) {
+    failed = true;
   }
 }
 

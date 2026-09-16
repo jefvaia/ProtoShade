@@ -100,21 +100,56 @@ bool buttonDown() {
   return BUTTON_ACTIVE_LOW ? level == LOW : level == HIGH;
 }
 
-// Debounce by simply requiring it to stay down. A face that flips into upload mode because
-// of a contact bounce is worse than one that needs the button held for a moment.
-bool buttonHeld(uint32_t ms) {
-  if (!buttonDown()) return false;
-  const uint32_t started = millis();
-  while (millis() - started < ms) {
-    if (!buttonDown()) {
-      // Worth saying out loud: "I pressed it and nothing happened" and "the pin never went
-      // low" are different problems, and this is the line that tells them apart.
-      Serial.println("button: saw a press but it was released too early - hold it a moment");
-      return false;
-    }
-    delay(5);
+// The pin latches its own presses, because loop() is not a reliable place to look for one.
+// A frame ends in pusher.submit(), which blocks until the previous push is done, and a push
+// runs whatever Display::push() a head puts in head_config.h - the built-in SerialDisplay
+// writes to a USB port that blocks when nobody is draining it, a panel driver can wait on a
+// bus. Sample the pin once per frame and a press that starts and ends between two slow
+// frames never happened: you press the button, nothing takes, and the pin was never wrong.
+//
+// So an edge interrupt times the press and loop() reads the result whenever it gets round
+// to it, however long that is.
+constexpr uint32_t kButtonHoldMs = 50;
+volatile uint32_t button_down_at = 0;   // millis() when the current press started, 0 if up
+volatile uint32_t button_press_ms = 0;  // how long the last finished press lasted
+
+// IRAM_ATTR because this can fire while the flash cache is off. digitalRead() is not itself
+// IRAM-safe, which is why the interrupt is detached before upload mode erases anything.
+void IRAM_ATTR onButtonEdge() {
+  const uint32_t now = millis();
+  if (buttonDown()) {
+    button_down_at = now;
+  } else if (button_down_at != 0) {
+    button_press_ms = now - button_down_at;
+    button_down_at = 0;
   }
-  return true;
+}
+
+void armButton() {
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonEdge, CHANGE);
+}
+
+// Nothing may latch a press once the window is shut, and nothing may run this handler while
+// the flash cache is off - upload mode erases the program partition.
+void disarmButton() {
+  detachInterrupt(digitalPinToInterrupt(BUTTON_PIN));
+  button_down_at = 0;
+  button_press_ms = 0;
+}
+
+// A press long enough to be a press: one that has finished, or one still being held. Short
+// ones are contact bounce and are said out loud rather than acted on - "I pressed it and
+// nothing happened" and "the pin never moved" are different problems.
+bool buttonPressed() {
+  const uint32_t finished = button_press_ms;
+  if (finished != 0) {
+    button_press_ms = 0;
+    if (finished >= kButtonHoldMs) return true;
+    Serial.printf("button: a %lu ms press is too short - hold it a moment\n",
+                  (unsigned long)finished);
+  }
+  const uint32_t started = button_down_at;
+  return started != 0 && millis() - started >= kButtonHoldMs;
 }
 
 // Mirrors the canvas to whoever is on the other end of the USB cable. The editor picks the
@@ -232,6 +267,9 @@ void reportStats() {
 
 void renderFace() {
   readSensors(SENSORS, SENSOR_COUNT, sensorValues, SENSOR_SLOTS);
+  // The LED is red from setup() until the first frame is on the panels, so this is the line
+  // that says how long that was - and whether a long red light was the boot or the frame.
+  static bool first_frame = true;
 
   // One snapshot per frame, shared by both render tasks. A reading that changed halfway
   // through would put a different value in the top half of the face than the bottom.
@@ -257,6 +295,12 @@ void renderFace() {
     setLed(LedState::Running, "rendering your program");
   }
 
+  if (first_frame) {
+    first_frame = false;
+    Serial.printf("first frame at %lu ms (render %lu us) - the light stops being red here\n",
+                  (unsigned long)millis(), (unsigned long)(rendered - started));
+  }
+
   // Hands the frame to the push task and returns; it blocks only until the PREVIOUS push is
   // done, so rendering the next frame overlaps sending this one.
   pusher.submit(back);
@@ -279,6 +323,7 @@ void renderFace() {
 void enterUploadMode() {
   Serial.println("switching to upload mode: the face stops, WiFi comes up");
   mode = Mode::Upload;
+  disarmButton();  // its job is done, and erasing flash turns the cache off under the handler
 
   // Stop rendering before the flash partition can be erased under us, and give the two
   // render tasks' stacks back to the heap - WiFi and the web server want them more.
@@ -317,6 +362,7 @@ void setup() {
   Serial.printf("button: GPIO %d reads %s at boot%s\n", BUTTON_PIN,
                 buttonDown() ? "PRESSED" : "released",
                 buttonDown() ? "  <-- wrong pin, or BUTTON_ACTIVE_LOW is inverted" : "");
+  armButton();
 
   for (size_t i = 0; i < PANEL_COUNT; i++) {
     if (PANELS[i].display && !PANELS[i].display->begin()) {
@@ -342,9 +388,12 @@ void setup() {
   }
 
   stats.since = millis();
-  Serial.printf("face running at %ux%u. Press the button within %lu s for upload mode, or\n"
-                "type u here at any time, or p to mirror the canvas to the editor.\n",
-                CANVAS_W, CANVAS_H, (unsigned long)(UPLOAD_WINDOW_MS / 1000));
+  // The time, because the light is red for all of it: if the head sits red for seconds on
+  // end, this line and the one from the first frame say which half of the boot ate them.
+  Serial.printf("face running at %ux%u, setup took %lu ms. Press the button within %lu s for\n"
+                "upload mode, or type u here at any time, or p to mirror the canvas.\n",
+                CANVAS_W, CANVAS_H, (unsigned long)millis(),
+                (unsigned long)(UPLOAD_WINDOW_MS / 1000));
 }
 
 void loop() {
@@ -368,12 +417,13 @@ void loop() {
   // point - but say so once, or a press at 61 seconds looks like a broken button.
   static bool window_closed = false;
   if (millis() < UPLOAD_WINDOW_MS) {
-    if (buttonHeld(50)) {
+    if (buttonPressed()) {
       enterUploadMode();
       return;
     }
   } else if (!window_closed) {
     window_closed = true;
+    disarmButton();
     Serial.println("upload window closed - power-cycle for the button, or type u here");
   }
 

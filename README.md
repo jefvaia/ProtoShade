@@ -119,13 +119,20 @@ only thing that ever needed Windows was `build.bat`, and it is a one-line wrappe
 
 ```
 npm install
-npm run build          # typecheck + tests + minified dist/index.html, main.js, styles.css
+npm run build          # typecheck + tests + minified dist/, and the wasm module if em++ is here
 npm run build:wasm     # em++: runs the runtime tests, then emits dist/protoshade.js + .wasm
 npm run build:device   # build, plus data/ - the editor, for the head's LittleFS
 ```
 
-Only `build:wasm` needs emscripten (`source emsdk_env.sh`, or `emsdk_env.bat`). Everything
-else - the editor, every test, the ESP32 sketch - builds without it. The C++ half is also
+`npm run build` ends by building the wasm module too, but only when emscripten is on PATH
+(`source emsdk_env.sh`, or `emsdk_env.bat`); without it that step says so and the build still
+succeeds. `build:wasm` is the same step without the escape hatch, for when you want to be told
+that em++ is missing rather than have it shrug. Everything else - the editor, every test, the
+ESP32 sketch - builds without emscripten at all.
+
+The module is not put on the head: `build:device` ships the editor, and the editor previews by
+interpreting the compiled program in TypeScript, so a quarter of a megabyte of wasm on the
+LittleFS partition would be a quarter of a megabyte nothing loads. The C++ half is also
 checked by the tests below with a plain host compiler, so you do not need emscripten to
 change the runtime, only to reload the wasm module the page probes for.
 
@@ -275,7 +282,15 @@ render into a;      // a is free: submit(b) did not return until its push finish
 
 **Two ways in.** Press the button within 60 seconds of power-on - `BUTTON_PIN` in
 `head_config.h`, GPIO 0 (the BOOT button) by default - holding it for a moment, since a
-contact bounce is ignored on purpose. Press it *after* the board has booted: holding BOOT
+contact bounce is ignored on purpose.
+
+The pin latches its own presses through an edge interrupt, rather than being sampled once a
+frame. A frame ends in `pusher.submit()`, which waits for the previous push, and a push runs
+whatever `Display::push()` your head configures - the built-in `SerialDisplay` writes to a
+USB port that blocks when nobody is draining it. Sampled, a press that starts and ends
+between two slow frames simply never happened, which feels exactly like a broken button and
+is not. Latched, the press waits for `loop()` instead of the other way round.
+`test/button-check.cpp` runs that logic on the host, that case included. Press it *after* the board has booted: holding BOOT
 while resetting puts the chip in its ROM download mode, which is a different thing.
 
 Or **type `u` in the serial monitor**, any time, window or not. No button, no wiring, no
@@ -286,7 +301,7 @@ The serial log says which of those is failing:
 ```
 button: GPIO 0 reads released at boot          <- pin and polarity are right
 button: GPIO 0 reads PRESSED at boot  <-- ...  <- wrong pin, or inverted polarity
-button: saw a press but it was released too early - hold it a moment
+button: a 12 ms press is too short - hold it a moment
 upload window closed - power-cycle for the button, or type u here
 switching to upload mode: the face stops, WiFi comes up
 upload mode: join ProtoShade, open http://192.168.4.1/

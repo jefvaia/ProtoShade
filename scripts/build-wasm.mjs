@@ -22,6 +22,15 @@ const src = (...p) => join(root, ...p);
 // em++ is a shell script on Linux/macOS and a .bat on Windows; spawning through a shell is
 // what makes both resolve off PATH.
 const emxx = process.env.EMXX || "em++";
+
+// --if-available: build the module when emscripten is here, say why not and succeed when it
+// is not. That is what lets `npm run build` ship the wasm without making emscripten a
+// requirement for the editor, the tests or the sketch - none of which need it.
+if (process.argv.includes("--if-available") &&
+    spawnSync(emxx, ["--version"], { shell: true, stdio: "ignore" }).status !== 0) {
+  console.log("wasm: skipped, no emscripten on PATH (source emsdk_env.sh and build again to ship it)");
+  process.exit(0);
+}
 function run(args, label) {
   const result = spawnSync(emxx, args, { stdio: "inherit", shell: true });
   if (result.error || result.status !== 0) {

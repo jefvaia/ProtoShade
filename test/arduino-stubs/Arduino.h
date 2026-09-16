@@ -15,6 +15,9 @@
 #define INPUT_PULLUP 5
 #define INPUT_PULLDOWN 9
 #define RGB_BUILTIN 48
+#define CHANGE 3
+#define IRAM_ATTR
+#define digitalPinToInterrupt(pin) (pin)
 
 unsigned long millis();
 unsigned long micros();
@@ -23,6 +26,8 @@ void pinMode(uint8_t pin, uint8_t mode);
 int digitalRead(uint8_t pin);
 void rgbLedWrite(uint8_t pin, uint8_t r, uint8_t g, uint8_t b);
 void analogRead(uint8_t pin);
+void attachInterrupt(uint8_t pin, void (*handler)(), int mode);
+void detachInterrupt(uint8_t pin);
 
 template <typename T, typename U>
 constexpr auto min(T a, U b) -> decltype(a < b ? a : b) {
