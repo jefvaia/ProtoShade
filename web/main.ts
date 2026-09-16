@@ -277,7 +277,7 @@ mirrorButton.onclick = async () => {
       },
     );
     mirrorButton.textContent = "stop mirroring";
-    mirrorStatus("connected, waiting for frames…");
+    mirrorStatus("connected, waiting for frames...");
     await link.send("p"); // same command the serial monitor takes
   } catch (err) {
     // Includes the user simply closing the port picker, which is not worth shouting about.
@@ -394,7 +394,7 @@ function render(now: number): void {
       mirrorStatus(
         mirroring && deviceFrame
           ? `live from the head · ${deviceFrame.w}×${deviceFrame.h} · ${deviceFps} fps over USB`
-          : "connected, waiting for frames…",
+          : "connected, waiting for frames...",
       );
     }
     hint.textContent = result.ok ? "" : result.reason;

@@ -143,14 +143,14 @@ Serve `dist/` over HTTP (not `file://` - it is an ES module) and open `index.htm
 
 Plain HTML + Tailwind v4 + TypeScript, no framework:
 
-- `web/index.html` — markup, Tailwind utility classes
-- `web/main.ts` — page wiring: editor, resolution, preview loop, download
-- `web/nodes.ts` — the node library and the instruction set they compile to
-- `web/graph.ts` — graph → Program, and the interpreter that runs one
-- `web/pack.ts` — Program → `.bin`
-- `web/serial.ts` — finds the head's frames in the USB stream (see below)
-- `web/visor.ts` — the 3D view of the panels (WebGL, no library)
-- `web/vendor/` — third-party files, committed (no CDN: the ESP32 has no internet)
+- `web/index.html` - markup, Tailwind utility classes
+- `web/main.ts` - page wiring: editor, resolution, preview loop, download
+- `web/nodes.ts` - the node library and the instruction set they compile to
+- `web/graph.ts` - graph -> Program, and the interpreter that runs one
+- `web/pack.ts` - Program -> `.bin`
+- `web/serial.ts` - finds the head's frames in the USB stream (see below)
+- `web/visor.ts` - the 3D view of the panels (WebGL, no library)
+- `web/vendor/` - third-party files, committed (no CDN: the ESP32 has no internet)
 
 ### The shader editor
 
@@ -169,11 +169,11 @@ component-wise ops), `Mix`, `Alpha Over`, `Separate`/`Combine RGBA`, `HSV`, `Ima
 The `Image` node's **wrap** decides what happens outside the image, which matters the moment
 you scale the UV to place a sprite:
 
-- `clip` (default) — nothing outside 0..1. The sprite appears once and stops.
-- `clamp` — the edge texel stretches outwards. Scale the UV by 2.3 and the last column and
+- `clip` (default) - nothing outside 0..1. The sprite appears once and stops.
+- `clamp` - the edge texel stretches outwards. Scale the UV by 2.3 and the last column and
   row of the image smear across the rest of the panel, which is where those streaks come
   from. Useful for a deliberate gradient off the edge, wrong for a sprite.
-- `repeat` — tiles.
+- `repeat` - tiles.
 
 With `linear` filtering, `clip` fades the alpha at the boundary but keeps the edge colour,
 so a sprite feathers out instead of picking up a dark fringe.
@@ -244,7 +244,7 @@ face with nothing but a phone.
    [arduino-littlefs-upload](https://github.com/earlephilhower/arduino-littlefs-upload/releases),
    drop it in the IDE's plugins folder (create it) and restart: `%USERPROFILE%\.arduinoIDE\plugins\`
    on Windows, `~/.arduinoIDE/plugins/` on Linux and macOS.
-3. Close the Serial Monitor - the uploader needs the port - then `Ctrl+Shift+P` ▸
+3. Close the Serial Monitor - the uploader needs the port - then `Ctrl+Shift+P` >
    **Upload LittleFS to Pico/ESP8266/ESP32**.
 
 It writes to the partition labelled `spiffs`, which is why the table calls it that even
@@ -431,19 +431,19 @@ npm test                                     # both JS checks
 g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
 ```
 
-- `test/visor.test.mjs` — the visor mesh: the canvas split, the nose, the normals.
-- `test/graph.test.mjs` — the compiler: what a graph turns into, dead branches dropped,
+- `test/visor.test.mjs` - the visor mesh: the canvas split, the nose, the normals.
+- `test/graph.test.mjs` - the compiler: what a graph turns into, dead branches dropped,
   cycles cut, pooled constants, alpha, sensors, and the container header.
-- `test/crosscheck.mjs` — **the important one.** Compiles 55 programs, renders every pixel
+- `test/crosscheck.mjs` - **the important one.** Compiles 55 programs, renders every pixel
   with the TypeScript interpreter, packs the same Program to a `.bin`, renders that with the
   C++ VM, and compares. Currently 99.4% of channels are bit-identical and nothing differs by
   more than 1/255, which is float-vs-double rounding of the last bit. A drifting opcode shows
   up here as a wrong pixel. Needs a host C++ compiler; skips without one.
-- `test/test.cpp` — the runtime: container validation against malformed input, every opcode,
+- `test/test.cpp` - the runtime: container validation against malformed input, every opcode,
   the step budget, that two half-frames equal one whole one, and the panel mapping - every
   rotation and mirror against a canvas tagged with its own coordinates, because that is what
   looks fine in a comment and comes out upside down on a head.
-- `test/check-sketch.mjs` — parses the ESP32 sketch on a host compiler, against just enough
+- `test/check-sketch.mjs` - parses the ESP32 sketch on a host compiler, against just enough
   of Arduino.h, WiFi, WebServer, LittleFS, esp_partition and FreeRTOS to compile
   (`test/arduino-stubs/`). The sketch is otherwise only ever built by the Arduino IDE on
   someone else's machine, so a name collision in it is found by whoever is trying to flash
@@ -451,10 +451,10 @@ g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
   - it catches our own typos, collisions and signatures. It also compiles
   `ProtoShadeParallel.cpp`, which is `#if`-guarded to ESP32 and invisible to every other
   check here. Compiled as `gnu++11`, the older core's standard, because it is the stricter one.
-- `test/serial.test.mjs` — the frame parser, against text mixed into the stream, a magic
+- `test/serial.test.mjs` - the frame parser, against text mixed into the stream, a magic
   appearing inside a log line, an impossible header, a truncated frame, one byte at a time,
   and **every possible split point** of a two-frame stream. A chunk boundary landing
   mid-header happens once in a thousand reads on real hardware and is trivial to write down
   here.
-- `test/render.cpp` — renders a `.bin` to raw RGB on stdout. Used by the cross-check, handy
+- `test/render.cpp` - renders a `.bin` to raw RGB on stdout. Used by the cross-check, handy
   on its own when a shader looks wrong.
