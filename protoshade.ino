@@ -367,7 +367,16 @@ void flashOverSerial() {
   pusher.wait();
   setLed(LedState::Upload, "taking a .bin over USB");
 
+  // The pixel stream and the transfer share one cable. A mirrored head is pushing six
+  // kilobytes a frame up the same port the .bin is coming down, and the acks that pace the
+  // transfer have to be found in among it - so hold the stream for the duration and put it
+  // back afterwards, rather than making someone remember to stop mirroring before flashing.
+  const bool was_streaming = streaming;
+  streaming = false;
+
   upload::receiveOverSerial(runtime);
+
+  streaming = was_streaming;
 
   // The transfer is not a frame, and averaging it into the frame time would report a face
   // running at 0.4 fps for the next two seconds.

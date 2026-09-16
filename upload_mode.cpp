@@ -32,6 +32,14 @@ bool last_failed = false;
 // hides it, and then nothing inside here can say upload:: again.
 struct Upload {
   uint8_t sector[4096];
+  // The first sector, held back until the last byte of the program is in flash. The magic
+  // and total_length live in it, so until it is written the partition does not parse as a
+  // program at all - which is the whole point. A transfer that stops halfway, or a head
+  // unplugged mid-upload, then leaves something that is refused rather than something that
+  // loads and renders erased flash. Erased flash is 0xFF, and 0xFF in an RGBA image is
+  // opaque white, so the failure that shape of bug produces is a face that is simply white.
+  // 4 KB of static RAM to make a half-written face impossible is a good trade.
+  uint8_t first[4096];
   size_t inSector;
   uint32_t written;
   uint32_t declared;  // total_length out of the header, known once 48 bytes have arrived
@@ -105,6 +113,15 @@ bool flushSector() {
   // Pad the tail: the region is erased to 0xFF anyway, and total_length says where the
   // program really ends.
   memset(state.sector + state.inSector, 0xFF, sizeof(state.sector) - state.inSector);
+
+  // Sector zero is kept in RAM and written by commit() once everything else has landed.
+  if (state.written == 0) {
+    memcpy(state.first, state.sector, sizeof(state.sector));
+    state.written += sizeof(state.sector);
+    state.inSector = 0;
+    return true;
+  }
+
   const esp_err_t err = esp_partition_write(partition, state.written, state.sector, sizeof(state.sector));
   if (err != ESP_OK) {
     state.failed = true;
@@ -113,6 +130,28 @@ bool flushSector() {
   }
   state.written += sizeof(state.sector);
   state.inSector = 0;
+  return true;
+}
+
+// The last write of an upload: the header, which is what makes the partition a program.
+//
+// Nothing before this point is loadable, so there is no window in which a half-written file
+// looks like a whole one - not to the next loadProgram(), and not to the next boot either.
+// It also refuses to commit a file shorter than its own header claims, which is the other
+// way a browser can leave a program with a tail of erased flash in it.
+bool commit() {
+  if (state.declared == 0 || state.written == 0) {
+    state.fail("nothing was written");
+    return false;
+  }
+  if (state.written < state.declared) {
+    state.fail("the transfer stopped halfway");
+    return false;
+  }
+  if (esp_partition_write(partition, 0, state.first, sizeof(state.first)) != ESP_OK) {
+    state.fail("flash write failed");
+    return false;
+  }
   return true;
 }
 
@@ -255,7 +294,7 @@ void handleUploadChunk() {
   }
 
   if (chunk.status == UPLOAD_FILE_END && !state.failed) {
-    flushSector();
+    if (flushSector()) commit();
   }
 }
 
@@ -341,7 +380,7 @@ bool receiveOverSerial(ProtoShadeRuntime& runtime) {
     Serial.printf("psflash ack %lu\n", (unsigned long)received);
   }
 
-  if (!state.failed) flushSector();
+  if (!state.failed && flushSector()) commit();
   if (state.failed) {
     Serial.printf("psflash error - %s\n", state.error);
     loadProgram();  // whatever was there before, if the erase never happened

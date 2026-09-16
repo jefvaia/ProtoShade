@@ -62,11 +62,26 @@ public:
   void println(const char* = "") {}
   void println(const String&) {}
   void print(const char*) {}
-  int available() { return 0; }
-  int read() { return -1; }
+  void setTimeout(unsigned long) {}
   size_t write(const uint8_t*, size_t) { return 0; }
   size_t write(uint8_t) { return 0; }
-  void setTimeout(unsigned long) {}
-  size_t readBytes(uint8_t*, size_t) { return 0; }
+
+  // Bytes a test has queued for the sketch to read. Left empty by everything else, and then
+  // the port behaves exactly as it did before this existed: nothing to read, ever. It is
+  // here so test/upload-check.cpp can drive the flash protocol through the real code rather
+  // than around it - the transfer is the part where a .bin gets corrupted.
+  const uint8_t* in = nullptr;
+  size_t in_len = 0;
+  size_t in_at = 0;
+
+  int available() { return in ? int(in_len - in_at) : 0; }
+  int read() { return in && in_at < in_len ? in[in_at++] : -1; }
+  size_t readBytes(uint8_t* dst, size_t want) {
+    if (!in) return 0;
+    const size_t take = want <= in_len - in_at ? want : in_len - in_at;
+    memcpy(dst, in + in_at, take);
+    in_at += take;
+    return take;  // short of `want` is a timeout, which is what a dead transfer looks like
+  }
 };
 extern SerialStub Serial;

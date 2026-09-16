@@ -133,6 +133,12 @@ is just the `frames == 1` case. Layout is
 documented at the top of `ProtoShadeRuntime.h`; `test/test.cpp` builds one byte by byte and is
 the arbiter if the packer and the runtime ever disagree.
 
+It is written to flash **header last**. The first sector is held in RAM until every other
+byte has landed, so a transfer that dies halfway - or a head unplugged mid-upload - leaves a
+partition that does not parse as a program at all, rather than one that loads and renders the
+erased flash behind it. Erased flash is `0xFF`, and `0xFF` in an RGBA image is opaque white,
+so the bug that shape of mistake produces is a face that is simply, persistently white.
+
 It belongs in a **flash** partition, not RTC memory - RTC RAM is 8 KB and is lost on power
 loss. `partitions.csv` gives it **8 MB** of a 16 MB board, which is a lot of frames: a baked
 64x32 strip is 4 KB per frame. Growing it is a one-line change to that file and nothing else
@@ -611,6 +617,15 @@ g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
   the step budget, that two half-frames equal one whole one, and the panel mapping - every
   rotation and mirror against a canvas tagged with its own coordinates, because that is what
   looks fine in a comment and comes out upside down on a head.
+- `test/upload-check.cpp` - the flash protocol, run rather than parsed: a fake NOR flash
+  with NOR's rules (erased is 0xFF, a write only clears bits, the alignment the ESP-IDF calls
+  demand), the sketch's own upload code on top of it, and a real 128 KB program driven
+  through `receiveOverSerial()`. It checks the bytes in flash are the bytes that were sent,
+  and that the runtime renders the same picture out of flash as out of RAM. It also holds the
+  rule that matters most: **a transfer that stops halfway must not leave a program that
+  loads.** A half-written `.bin` whose header already says how long the whole thing was
+  passes every check the runtime makes, and every texel past the point the transfer stopped
+  reads 0xFF - opaque white. That is why the header is the *last* thing written.
 - `test/check-sketch.mjs` - parses the ESP32 sketch on a host compiler, against just enough
   of Arduino.h, WiFi, WebServer, LittleFS, esp_partition and FreeRTOS to compile
   (`test/arduino-stubs/`). It first does to the `.ino` what the Arduino builder does: a

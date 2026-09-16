@@ -93,19 +93,25 @@ for (const unit of units) {
   }
 }
 
-// One piece of the sketch is worth running rather than parsing: the button latch, which is
-// what stands between a press and upload mode. test/button-check.cpp links the sketch
-// against a clock and a pin it owns and drives it.
-if (!failed) {
-  const binary = join(work, "button-check");
+// Two pieces of the sketch are worth running rather than parsing.
+//
+//   button-check  the latch, which is what stands between a press and upload mode.
+//   upload-check  the flash protocol, which is what stands between a .bin and the panels.
+//
+// Both link the real code against a platform the test file owns, so what runs is the
+// sketch's own logic and not a description of it.
+for (const [name, sources] of [
+  ["button-check", ["test/button-check.cpp", "src/ProtoShadeRuntime.cpp", "src/ProtoShadeDisplay.cpp"]],
+  ["upload-check", ["test/upload-check.cpp", "upload_mode.cpp", "src/ProtoShadeRuntime.cpp"]],
+]) {
+  if (failed) break;
+  const binary = join(work, name);
   const build = spawnSync(
     cxx,
     [
       "-std=gnu++11", "-Wall", "-Wextra", "-Wno-unused-parameter",
       "-DARDUINO_ARCH_ESP32=1", `-I${join(root, "test/arduino-stubs")}`,
-      join(root, "test/button-check.cpp"),
-      join(root, "src/ProtoShadeRuntime.cpp"),
-      join(root, "src/ProtoShadeDisplay.cpp"),
+      ...sources.map((s) => join(root, s)),
       "-o", binary,
     ],
     { encoding: "utf8" },
