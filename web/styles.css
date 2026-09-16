@@ -1,5 +1,12 @@
-@import "tailwindcss";
+/* Vendor CSS first and in its own layer: layers are ordered by first appearance and
+   Tailwind's utilities live in later layers, so a utility class always wins over
+   litegraph's own rules. Unlayered vendor CSS would beat every Tailwind utility. */
+@import "./vendor/litegraph.min.css" layer(vendor);
 
-/* Tailwind v4 scans the sources listed here for class names. */
+/* source(none) turns off automatic source detection - otherwise Tailwind scans all of
+   web/, including the 491 KB minified litegraph bundle, and mints junk utilities from
+   whatever in there happens to look like a class name. Sources are listed explicitly. */
+@import "tailwindcss" source(none);
+
 @source "./index.html";
 @source "./main.ts";

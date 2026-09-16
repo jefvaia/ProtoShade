@@ -10,6 +10,10 @@
   <h1 class="text-2xl tracking-widest uppercase">ProtoShade</h1>
   <canvas id="c" width="8" height="8" class="w-80 h-80 [image-rendering:pixelated] rounded ring-1 ring-neutral-700"></canvas>
   <p class="text-sm text-neutral-400">ProtoShade-Runtime, compiled to wasm.</p>
+  <!-- Classic script, not bundled: litegraph's IIFEs end in })(this) to reach the global
+       object, and inside an ES module top-level this is undefined. Module scripts are
+       deferred, so main.js always runs after this one. -->
+  <script src="./vendor/litegraph.min.js"></script>
   <script type="module" src="./main.js"></script>
 </body>
 </html>

@@ -23,6 +23,19 @@ Plain HTML + Tailwind v4 + TypeScript, no framework:
 - `web/main.ts` — canvas loop, imports the wasm module
 - `web/styles.css` — `@import "tailwindcss"` + `@source` scan list
 - `web/protoshade.d.ts` — hand-written types for the emscripten glue
+- `web/vendor/` — third-party files, committed (no CDN: the ESP32 has no internet)
+
+### Adding a vendor file
+
+- **JS**: drop it in `web/vendor/` and `import` it from `main.ts` so esbuild bundles it.
+  If it is a classic/UMD script that reaches the global object (litegraph does, via
+  `})(this)`), that breaks in a module — add a `<script>` tag to `index.html` instead;
+  the build copies `web/vendor/` to `dist/vendor/`. Types go in a `.d.ts` beside it.
+- **CSS**: `@import "./vendor/name.css" layer(vendor);` at the top of `styles.css`, so it
+  ends up in the single minified stylesheet. The `layer(vendor)` matters — unlayered
+  vendor CSS beats every Tailwind utility, layered it loses to them. If the file
+  references fonts or images by `url()`, link it separately instead; those paths are
+  not rewritten.
 
 `npm run build` minifies all three outputs; `npm run build:dev` skips minification
 and emits a JS sourcemap. Types are checked with `npm run typecheck`.

@@ -7,7 +7,7 @@
 //   --port <n>    dev server port (default 8000)
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, extname, join, normalize } from "node:path";
@@ -25,8 +25,19 @@ const port = Number(args[args.indexOf("--port") + 1]) || 8000;
 
 const htmlIn = join(src, "index.html");
 const cssIn = join(src, "styles.css");
+const vendorIn = join(src, "vendor");
 
 mkdirSync(out, { recursive: true });
+
+// Third-party files that ship as-is. The CSS is pulled in by styles.css and the .d.ts is
+// types only, so only what the page actually requests at runtime gets copied.
+function copyVendor() {
+  if (!existsSync(vendorIn)) return;
+  for (const name of readdirSync(vendorIn)) {
+    if (name.endsWith(".css") || name.endsWith(".d.ts")) continue;
+    cpSync(join(vendorIn, name), join(out, "vendor", name), { recursive: true });
+  }
+}
 
 // Tailwind -> CSS. Its own --minify is the only CSS minifier we need.
 // ponytail: one-shot per rebuild (~40ms) instead of `tailwindcss --watch`, so there is
@@ -91,9 +102,14 @@ const config = {
         build.onLoad({ filter: /main\.ts$/ }, (file) => ({
           contents: readFileSync(file.path, "utf8"),
           loader: "ts",
-          watchFiles: [htmlIn, cssIn],
+          watchFiles: [
+            htmlIn,
+            cssIn,
+            ...(existsSync(vendorIn) ? readdirSync(vendorIn).map((name) => join(vendorIn, name)) : []),
+          ],
         }));
         build.onEnd(async () => {
+          copyVendor();
           buildCss();
           await buildHtml();
           reload();
