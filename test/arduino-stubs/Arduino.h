@@ -45,6 +45,7 @@ public:
   bool startsWith(const String&) const { return false; }
   String& operator+=(const String&) { return *this; }
   bool operator==(const char*) const { return false; }
+  bool operator!=(const char*) const { return false; }
 };
 inline String operator+(const String&, const String&) { return String(); }
 inline String operator+(const char*, const String&) { return String(); }

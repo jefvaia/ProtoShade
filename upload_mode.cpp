@@ -144,14 +144,21 @@ String contentType(const String& path) {
 // false when the editor was never uploaded, which is not an error - /upload still works.
 bool serveFromFs(String path) {
   if (path.endsWith("/")) path += "index.html";
+  const String type = contentType(path);
+  // Content-Encoding is not ours to send. streamFile() adds it itself for a file whose name
+  // ends in .gz, and sendHeader() appends rather than replaces, so sending one here too put
+  // two in the response: the browser reads "gzip, gzip", inflates twice and gives up - which
+  // is the "Content Encoding Error" page you get instead of the editor.
+  //
+  // The one type it will not label that way is application/octet-stream, so a file we cannot
+  // name serves its plain copy or nothing at all, never gzip nobody declared.
   const String gz = path + ".gz";
-  const bool zipped = LittleFS.exists(gz);
+  const bool zipped = type != "application/octet-stream" && LittleFS.exists(gz);
   if (!zipped && !LittleFS.exists(path)) return false;
 
   File file = LittleFS.open(zipped ? gz : path, "r");
   if (!file) return false;
-  if (zipped) server.sendHeader("Content-Encoding", "gzip");
-  server.streamFile(file, contentType(path));
+  server.streamFile(file, type);
   file.close();
   return true;
 }

@@ -13,6 +13,7 @@
 // invisible to every other check in this repository.
 
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -49,6 +50,16 @@ for (const unit of units) {
     failed = true;
     console.error(result.stderr);
   }
+}
+
+// The stubs parse, they do not behave, so this one rule has to be read rather than compiled.
+// WebServer::streamFile() sends Content-Encoding: gzip itself for a .gz file, and
+// sendHeader() appends instead of replacing: a second one makes the browser read
+// "gzip, gzip", inflate twice and refuse the page. The editor served off the head is the
+// only thing that goes out gzipped, so this is the whole rule.
+if (/sendHeader\s*\(\s*"Content-Encoding"/.test(readFileSync(join(root, "upload_mode.cpp"), "utf8"))) {
+  failed = true;
+  console.error("upload_mode.cpp sends Content-Encoding itself - streamFile() already does, and two of them break the page");
 }
 
 if (failed) process.exit(1);
