@@ -106,7 +106,7 @@ Three independent builds, all writing into `dist/`:
 build.bat              # em++: runs test/test.cpp, then emits dist/protoshade.js + .wasm
 npm install
 npm run build          # typecheck + tests + minified dist/index.html, main.js, styles.css
-npm run build:device   # the above, plus examples/ProtoShadeHead/data/ for the head
+npm run build:device   # the above, plus data/ - the editor, for the head's LittleFS
 ```
 
 Serve `dist/` over HTTP (not `file://` - it is an ES module) and open `index.html`.
@@ -153,31 +153,23 @@ The graph autosaves to `localStorage` (uploads included) and reloads with the pa
 
 ## The head
 
-`examples/ProtoShadeHead` is the whole thing: boot, face, upload mode, panel mapping.
+`protoshade.ino` at the root of this repository is the whole thing: boot, face, upload mode,
+panel mapping. Its parts are `head_config.h` (the file you edit per head) and
+`upload_mode.{h,cpp}`.
 
 ### Compiling it in the Arduino IDE
 
-`#include <ProtoShadeParallel.h>` searches Arduino's **libraries** folder, not the folder
-the sketch happens to sit in. Cloning the repo into your sketchbook is not enough - the IDE
-has to see this repository *as a library*, which it already is (`library.properties` plus
-`src/` at the root). Pick one:
+**Open `protoshade.ino` and press Verify. There is nothing to install.**
 
-**Junction (best while developing)** - the repo stays where it is, git and all, and the IDE
-follows a link to it. In a Windows terminal, with the repo at `Documents\Arduino\protoshade`:
+The repository root *is* the sketch folder, and the Arduino builder compiles a sketch's
+`src/` subfolder recursively - which is exactly where the library already lives. That is
+also why the sketch includes it as `"src/ProtoShadeRuntime.h"` and not
+`<ProtoShadeRuntime.h>`: angle brackets would send the compiler off to look in Arduino's
+`libraries/` folder, and then you would have to install something.
 
-```
-mklink /J "%USERPROFILE%\Documents\Arduino\libraries\ProtoShade" "%USERPROFILE%\Documents\Arduino\protoshade"
-```
-
-macOS/Linux: `ln -s ~/Documents/Arduino/protoshade ~/Documents/Arduino/libraries/ProtoShade`
-
-**Or move it**: put the repo at `Documents/Arduino/libraries/ProtoShade` outright.
-
-**Or zip it**: Sketch ▸ Include Library ▸ Add .ZIP Library, pointing at a zip of the repo
-root. Fine for using it, annoying for editing it - you reinstall on every change.
-
-Restart the IDE. The examples then show up under File ▸ Examples ▸ ProtoShade-Runtime, and
-that is the copy to open - opening the `.ino` by path works too, once the library is visible.
+(If the IDE complains that the file has to live in a folder of the same name, your clone is
+called something other than `protoshade` - rename either one to match. Windows and macOS do
+not care about the capitalisation; Linux does.)
 
 Then in **Tools**:
 
@@ -191,10 +183,15 @@ Then in **Tools**:
 If your board is 4 or 16 MB, edit the offsets in `partitions.csv` to match - the comment at
 the top of that file says which two partitions matter and why.
 
-Serving the editor off the head also needs `examples/ProtoShadeHead/data/` (from
-`npm run build:device`) uploaded to LittleFS, which IDE 2.x needs the
-`arduino-littlefs-upload` extension for. Skip it entirely and `/upload` still works - that
-page is built into the sketch.
+Serving the editor off the head also needs `data/` (from `npm run build:device`) uploaded to
+LittleFS, which IDE 2.x needs the `arduino-littlefs-upload` extension for. `data/` next to
+the sketch is exactly where those uploaders look. Skip it entirely and `/upload` still works
+- that page is built into the sketch.
+
+**Using the runtime in your own sketch** instead of this one: the repository is also a valid
+Arduino library (`library.properties` + `src/`), so drop it in `Arduino/libraries/` and
+`#include <ProtoShadeRuntime.h>` works the usual way. That is the only case that needs an
+install, and it is not needed for the head.
 
 ### Boot
 
@@ -229,13 +226,13 @@ The sketch validates the header *before* erasing anything, so a garbage upload c
 program that works, then streams it into flash a sector at a time and loads it. It survives
 power loss because it is in flash, not RAM.
 
-`npm run build:device` also puts the whole editor (gzipped, 133 KB) into
-`examples/ProtoShadeHead/data/` for the LittleFS partition, so the head serves the editor
-itself at `http://192.168.4.1/` with no computer involved. Skip it and `/upload` still works.
+`npm run build:device` also puts the whole editor (gzipped, 133 KB) into `data/` for the
+LittleFS partition, so the head serves the editor itself at `http://192.168.4.1/` with no
+computer involved. Skip it and `/upload` still works.
 
 ### Wiring a head: `head_config.h`
 
-One file per head, and `ProtoShadeHead.ino` never changes. It holds five things:
+One file per head, and `protoshade.ino` never changes. It holds five things:
 
 1. **The canvas** - the whole face as one drawing, at the resolution you author at.
 2. **The button** - pin, polarity, how long the window stays open.

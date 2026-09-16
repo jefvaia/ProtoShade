@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include <ProtoShadeRuntime.h>
+#include "src/ProtoShadeRuntime.h"
 
 namespace upload {
 

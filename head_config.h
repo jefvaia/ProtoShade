@@ -1,7 +1,7 @@
 // ===========================================================================
 // THIS IS THE FILE YOU EDIT PER HEAD. Everything head-specific lives here:
 // the canvas, the button, the display drivers, where each panel reads from the
-// canvas, and what sensors are wired up. ProtoShadeHead.ino never changes.
+// canvas, and what sensors are wired up. protoshade.ino never changes.
 // ===========================================================================
 //
 // It is included exactly once, from the .ino, so these are plain definitions.
@@ -9,7 +9,7 @@
 #pragma once
 
 #include <Arduino.h>
-#include <ProtoShadeDisplay.h>
+#include "src/ProtoShadeDisplay.h"
 
 using namespace protoshade;
 
