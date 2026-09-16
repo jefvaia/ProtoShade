@@ -142,6 +142,7 @@ Plain HTML + Tailwind v4 + TypeScript, no framework:
 - `web/graph.ts` — graph → Program, and the interpreter that runs one
 - `web/pack.ts` — Program → `.bin`
 - `web/serial.ts` — finds the head's frames in the USB stream (see below)
+- `web/visor.ts` — the 3D view of the panels (WebGL, no library)
 - `web/vendor/` — third-party files, committed (no CDN: the ESP32 has no internet)
 
 ### The shader editor
@@ -171,6 +172,24 @@ With `linear` filtering, `clip` fades the alpha at the boundary but keeps the ed
 so a sprite feathers out instead of picking up a dark fringe.
 
 The graph autosaves to `localStorage` (uploads included) and reloads with the page.
+
+### The visor view
+
+Under the flat preview is the same frame wrapped onto a head: **the left half of the canvas
+is one side of the face, the right half the other, and they meet at the nose**, so the middle
+columns of your graph are the bridge and not a seam you can ignore. Drag to turn it, scroll
+to zoom.
+
+It draws whatever the preview canvas holds, which means it follows the interpreter and a
+mirrored head over USB alike without knowing which one it is looking at - connect **mirror
+head** and you are turning the real frames around.
+
+Plain WebGL, no library: two mirrored strips swept along one quadratic curve (top view: nose
+tip, out, then back along the side), and a vertex shader that does yaw, pitch and distance
+itself rather than carrying a matrix stack. `test/visor.test.mjs` checks the mesh - that each
+half of the canvas lands on its own side, that the halves meet at the frontmost point, and
+that the normals point out of the head. A browser without WebGL just hides the canvas; the
+flat preview is still the authoritative one.
 
 ## The head
 
@@ -396,6 +415,7 @@ npm test                                     # both JS checks
 g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
 ```
 
+- `test/visor.test.mjs` — the visor mesh: the canvas split, the nose, the normals.
 - `test/graph.test.mjs` — the compiler: what a graph turns into, dead branches dropped,
   cycles cut, pooled constants, alpha, sensors, and the container header.
 - `test/crosscheck.mjs` — **the important one.** Compiles 55 programs, renders every pixel

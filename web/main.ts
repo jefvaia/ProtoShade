@@ -9,6 +9,7 @@ import { compile, Runner, type Program } from "./graph.js";
 import { instructionCount, pack, packedSize } from "./pack.js";
 import { RANGES, decodeInto, imageLabel, images, register, type Env, type Vec } from "./nodes.js";
 import { DeviceLink, supported as serialSupported, type SerialFrame } from "./serial.js";
+import { Visor } from "./visor.js";
 
 const el = <T extends HTMLElement>(id: string): T => {
   const node = document.getElementById(id);
@@ -27,6 +28,11 @@ const hint = el<HTMLElement>("hint");
 const binInfo = el<HTMLElement>("bin-info");
 const mirrorInfo = el<HTMLElement>("mirror-info");
 const mirrorButton = el<HTMLButtonElement>("mirror");
+
+// The 3D view of the panels. It reads the same canvas the flat preview draws, so it follows
+// the interpreter and the mirrored head without caring which one produced the frame.
+const visor = Visor.create(el<HTMLCanvasElement>("visor"));
+if (!visor) el("visor").classList.add("hidden");
 
 const lctx = led.getContext("2d");
 if (!lctx) throw new Error("2d context unavailable");
@@ -353,6 +359,7 @@ function render(now: number): void {
     }
     pctx!.putImageData(img, 0, 0);
   }
+  visor?.draw(panel);
   lctx!.imageSmoothingEnabled = false;
   lctx!.drawImage(panel, 0, 0, led.width, led.height);
 
