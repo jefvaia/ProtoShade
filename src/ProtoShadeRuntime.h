@@ -2,9 +2,9 @@
 #include <cstdint>
 
 // Portable core: NO Arduino.h, NO emscripten here. Plain C++ only.
-class Protoshade {
+class ProtoShadeRuntime {
 public:
-  Protoshade(uint16_t width, uint16_t height) : w_(width), h_(height) {}
+  ProtoShadeRuntime(uint16_t width, uint16_t height) : w_(width), h_(height) {}
 
   // Brightness 0..254 of pixel (x, y) at time ms: a diagonal wave scrolling over time.
   uint8_t pixel(uint16_t x, uint16_t y, uint32_t ms) const;

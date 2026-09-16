@@ -6,7 +6,7 @@
 import createModule from '../dist/protoshade.js';
 
 const m = await createModule();
-const face = new m.Protoshade(8, 8);
+const face = new m.ProtoShadeRuntime(8, 8);
 const ctx = document.getElementById('c').getContext('2d');
 const img = ctx.createImageData(8, 8);
 

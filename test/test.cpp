@@ -1,9 +1,9 @@
 #include <cassert>
 #include <cstdio>
-#include "../src/Protoshade.h"
+#include "../src/ProtoShadeRuntime.h"
 
 int main() {
-  Protoshade p(8, 8);
+  ProtoShadeRuntime p(8, 8);
   assert(p.pixel(0, 0, 0) == 0);                  // wave starts dark
   assert(p.pixel(0, 0, 256) == 128);              // phase 64 -> half brightness
   assert(p.pixel(8, 0, 0) == 254);                // phase 128 -> peak

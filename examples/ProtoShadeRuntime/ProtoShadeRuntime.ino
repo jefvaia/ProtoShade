@@ -1,6 +1,6 @@
-#include <Protoshade.h>
+#include <ProtoShadeRuntime.h>
 
-Protoshade face(8, 8);
+ProtoShadeRuntime face(8, 8);
 
 void setup() {
   Serial.begin(115200);
