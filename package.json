@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node test/graph.test.mjs && node test/crosscheck.mjs",
+    "test": "node test/graph.test.mjs && node test/crosscheck.mjs && node test/check-sketch.mjs",
     "build": "npm run typecheck && npm test && node scripts/build-web.mjs",
     "build:dev": "node scripts/build-web.mjs --no-minify",
     "build:device": "npm run build && node scripts/build-web.mjs --device",

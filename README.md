@@ -343,5 +343,13 @@ g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
   the step budget, that two half-frames equal one whole one, and the panel mapping - every
   rotation and mirror against a canvas tagged with its own coordinates, because that is what
   looks fine in a comment and comes out upside down on a head.
+- `test/check-sketch.mjs` — parses the ESP32 sketch on a host compiler, against just enough
+  of Arduino.h, WiFi, WebServer, LittleFS, esp_partition and FreeRTOS to compile
+  (`test/arduino-stubs/`). The sketch is otherwise only ever built by the Arduino IDE on
+  someone else's machine, so a name collision in it is found by whoever is trying to flash
+  their head. Nothing here runs and it cannot catch a real API mismatch with the ESP32 core
+  - it catches our own typos, collisions and signatures. It also compiles
+  `ProtoShadeParallel.cpp`, which is `#if`-guarded to ESP32 and invisible to every other
+  check here. Compiled as `gnu++11`, the older core's standard, because it is the stricter one.
 - `test/render.cpp` — renders a `.bin` to raw RGB on stdout. Used by the cross-check, handy
   on its own when a shader looks wrong.

@@ -51,7 +51,9 @@ Mode mode = Mode::Face;
 // Status LED
 // ---------------------------------------------------------------------------
 
-enum class Status : uint8_t { Running, Upload, Error };
+// LedState, not Status: the sketch says `using namespace protoshade;` and the runtime
+// already has a Status (the load-status enum), so that name is ambiguous here.
+enum class LedState : uint8_t { Running, Upload, Error };
 
 // Latched: something is structurally wrong and will not fix itself - a driver that did not
 // start, no partition to load from. A heavy frame or a missing program is NOT latched, so
@@ -65,19 +67,19 @@ void fail(const char* why) {
 
 // Only writes when the colour actually changes: this runs every frame, and rgbLedWrite bangs
 // out an RMT sequence each time it is called.
-void setStatus(Status status) {
-  static Status shown = Status::Running;
+void setLed(LedState state) {
+  static LedState shown = LedState::Running;
   static bool written = false;
-  if (written && status == shown) return;
-  shown = status;
+  if (written && state == shown) return;
+  shown = state;
   written = true;
   if (STATUS_LED_PIN < 0) return;
 
   const uint8_t b = STATUS_LED_BRIGHTNESS;
-  switch (status) {
-    case Status::Running: rgbLedWrite(STATUS_LED_PIN, 0, b, 0); break;
-    case Status::Upload:  rgbLedWrite(STATUS_LED_PIN, 0, 0, b); break;
-    case Status::Error:   rgbLedWrite(STATUS_LED_PIN, b, 0, 0); break;
+  switch (state) {
+    case LedState::Running: rgbLedWrite(STATUS_LED_PIN, 0, b, 0); break;
+    case LedState::Upload:  rgbLedWrite(STATUS_LED_PIN, 0, 0, b); break;
+    case LedState::Error:   rgbLedWrite(STATUS_LED_PIN, b, 0, 0); break;
   }
 }
 
@@ -169,7 +171,7 @@ void renderFace() {
 
   // Green means it is rendering YOUR program. A head with nothing uploaded is running the
   // built-in test pattern, which is not the same thing and is worth a red light.
-  setStatus(fault || !within_budget || !runtime.hasProgram() ? Status::Error : Status::Running);
+  setLed(fault || !within_budget || !runtime.hasProgram() ? LedState::Error : LedState::Running);
 
   // Hands the frame to the push task and returns; it blocks only until the PREVIOUS push is
   // done, so rendering the next frame overlaps sending this one.
@@ -219,7 +221,7 @@ void setup() {
 
   // Red until setup finishes: if it hangs or crashes on the way, the light says so instead
   // of staying dark and looking like a dead board.
-  setStatus(Status::Error);
+  setLed(LedState::Error);
 
   pinMode(BUTTON_PIN, BUTTON_ACTIVE_LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
   delay(10);  // let the pull settle before reading it
@@ -261,7 +263,7 @@ void loop() {
     upload::handle();
     // Blue while it waits; red if the last .bin was refused, so you can see a bad upload
     // without going back to the browser tab.
-    setStatus(fault || upload::lastUploadFailed() ? Status::Error : Status::Upload);
+    setLed(fault || upload::lastUploadFailed() ? LedState::Error : LedState::Upload);
     showUploadIndicator();
     delay(10);
     return;
