@@ -176,17 +176,30 @@ Then in **Tools**:
 | Setting | Value |
 | --- | --- |
 | Board | ESP32S3 Dev Module |
-| Flash Size | what your board actually has, and **at least 8MB** - `partitions.csv` covers 8 MB, so a board set to 4MB rejects the table (a 16MB board is fine, the tail is just unused) |
-| Partition Scheme | **Custom** - it uses the `partitions.csv` sitting next to the `.ino` |
+| Flash Size | what your board actually has. `partitions.csv` is laid out for **16MB**; its header comment has the 8 MB and 4 MB variants |
+| Partition Scheme | **Custom** - it uses the `partitions.csv` sitting next to the `.ino`. None of the built-in schemes has a `protoshade` partition, so with one of those the head boots, says so on serial, and sits on its test pattern |
+| Erase All Flash Before Sketch Upload | **Disabled** - enabling it wipes the face program every time you upload the sketch |
 | PSRAM | whatever your board has; the framebuffers are small and stay in internal SRAM |
 
-If your board is 4 or 16 MB, edit the offsets in `partitions.csv` to match - the comment at
-the top of that file says which two partitions matter and why.
+If your board is 4 or 8 MB, edit the offsets in `partitions.csv` to match - the comment at
+the top of that file has both variants and says which two partitions matter and why.
 
-Serving the editor off the head also needs `data/` (from `npm run build:device`) uploaded to
-LittleFS, which IDE 2.x needs the `arduino-littlefs-upload` extension for. `data/` next to
-the sketch is exactly where those uploaders look. Skip it entirely and `/upload` still works
-- that page is built into the sketch.
+### Putting the editor on the head (optional)
+
+You do not need this. Run the editor on a computer (`npm run dev`), download the `.bin`,
+join the head's AP and upload it at `/upload`. The only thing this buys you is editing a
+face with nothing but a phone.
+
+1. `npm run build:device` - writes `data/`, the gzipped editor, next to the sketch. That is
+   exactly where filesystem uploaders look.
+2. Install the uploader, which Arduino IDE 2.x does not ship: grab the `.vsix` from
+   [arduino-littlefs-upload](https://github.com/earlephilhower/arduino-littlefs-upload/releases),
+   drop it in `%USERPROFILE%\.arduinoIDE\plugins\` (create the folder), restart the IDE.
+3. Close the Serial Monitor - the uploader needs the port - then `Ctrl+Shift+P` ▸
+   **Upload LittleFS to Pico/ESP8266/ESP32**.
+
+It writes to the partition labelled `spiffs`, which is why the table calls it that even
+though the contents are LittleFS. Then `http://192.168.4.1/` serves the editor itself.
 
 **Using the runtime in your own sketch** instead of this one: the repository is also a valid
 Arduino library (`library.properties` + `src/`), so drop it in `Arduino/libraries/` and
@@ -218,9 +231,19 @@ render into a;      // a is free: submit(b) did not return until its push finish
 
 ### Upload mode
 
-WiFi comes up as an access point (`ProtoShade`), the panels show a slow blue pulse so you
-can see what mode the head is in from across the room, and the VM stops - upload mode erases
-the bytes it would be reading. Open **http://192.168.4.1/upload**, pick the `.bin`.
+**To get into it: press the button within 60 seconds of power-on** - `BUTTON_PIN` in
+`head_config.h`, GPIO 0 (the BOOT button) by default. Hold it for a moment; a contact bounce
+is ignored on purpose. Serial says `button pressed - switching to upload mode`, then prints
+the address. Press it *after* the board has booted - holding BOOT while resetting puts the
+chip in its ROM download mode instead, which has nothing to do with this.
+
+Miss the window and the button stops doing anything until the next power cycle. That is the
+point: your face cannot fall into an access point because something knocked the button.
+
+WiFi then comes up as an access point (`ProtoShade`, password `protogen`), the panels show a
+slow blue pulse so you can see the mode from across the room, and the VM stops - upload mode
+erases the bytes it would be reading. Join that network and open
+**http://192.168.4.1/upload**, pick the `.bin`.
 
 The sketch validates the header *before* erasing anything, so a garbage upload cannot wipe a
 program that works, then streams it into flash a sector at a time and loads it. It survives
