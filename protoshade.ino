@@ -65,14 +65,24 @@ void fail(const char* why) {
   fault = true;
 }
 
+// Forward declaration: setLed is defined below but setup() and the fault paths both want it.
+void setLed(LedState state, const char* why = "");
+
 // Only writes when the colour actually changes: this runs every frame, and rgbLedWrite bangs
 // out an RMT sequence each time it is called.
-void setLed(LedState state) {
+//
+// It also says why, once, on the change. A red light with no explanation is a light that
+// tells you something is wrong and nothing else, and "it is red no matter what I do" is
+// then a question only the source code can answer.
+void setLed(LedState state, const char* why) {
   static LedState shown = LedState::Running;
   static bool written = false;
   if (written && state == shown) return;
   shown = state;
   written = true;
+
+  const char* name = state == LedState::Running ? "green" : state == LedState::Upload ? "blue" : "RED";
+  Serial.printf("led: %s%s%s\n", name, why[0] ? " - " : "", why);
   if (STATUS_LED_PIN < 0) return;
 
   const uint8_t b = STATUS_LED_BRIGHTNESS;
@@ -234,7 +244,15 @@ void renderFace() {
 
   // Green means it is rendering YOUR program. A head with nothing uploaded is running the
   // built-in test pattern, which is not the same thing and is worth a red light.
-  setLed(fault || !within_budget || !runtime.hasProgram() ? LedState::Error : LedState::Running);
+  if (fault) {
+    setLed(LedState::Error, "a fault was latched at boot - look further up this log");
+  } else if (!runtime.hasProgram()) {
+    setLed(LedState::Error, "no program in flash - upload a .bin, this is the test pattern");
+  } else if (!within_budget) {
+    setLed(LedState::Error, "step budget exceeded - the shader is too heavy");
+  } else {
+    setLed(LedState::Running, "rendering your program");
+  }
 
   // Hands the frame to the push task and returns; it blocks only until the PREVIOUS push is
   // done, so rendering the next frame overlaps sending this one.
@@ -287,7 +305,7 @@ void setup() {
 
   // Red until setup finishes: if it hangs or crashes on the way, the light says so instead
   // of staying dark and looking like a dead board.
-  setLed(LedState::Error);
+  setLed(LedState::Error, "starting up");
 
   pinMode(BUTTON_PIN, BUTTON_ACTIVE_LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
   delay(10);  // let the pull settle before reading it
@@ -331,7 +349,8 @@ void loop() {
     upload::handle();
     // Blue while it waits; red if the last .bin was refused, so you can see a bad upload
     // without going back to the browser tab.
-    setLed(fault || upload::lastUploadFailed() ? LedState::Error : LedState::Upload);
+    setLed(fault || upload::lastUploadFailed() ? LedState::Error : LedState::Upload,
+           upload::lastUploadFailed() ? "the last upload was rejected" : "waiting for a .bin");
     showUploadIndicator();
     delay(10);
     return;

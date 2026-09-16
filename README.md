@@ -352,6 +352,20 @@ also comes on while `setup()` runs, so a board that hangs on the way up says so 
 sitting dark and looking dead. A heavy frame flickers it red and back; a driver that failed
 to start latches it.
 
+**Every change says why on serial**, which is the difference between a light that tells you
+something is wrong and one that tells you what:
+
+```
+led: RED - starting up
+led: RED - no program in flash - upload a .bin, this is the test pattern
+led: RED - a fault was latched at boot - look further up this log
+led: RED - step budget exceeded - the shader is too heavy
+led: blue - waiting for a .bin
+led: green - rendering your program
+```
+
+A red that never turns green is one of exactly three things, and the line names which.
+
 Pin and brightness are in `head_config.h` - set `STATUS_LED_PIN` to -1 for a board without
 one.
 
