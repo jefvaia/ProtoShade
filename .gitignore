@@ -1,32 +1,10 @@
-# Prerequisites
-*.d
+# Build output (build.bat)
+dist/
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# Stray archives
+*.zip
 
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
+# Editor / OS junk
+.vscode/
+Thumbs.db
+desktop.ini

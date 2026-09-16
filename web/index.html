@@ -1,0 +1,23 @@
+<!doctype html>
+<title>protoshade</title>
+<body style="background:#111">
+<canvas id="c" width="8" height="8" style="width:320px;image-rendering:pixelated"></canvas>
+<script type="module">
+import createModule from '../dist/protoshade.js';
+
+const m = await createModule();
+const face = new m.Protoshade(8, 8);
+const ctx = document.getElementById('c').getContext('2d');
+const img = ctx.createImageData(8, 8);
+
+function frame(t) {
+  for (let y = 0; y < 8; y++)
+    for (let x = 0; x < 8; x++) {
+      const v = face.pixel(x, y, Math.floor(t));
+      img.data.set([0, v, v, 255], (y * 8 + x) * 4);
+    }
+  ctx.putImageData(img, 0, 0);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
