@@ -5,9 +5,11 @@
 //   --no-minify   readable output + JS sourcemap
 //   --watch       rebuild on change, serve dist/ over HTTP, reload the browser
 //   --port <n>    dev server port (default 8000)
+//   --device      also gzip the editor into examples/ProtoShadeWeb/data/ for LittleFS
 import { spawnSync } from "node:child_process";
+import { gzipSync } from "node:zlib";
 import { createServer } from "node:http";
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, extname, join, normalize } from "node:path";
@@ -20,6 +22,7 @@ const src = join(root, "web");
 const out = join(root, "dist");
 const args = process.argv.slice(2);
 const watch = args.includes("--watch");
+const device = args.includes("--device");
 const minify = !watch && !args.includes("--no-minify");
 const port = Number(args[args.indexOf("--port") + 1]) || 8000;
 
@@ -157,9 +160,32 @@ function serve() {
   }).listen(port, () => console.log(`\nwatching web/ - http://localhost:${port}/  (ctrl-c to stop)`));
 }
 
+// The editor, gzipped, for the ESP32's LittleFS partition. The wasm module is deliberately
+// left out: the editor previews by interpreting the compiled program in TypeScript, so the
+// device would be serving a quarter of a megabyte nothing loads.
+//
+// Content-Encoding: gzip is what the sketch sends; litegraph goes from 491 KB to about 120,
+// which is the difference between fitting comfortably and not.
+function buildDeviceFs() {
+  const data = join(root, "examples", "ProtoShadeWeb", "data");
+  rmSync(data, { recursive: true, force: true });
+  let total = 0;
+  for (const name of ["index.html", "main.js", "styles.css", join("vendor", "litegraph.min.js")]) {
+    const from = join(out, name);
+    if (!existsSync(from)) continue;
+    const gz = gzipSync(readFileSync(from), { level: 9 });
+    mkdirSync(dirname(join(data, name)), { recursive: true });
+    writeFileSync(join(data, `${name}.gz`), gz);
+    total += gz.length;
+    console.log(`  ${name}.gz  ${(statSync(from).size / 1024).toFixed(0)} KB -> ${(gz.length / 1024).toFixed(0)} KB`);
+  }
+  console.log(`device filesystem: ${(total / 1024).toFixed(0)} KB in examples/ProtoShadeWeb/data/`);
+}
+
 if (!watch) {
   await esbuild.build(config);
   console.log(`done: dist/index.html + dist/main.js + dist/styles.css${minify ? " (minified)" : ""}`);
+  if (device) buildDeviceFs();
 } else {
   const ctx = await esbuild.context(config);
   await ctx.watch();

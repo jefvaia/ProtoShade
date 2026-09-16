@@ -25,14 +25,15 @@ enum class Status : uint8_t {
   BadVersion,     // built by a newer (or older) web app than this firmware understands
   BadLayout,      // an offset/length in the blob points outside the blob
   BadResolution,
+  BadProgram,     // code is inside the blob but is not executable: bad opcode or operand
 };
 
 // Asset pixel formats. PNGs are decoded and converted by the web app at pack time - the
 // device never decodes PNG, it just points at bytes.
 enum class AssetFormat : uint8_t {
-  RGB565 = 0,   // 2 bytes/px, the native format for most panels
-  RGBA8888 = 1, // 4 bytes/px, when a shader needs alpha
-  A8 = 2,       // 1 byte/px, masks
+  RGB565 = 0,   // 2 bytes/px, what the packer emits for a fully opaque image
+  RGBA8888 = 1, // 4 bytes/px, emitted as soon as one pixel is transparent
+  A8 = 2,       // 1 byte/px, masks: reads as white with that alpha
 };
 
 struct Asset {
@@ -42,21 +43,76 @@ struct Asset {
   AssetFormat format;
 };
 
+// Sensor readings, by slot, exactly as the program's Sensor nodes indexed them. Borrowed:
+// the array must outlive the Frame that carries it.
+//
+// They live in Frame rather than being read inside sample() because two cores render one
+// frame at the same time. A reading that changed halfway through would put a different
+// value in the top half of the face than the bottom, and you would see the seam.
+struct Sensors {
+  const float* values = nullptr;
+  uint8_t count = 0;
+};
+
 // Per-frame values, computed once and shared read-only by every core rendering that frame.
 struct Frame {
   uint32_t ms;     // time base handed to the shader
   uint32_t index;  // frame counter, for effects that want it
+  float seconds;   // ms in seconds, converted once here instead of once per pixel
+  Sensors sensors;
 };
 
+namespace format {
+constexpr uint8_t kMagic[4] = {'P', 'S', 'H', 'D'};
+constexpr uint16_t kVersion = 2;       // bump on every layout change; old firmware then refuses new bins
+constexpr size_t kHeaderSize = 48;
+constexpr size_t kAssetEntrySize = 16;
+constexpr size_t kInstrSize = 8;
+constexpr uint16_t kMaxDimension = 512;  // sanity cap, not a hardware limit
+constexpr uint8_t kMaxRegisters = 64;    // one per instruction; sized so the written-mask is one uint64_t
+constexpr uint16_t kMaxConstants = 128;  // operand encoding is 7 bits + the constant flag
+// Bounds on what load() will copy into RAM. Generous next to what the web app emits (it
+// caps itself at kMaxRegisters instructions), and they are what keeps the copies below a
+// few KB on a chip with 512 KB of SRAM.
+constexpr uint16_t kMaxInstructions = 256;
+constexpr uint16_t kMaxAssets = 32;
+}  // namespace format
+
+// The instruction set. Mirrored in web/nodes.ts (OP) - the numbering IS the format, so
+// append, never reorder, and bump kVersion when you do.
+enum class Op : uint8_t {
+  UV = 0,     // -> (u, v, 0, 1)
+  Centered,   // aspect-corrected -1..1
+  PixelPos,   // -> (x, y, 0, 1)
+  Time,       // src0 = speed
+  Sensor,     // aux = slot, aux2 = range << 1 | unit; src0 = value used when the slot is absent
+  Math,       // aux = op index; src0 = A, src1 = B
+  Mix,        // src0 = fac, src1 = A, src2 = B
+  Over,       // src0 = fac, src1 = foreground, src2 = background
+  Swizzle,    // aux = component 0..3, broadcast; src0 = vector
+  Combine,    // src0..3 contribute their component 0
+  Hsv,        // src0..3 = hue, sat, val, alpha
+  Tex,        // aux = asset, aux2 = wrap | filter << 1 | alpha-out << 2; src0 = uv
+  Output,     // src0 = colour, src1 = brightness. Always the last instruction.
+  kCount,
+};
+
+constexpr uint8_t kMathOpCount = 21;  // web/nodes.ts MATH_OPS
+constexpr uint8_t kRangeCount = 5;    // web/nodes.ts RANGES
+
 // Per-thread scratch. One per rendering thread - never share one across cores.
-// Today it only carries the step budget; the VM's stack and registers land here too, which
-// is exactly why it is caller-owned rather than a member of the runtime.
+//
+// ~1 KB because of the register file, so keep it a member or a global, not a stack local
+// inside loop(). That is also why it is caller-owned: the two render tasks each keep one.
 struct ExecContext {
   // Hard ceiling on work per pixel. A program from the web is untrusted input: without a
-  // budget a bad loop is a watchdog reset with the visor on someone's head.
+  // budget a bad loop is a watchdog reset with the visor on someone's head. The code has no
+  // loops, so today this is really a ceiling on program length - checked once per pixel.
   uint32_t step_limit = 4096;
   uint32_t steps_used = 0;   // reset per pixel
   bool budget_exceeded = false;  // sticky, so a frame can be flagged without checking per pixel
+
+  float regs[format::kMaxRegisters][4] = {};
 };
 
 // Binary container layout, little-endian. Both targets are little-endian, but the fields are
@@ -68,13 +124,18 @@ struct ExecContext {
 //   6       2     flags
 //   8       2     width_hint       resolution the program was authored for (0 = any)
 //   10      2     height_hint
-//   12      4     code_offset
-//   16      4     code_length
-//   20      2     asset_count
-//   22      2     reserved
-//   24      4     asset_table_offset   asset_count entries of 16 bytes
-//   28      4     total_length         must equal the blob length
-//   32            end of header
+//   12      4     code_offset      instructions, 8 bytes each
+//   16      4     code_length      in bytes; must be a multiple of 8
+//   20      4     const_offset     constants, four float32 each
+//   24      2     const_count
+//   26      1     register_count
+//   27      1     sensor_count     highest sensor slot the program uses, plus one
+//   28      2     asset_count
+//   30      2     reserved
+//   32      4     asset_table_offset   asset_count entries of 16 bytes
+//   36      4     total_length         must equal the blob length
+//   40      8     reserved
+//   48            end of header
 //
 // Asset table entry:
 //   0       4     data_offset
@@ -83,23 +144,20 @@ struct ExecContext {
 //   10      2     height
 //   12      1     format (AssetFormat)
 //   13      3     reserved
-namespace format {
-constexpr uint8_t kMagic[4] = {'P', 'S', 'H', 'D'};
-constexpr uint16_t kVersion = 1;       // bump on every layout change; old firmware then refuses new bins
-constexpr size_t kHeaderSize = 32;
-constexpr size_t kAssetEntrySize = 16;
-constexpr uint16_t kMaxDimension = 512;  // sanity cap, not a hardware limit
-}  // namespace format
-
+//
+// Instruction (8 bytes): op, dst, src0, src1, src2, src3, aux, aux2.
+// An operand byte is a register index, or a constant index with bit 7 set.
 class ProtoShadeRuntime {
 public:
   ProtoShadeRuntime() = default;
   ProtoShadeRuntime(uint16_t width, uint16_t height) { setResolution(width, height); }
 
-  // Point the runtime at a compiled program. The bytes are NOT copied: on the ESP32 this is
-  // meant to be a pointer into a flash partition mapped with esp_partition_mmap(), which
-  // costs no RAM. The caller must keep the data alive for as long as the runtime uses it.
-  // Every offset in the blob is validated here, so sampling never has to re-check.
+  // Point the runtime at a compiled program. The ASSETS are not copied: on the ESP32 this is
+  // meant to be a pointer into a flash partition mapped with esp_partition_mmap(), so a
+  // megabyte of images costs no RAM. The caller must keep the data alive for as long as the
+  // runtime uses it. The program itself - code, constants, asset headers - is small and is
+  // copied into RAM here, see the members at the bottom for why.
+  // Every offset, opcode and operand in the blob is validated here, so sampling never has to.
   bool load(const uint8_t* program, size_t length);
 
   void unload();
@@ -118,7 +176,15 @@ public:
   uint16_t assetCount() const { return asset_count_; }
   bool asset(uint16_t index, Asset& out) const;
 
-  Frame beginFrame(uint32_t ms) const { return Frame{ms, frame_index_++}; }
+  uint16_t instructionCount() const { return instr_count_; }
+  // Sensor slots the program reads. A head with fewer wired up still runs it: missing slots
+  // read the value the author left in the Sensor node.
+  uint8_t sensorCount() const { return sensor_count_; }
+
+  Frame beginFrame(uint32_t ms) const { return beginFrame(ms, Sensors{}); }
+  Frame beginFrame(uint32_t ms, const Sensors& sensors) const {
+    return Frame{ms, frame_index_++, float(ms) / 1000.0f, sensors};
+  }
 
   // Sample one pixel. const and free of shared mutable state, so two cores may call it at
   // the same time as long as each passes its own ExecContext.
@@ -135,16 +201,46 @@ public:
 
 private:
   Pixel testPattern(const Frame& frame, uint16_t x, uint16_t y) const;
+  bool validateCode();
+  // Reads one asset texel into rgba (0..1). Bounds are already validated at load().
+  void texel(uint16_t asset, int32_t x, int32_t y, bool clamp, float* rgba) const;
+
+  // Asset header, copied out of the blob at load. Four fields the sampler needs per texel,
+  // in RAM, instead of re-parsing a 16-byte table entry out of mapped flash every time.
+  struct AssetRef {
+    const uint8_t* data;
+    int32_t w, h;
+    AssetFormat format;
+  };
 
   const uint8_t* blob_ = nullptr;
   size_t blob_len_ = 0;
-  const uint8_t* code_ = nullptr;
-  uint32_t code_len_ = 0;
   const uint8_t* asset_table_ = nullptr;
+  uint16_t instr_count_ = 0;
   uint16_t asset_count_ = 0;
   uint16_t prog_w_ = 0, prog_h_ = 0;
+  uint8_t reg_count_ = 0;
+  uint8_t sensor_count_ = 0;
+
+  // Code, constants and asset headers are copied into RAM at load.
+  //
+  // On the ESP32 the blob is mapped flash: every read goes through the 32 KB cache, which
+  // the framebuffer and the assets are already competing for. The program is at most 2 KB,
+  // so copying it buys a hot loop that never misses, and constants stop being reassembled
+  // from unaligned bytes on every single pixel. The assets stay mapped - they are the big
+  // thing, and the whole point of mmap is that they cost no RAM.
+  uint8_t code_[format::kMaxInstructions * format::kInstrSize] = {};
+  float consts_[format::kMaxConstants][4] = {};
+  AssetRef assets_[format::kMaxAssets] = {};
+  uint16_t const_count_ = 0;
+
+  // Work one pixel costs. The ISA has no jumps, so this is known before rendering starts.
+  uint32_t cost_ = 0;
 
   uint16_t w_ = 8, h_ = 8;
+  // Reciprocals, so the per-pixel coordinate is a multiply. The S3 has a single-precision
+  // FPU with no divide worth the name; this is the one division that would run per pixel.
+  float inv_w_ = 1.0f / 8.0f, inv_h_ = 1.0f / 8.0f;
   mutable uint32_t frame_index_ = 0;  // only touched by beginFrame(), never while rendering
   Status status_ = Status::NoProgram;
 };

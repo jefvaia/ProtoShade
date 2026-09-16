@@ -1,11 +1,13 @@
-// Wires the page together: litegraph editor on the left, LED preview on the right.
+// Wires the page together: litegraph editor on the left, LED preview on the right, and the
+// download button that turns the graph into the .bin the head runs.
 //
-// The preview evaluates the graph in TypeScript (graph.ts). The wasm runtime has no shader
-// VM yet - once it does, this loop hands it a packed .bin instead and the JS evaluator
-// becomes the reference implementation the two are checked against.
+// The preview does not evaluate nodes. It compiles the graph to a Program and interprets
+// that - the same Program pack() writes and the C++ VM executes - so what you see here is
+// what the panel will do, minus the panel.
 
-import { compile } from "./graph.js";
-import { decodeInto, imageLabel, images, register, type Env } from "./nodes.js";
+import { compile, Runner, type Program } from "./graph.js";
+import { instructionCount, pack, packedSize } from "./pack.js";
+import { RANGES, decodeInto, imageLabel, images, register, type Env, type Vec } from "./nodes.js";
 
 const el = <T extends HTMLElement>(id: string): T => {
   const node = document.getElementById(id);
@@ -21,6 +23,7 @@ const preset = el<HTMLSelectElement>("res-preset");
 const status = el<HTMLElement>("status");
 const previewInfo = el<HTMLElement>("preview-info");
 const hint = el<HTMLElement>("hint");
+const binInfo = el<HTMLElement>("bin-info");
 
 const lctx = led.getContext("2d");
 if (!lctx) throw new Error("2d context unavailable");
@@ -109,7 +112,7 @@ async function restoreImages(): Promise<void> {
         const widget = node.widgets?.[0];
         if (widget) widget.name = imageLabel(node.id);
       } catch {
-        /* unreadable upload: the node just renders black */
+        /* unreadable upload: the node renders transparent */
       }
     }),
   );
@@ -176,40 +179,78 @@ preset.onchange = () => {
 setResolution(W, H);
 
 // ---------------------------------------------------------------------------
+// Sensors. Nothing is plugged into a browser, so the editor plays the part of the firmware:
+// it fills the same feed the device will (Env.sensors / Frame::sensors), from each Sensor
+// node's own widgets. The compiled program is identical either way.
+// ---------------------------------------------------------------------------
+
+function sensorFeed(t: number): number[] {
+  const feed: number[] = [];
+  for (const node of graph._nodes) {
+    if (node.type !== "input/sensor") continue;
+    const slot = Math.max(0, Math.round(Number(node.properties.index) || 0));
+    if (slot > 255) continue;
+    feed[slot] = node.properties.sweep ? sweep(String(node.properties.range), t * 1.5) : Number(node.properties.test) || 0;
+  }
+  return feed;
+}
+
+/** Walks the declared range, so you can watch a shader react without wiring hardware. */
+function sweep(range: string, t: number): number {
+  switch (range) {
+    case "-1..1":
+      return Math.sin(t);
+    case "0..inf":
+      return 5 - 5 * Math.cos(t);
+    case "-inf..inf":
+      return 5 * Math.sin(t);
+    case "0..360":
+      return (t * 40) % 360;
+    default:
+      return 0.5 - 0.5 * Math.cos(t);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Preview loop
 // ---------------------------------------------------------------------------
 
-const env: Env = { x: 0, y: 0, u: 0, v: 0, w: W, h: H, t: 0, frame: 0, images };
+const env: Env = { x: 0, y: 0, u: 0, v: 0, w: W, h: H, t: 0, frame: 0 };
+const colour: Vec = [0, 0, 0, 1];
 let frames = 0;
-let fps = 0;
 let fpsAt = 0;
 const t0 = performance.now();
+/** Kept for the download button, so it ships exactly what the preview last drew. */
+let current: Program | null = null;
 
 function render(now: number): void {
   requestAnimationFrame(render);
 
-  const shader = compile(graph);
+  const result = compile(graph, images, W, H);
+  current = result.ok ? result.program : null;
+  const runner = current ? new Runner(current) : null;
   const img = pctx!.createImageData(W, H);
   env.w = W;
   env.h = H;
   env.t = (now - t0) / 1000;
+  env.sensors = sensorFeed(env.t);
 
   for (let y = 0, p = 0; y < H; y++) {
     for (let x = 0; x < W; x++, p += 4) {
-      let r = 0;
-      let g = 0;
-      let b = 0;
-      if (shader) {
+      colour[0] = colour[1] = colour[2] = 0;
+      if (runner) {
         env.x = x;
         env.y = y;
         // Pixel centres, so u never hits exactly 0 or 1 and an image tiles cleanly.
         env.u = (x + 0.5) / W;
         env.v = (y + 0.5) / H;
-        [r, g, b] = shader.shade(env);
+        runner.run(env, colour);
       }
-      img.data[p] = r * 255;
-      img.data[p + 1] = g * 255;
-      img.data[p + 2] = b * 255;
+      // Math.round, not the implicit rounding of a clamped array: the device rounds
+      // half-up and ties-to-even here would differ by a level on some pixels.
+      img.data[p] = Math.round(colour[0] * 255);
+      img.data[p + 1] = Math.round(colour[1] * 255);
+      img.data[p + 2] = Math.round(colour[2] * 255);
       img.data[p + 3] = 255;
     }
   }
@@ -238,21 +279,42 @@ function render(now: number): void {
 
   frames++;
   if (now - fpsAt > 500) {
-    fps = Math.round((frames * 1000) / (now - fpsAt));
+    const fps = Math.round((frames * 1000) / (now - fpsAt));
     frames = 0;
     fpsAt = now;
     previewInfo.textContent = `${W}×${H} · ${W * H} led${W * H === 1 ? "" : "s"} · ${fps} fps`;
-    hint.textContent = shader
-      ? `${shader.size} node${shader.size === 1 ? "" : "s"} feeding the output`
-      : "no LED Output node - add one (right-click ▸ output) and wire a colour into it";
+    hint.textContent = result.ok ? "" : result.reason;
+    binInfo.textContent = current
+      ? `${instructionCount(current)} instructions · ${current.assets.length} image${current.assets.length === 1 ? "" : "s"} · ` +
+        `${(packedSize(current) / 1024).toFixed(1)} KB .bin` +
+        (current.sensorCount ? ` · ${current.sensorCount} sensor slot${current.sensorCount === 1 ? "" : "s"}` : "")
+      : "";
   }
 }
 
 fitEditor();
 requestAnimationFrame(render);
 
-// The device runtime is compiled by build.bat and served next to this file. It has no
-// shader VM yet, so the preview does not use it - report whether it is there and move on.
+// ---------------------------------------------------------------------------
+// Download. This is the whole handoff: the file goes to the head's upload page as-is.
+// ---------------------------------------------------------------------------
+
+el<HTMLButtonElement>("download").onclick = () => {
+  if (!current) return;
+  const url = URL.createObjectURL(new Blob([pack(current) as BlobPart], { type: "application/octet-stream" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "protoshade.bin";
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
+// Sanity check that nobody renamed a range behind the compiler's back: the combo values and
+// the unit table are the same list, and a mismatch would silently shift every sensor.
+if (RANGES.length !== 5) throw new Error("RANGES changed - bump format::kVersion");
+
+// The device runtime is compiled by build.bat and served next to this file. The preview does
+// not need it - it runs the same program in TypeScript - so just report whether it is there.
 try {
   const createModule = (await import("./protoshade.js")).default;
   const rt = new (await createModule()).ProtoShadeRuntime();

@@ -1,138 +1,163 @@
-// Node library for the shader graph: one table of definitions, used twice.
+// Node library, and the instruction set every node compiles down to.
 //
-//  - register() turns each definition into a litegraph node class (editor side)
-//  - graph.ts calls def.eval() per pixel (preview side)
+//   nodes.ts   what a node is, and which instruction each of its outputs becomes
+//   graph.ts   graph -> Program (instructions + constants + assets), and runs one
+//   pack.ts    Program -> .bin, the container the ESP32 loads
+//
+// The browser does not evaluate nodes. It compiles the graph to a Program and interprets
+// that, which is the same Program the packer writes and the C++ VM runs - so the preview is
+// the device, not an impression of it. test/crosscheck.mjs renders both and compares pixels.
 //
 // One value type: Vec, an [r,g,b,a] / [x,y,z,w] quad. A scalar broadcasts to [n,n,n,1] -
-// opaque, so a plain number never turns invisible - and a node that wants one number reads
-// component 0. Blender coerces the same way, and one type keeps the evaluator free of
-// dispatch. Alpha is carried everywhere rather than off to the side, so an image with
-// transparency stays composable all the way to the Alpha Over node.
-//
-// eval() gets null for an unconnected input so the node can fall back to its own widget,
-// which is what makes a bare Math node usable without wiring anything into it.
+// opaque, so a plain number never turns invisible - and an op that wants one number reads
+// component 0. Alpha is carried everywhere rather than off to the side, so an image with
+// transparency stays composable all the way to Alpha Over.
 
 export type Vec = [number, number, number, number];
 
-/** Decoded upload, RGBA8888, as createImageData gives it. */
+// ---------------------------------------------------------------------------
+// Instruction set. Mirrored in src/ProtoShadeRuntime.cpp - the numbering IS the format,
+// so append, never reorder, and bump format::kVersion when you do.
+// ---------------------------------------------------------------------------
+
+export const OP = {
+  UV: 0, // -> (u, v, 0, 1)
+  CENTERED: 1, // aspect-corrected -1..1
+  PIXEL: 2, // -> (x, y, 0, 1)
+  TIME: 3, // src0 = speed
+  SENSOR: 4, // aux = slot, aux2 = range << 1 | unit; src0 = value used when that slot is absent
+  MATH: 5, // aux = MATH_OPS index; src0 = A, src1 = B
+  MIX: 6, // src0 = fac, src1 = A, src2 = B
+  OVER: 7, // src0 = fac, src1 = foreground, src2 = background
+  SWIZZLE: 8, // aux = component 0..3, broadcast; src0 = vector
+  COMBINE: 9, // src0..3 contribute their component 0
+  HSV: 10, // src0..3 = hue, sat, val, alpha
+  TEX: 11, // aux = asset, aux2 = wrap | filter << 1 | alpha-out << 2; src0 = uv
+  OUTPUT: 12, // src0 = colour, src1 = brightness. Always the last instruction.
+} as const;
+export type OpCode = (typeof OP)[keyof typeof OP];
+
+/** Instruction layout: op, dst, src0..3, aux, aux2. Fixed width so validation is total. */
+export const INSTR_SIZE = 8;
+
+/**
+ * An operand is one byte: a register index, or a constant-pool index with the top bit set.
+ * Registers stop at 64 because the device's per-thread register file is that big (one
+ * uint64_t of "written yet?" bits validates a whole program); constants get the full 7 bits.
+ * Both are mirrored in format:: - raising either is a format change.
+ */
+export const CONST_FLAG = 0x80;
+export const MAX_REGISTERS = 64;
+export const MAX_CONSTS = 128;
+
+/** Component-wise maths. Order is part of the format; unary ops ignore B. */
+export const MATH_OPS = [
+  "add",
+  "subtract",
+  "multiply",
+  "divide",
+  "power",
+  "modulo",
+  "minimum",
+  "maximum",
+  "greater than",
+  "less than",
+  "arctan2",
+  "sine",
+  "cosine",
+  "absolute",
+  "floor",
+  "ceil",
+  "round",
+  "fraction",
+  "sqrt",
+  "clamp",
+  "smoothstep",
+] as const;
+
+/** What a sensor reports. Order is part of the format. */
+export const RANGES = ["0..1", "-1..1", "0..inf", "-inf..inf", "0..360"] as const;
+
+/** Asset pixel formats, matching protoshade::AssetFormat. */
+export const ASSET = { RGB565: 0, RGBA8888: 1, A8: 2 } as const;
+
+export interface PackedAsset {
+  w: number;
+  h: number;
+  format: number;
+  /** Exactly the bytes that go into the .bin, and exactly what TEX samples in the preview. */
+  data: Uint8Array;
+}
+
+/** A decoded upload. `packed` is cached here because converting is per-image, not per-frame. */
 export interface ImageBuf {
   w: number;
   h: number;
   data: Uint8ClampedArray;
+  packed?: PackedAsset;
 }
 
-/** Everything a pixel knows about itself. Rebuilt per pixel, read-only to nodes. */
+/** Everything a pixel knows about itself. Rebuilt per pixel, read-only. */
 export interface Env {
-  x: number; // pixel column, 0..w-1
-  y: number; // pixel row, 0..h-1
-  u: number; // x normalised to 0..1 (pixel centre)
+  x: number;
+  y: number;
+  u: number; // pixel centre, 0..1
   v: number;
   w: number;
   h: number;
-  t: number; // seconds since the page loaded
+  t: number; // seconds
   frame: number;
-  images: Map<number, ImageBuf>; // by node id, filled by decodeInto()
   /**
-   * Live sensor readings by index, as the head's firmware will supply them. Absent in the
-   * browser, where nothing is plugged in - Sensor nodes then fall back to their own test
-   * widget, so the seam is already here for when a real feed arrives.
+   * Live sensor readings by slot, as the head's firmware supplies them (Frame::sensors on
+   * the device). A slot with no reading falls back to the value baked into the program.
    */
   sensors?: number[];
 }
 
-/** A node's widget values, straight off LGraphNode.properties. */
 export type Props = Record<string, unknown>;
 
 export interface PropDef {
   type: "number" | "combo" | "toggle" | "image";
   value: number | string | boolean;
-  options?: { values?: string[]; min?: number; max?: number; step?: number };
+  options?: { values?: readonly string[]; min?: number; max?: number; step?: number };
+}
+
+/** Where an operand comes from when nothing is wired into that input. */
+export type Fallback =
+  | { prop: string } // the node's own widget
+  | { value: number } // a literal
+  | { uv: true }; // synthesise a UV instruction (only the Image node needs this)
+
+export interface OutSpec {
+  op: OpCode;
+  aux?: (p: Props) => number;
+  aux2?: (p: Props) => number;
 }
 
 export interface NodeDef {
   title: string;
-  in?: string[];
-  out: string[];
-  props?: Record<string, PropDef>;
   color?: string;
   desc?: string;
-  /** One output Vec per entry in `out`. Extra params are optional - omit what you ignore. */
-  eval(inp: (Vec | null)[], p: Props, env: Env, id: number): Vec[];
+  /** Wired inputs, in operand order. */
+  in?: string[];
+  /** Parallel to `in`: what each unconnected input becomes. */
+  fallback?: Fallback[];
+  /** Extra operands taken straight from widgets, appended after `in`. */
+  args?: string[];
+  out: string[];
+  /** One entry per output. Absent on a node that is purely a constant. */
+  outs?: OutSpec[];
+  /** The node IS a constant - it compiles into the pool, not into an instruction. */
+  konst?: (p: Props) => Vec;
+  /** TEX nodes: the compiler fills aux with the asset slot it assigned this node. */
+  asset?: true;
+  props?: Record<string, PropDef>;
 }
 
-const vec = (n: number): Vec => [n, n, n, 1];
-/** Component-wise over RGB; alpha rides through from `a`. Scaling a colour must not
-    change its coverage, and a scalar B broadcasts to alpha 1 which add/divide would ruin. */
-const rgb2 = (a: Vec, b: Vec, f: Op): Vec => [f(a[0], b[0]), f(a[1], b[1]), f(a[2], b[2]), a[3]];
 const num = (v: unknown): number => (typeof v === "number" ? v : Number(v) || 0);
-/** Unconnected input -> the node's own widget value, broadcast. */
-const fb = (v: Vec | null, p: Props, key: string): Vec => v ?? vec(num(p[key]));
-const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);
-
-// Component-wise math. Unary entries ignore B, which is why arity is tracked separately:
-// the editor greys nothing out, but B simply has no effect and that is documented per op.
-type Op = (a: number, b: number) => number;
-export const OPS: Record<string, Op> = {
-  add: (a, b) => a + b,
-  subtract: (a, b) => a - b,
-  multiply: (a, b) => a * b,
-  // Zero denominators come from live widgets and unconnected inputs, not from bugs:
-  // returning 0 keeps Infinity/NaN out of the pixel buffer, where they render as black
-  // holes that are hard to trace back here.
-  divide: (a, b) => (b === 0 ? 0 : a / b),
-  power: (a, b) => (a < 0 ? 0 : Math.pow(a, b)),
-  // Floored modulo, so mod(-0.25, 1) is 0.75 and a scrolling coordinate stays continuous
-  // when it crosses zero. JS's % would give -0.25 and tear the pattern.
-  modulo: (a, b) => (b === 0 ? 0 : a - Math.floor(a / b) * b),
-  minimum: (a, b) => Math.min(a, b),
-  maximum: (a, b) => Math.max(a, b),
-  "greater than": (a, b) => (a > b ? 1 : 0),
-  "less than": (a, b) => (a < b ? 1 : 0),
-  arctan2: (a, b) => Math.atan2(a, b),
-  sine: (a) => Math.sin(a),
-  cosine: (a) => Math.cos(a),
-  absolute: (a) => Math.abs(a),
-  floor: (a) => Math.floor(a),
-  ceil: (a) => Math.ceil(a),
-  round: (a) => Math.round(a),
-  fraction: (a) => a - Math.floor(a),
-  sqrt: (a) => (a < 0 ? 0 : Math.sqrt(a)),
-  clamp: (a) => clamp01(a),
-  // Shaping curve on 0..1. Scale/offset A first (subtract + divide) to place the ramp.
-  smoothstep: (a) => {
-    const x = clamp01(a);
-    return x * x * (3 - 2 * x);
-  },
-};
-export const OP_NAMES = Object.keys(OPS);
-
-const hsvToRgb = (h: number, s: number, v: number, a: number): Vec => {
-  const hh = (h - Math.floor(h)) * 6;
-  const c = clamp01(v) * clamp01(s);
-  const x = c * (1 - Math.abs((hh % 2) - 1));
-  const m = clamp01(v) - c;
-  const i = Math.floor(hh) % 6;
-  const t: [number, number, number] =
-    i === 0 ? [c, x, 0] : i === 1 ? [x, c, 0] : i === 2 ? [0, c, x] : i === 3 ? [0, x, c] : i === 4 ? [x, 0, c] : [c, 0, x];
-  return [t[0] + m, t[1] + m, t[2] + m, a];
-};
-
-/**
- * What a sensor reports, and how to squash it into 0..1. The range is the sensor's own
- * format - a flex sensor gives 0..1, an encoder counts up forever, an IMU axis swings both
- * ways - so the node declares it instead of pretending everything is already normalised.
- * `unit` is what makes an unbounded reading usable as a hue or a mix factor: it saturates
- * instead of clipping, so a value of 3 and a value of 300 still look different.
- */
-const RANGES: Record<string, { unit: (x: number) => number; sweep: (t: number) => number }> = {
-  "0..1": { unit: clamp01, sweep: (t) => 0.5 - 0.5 * Math.cos(t) },
-  "-1..1": { unit: (x) => clamp01(x * 0.5 + 0.5), sweep: (t) => Math.sin(t) },
-  "0..inf": { unit: (x) => (x <= 0 ? 0 : x / (1 + x)), sweep: (t) => 5 - 5 * Math.cos(t) },
-  "-inf..inf": { unit: (x) => 0.5 + (0.5 * x) / (1 + Math.abs(x)), sweep: (t) => 5 * Math.sin(t) },
-  // Degrees wrap rather than clamp: at 359 deg a head is a degree from 0, not at the far end.
-  "0..360": { unit: (x) => (((x % 360) + 360) % 360) / 360, sweep: (t) => ((t * 60) % 360) },
-};
-const RANGE_NAMES = Object.keys(RANGES);
+const pick = (list: readonly string[], v: unknown): number => Math.max(0, list.indexOf(String(v) as never));
+const slotOf = (p: Props): number => Math.max(0, Math.round(num(p.index)));
+const texFlags = (p: Props): number => (p.wrap === "clamp" ? 1 : 0) | (p.filter === "linear" ? 2 : 0);
 
 export const OUTPUT_TYPE = "output/led";
 
@@ -142,43 +167,38 @@ export const NODES: Record<string, NodeDef> = {
     color: "#3a5",
     desc: "Where this pixel is on the panel",
     out: ["UV", "Centered", "Pixel"],
-    eval: (_i, _p, env) => [
-      [env.u, env.v, 0, 1],
-      // Aspect-corrected -1..1, so a circle on a 64x32 panel stays round.
-      [(env.u * 2 - 1) * (env.w / Math.max(env.h, 1)), env.v * 2 - 1, 0, 1],
-      [env.x, env.y, 0, 1],
-    ],
+    outs: [{ op: OP.UV }, { op: OP.CENTERED }, { op: OP.PIXEL }],
   },
 
   "input/time": {
     title: "Time",
     color: "#3a5",
-    desc: "Seconds since load, times speed",
+    desc: "Seconds since boot, times speed",
     out: ["Time"],
+    outs: [{ op: OP.TIME }],
+    args: ["speed"],
     props: { speed: { type: "number", value: 1, options: { step: 10 } } },
-    eval: (_i, p, env) => [vec(env.t * num(p.speed))],
   },
 
   "input/sensor": {
     title: "Sensor",
     color: "#3a5",
-    desc: "A sensor on the head, by index. Value is raw, Unit is that value squashed to 0..1",
+    desc: "A sensor on the head, by slot. Value is raw, Unit is that reading squashed to 0..1",
     out: ["Value", "Unit"],
+    outs: [
+      { op: OP.SENSOR, aux: slotOf, aux2: (p) => pick(RANGES, p.range) << 1 },
+      { op: OP.SENSOR, aux: slotOf, aux2: (p) => (pick(RANGES, p.range) << 1) | 1 },
+    ],
+    // `test` is not a preview-only knob: it is what the shader reads when the head it runs
+    // on has nothing in that slot, so it ships inside the program.
+    args: ["test"],
     props: {
-      range: { type: "combo", value: "0..1", options: { values: RANGE_NAMES } },
+      range: { type: "combo", value: "0..1", options: { values: RANGES } },
       index: { type: "number", value: 0, options: { min: 0, max: 255, step: 10 } },
-      // No hardware is attached to a browser, so the editor drives the node itself:
-      // `test` holds a reading, `sweep` walks the range so you can watch it animate.
       test: { type: "number", value: 0.5, options: { step: 1 } },
+      // Editor-only: main.ts feeds a swept reading into Env.sensors, exactly where hardware
+      // readings land. The program is identical either way - only the input differs.
       sweep: { type: "toggle", value: false },
-    },
-    eval: (_i, p, env) => {
-      const r = RANGES[String(p.range)] ?? RANGES["0..1"];
-      // Index is a widget: round it, floor it at 0, and read past the end as 0 rather
-      // than letting a typo hand undefined to the maths.
-      const live = env.sensors?.[Math.max(0, Math.round(num(p.index)))];
-      const raw = live ?? (p.sweep ? r.sweep(env.t * 1.5) : num(p.test));
-      return [vec(raw), vec(r.unit(raw))];
     },
   },
 
@@ -186,21 +206,21 @@ export const NODES: Record<string, NodeDef> = {
     title: "Value",
     color: "#666",
     out: ["Value"],
+    konst: (p) => [num(p.value), num(p.value), num(p.value), 1],
     props: { value: { type: "number", value: 0.5, options: { step: 1 } } },
-    eval: (_i, p) => [vec(num(p.value))],
   },
 
   "const/color": {
     title: "Color",
     color: "#aa3",
     out: ["Color"],
+    konst: (p) => [num(p.r), num(p.g), num(p.b), num(p.a)],
     props: {
       r: { type: "number", value: 1, options: { min: 0, max: 1, step: 1 } },
       g: { type: "number", value: 0.4, options: { min: 0, max: 1, step: 1 } },
       b: { type: "number", value: 0, options: { min: 0, max: 1, step: 1 } },
       a: { type: "number", value: 1, options: { min: 0, max: 1, step: 1 } },
     },
-    eval: (_i, p) => [[num(p.r), num(p.g), num(p.b), num(p.a)]],
   },
 
   "math/math": {
@@ -208,13 +228,14 @@ export const NODES: Record<string, NodeDef> = {
     color: "#35a",
     desc: "Component-wise over RGB, alpha comes from A. Unary ops (sine, floor, ...) ignore B",
     in: ["A", "B"],
+    fallback: [{ prop: "a" }, { prop: "b" }],
     out: ["Result"],
+    outs: [{ op: OP.MATH, aux: (p) => pick(MATH_OPS, p.op) }],
     props: {
-      op: { type: "combo", value: "multiply", options: { values: OP_NAMES } },
+      op: { type: "combo", value: "multiply", options: { values: MATH_OPS } },
       a: { type: "number", value: 0, options: { step: 1 } },
       b: { type: "number", value: 1, options: { step: 1 } },
     },
-    eval: (inp, p) => [rgb2(fb(inp[0], p, "a"), fb(inp[1], p, "b"), OPS[String(p.op)] ?? OPS.add)],
   },
 
   "math/mix": {
@@ -222,15 +243,10 @@ export const NODES: Record<string, NodeDef> = {
     color: "#35a",
     desc: "A when Fac is 0, B when Fac is 1. Alpha is blended too",
     in: ["Fac", "A", "B"],
+    fallback: [{ prop: "fac" }, { value: 0 }, { value: 1 }],
     out: ["Result"],
+    outs: [{ op: OP.MIX }],
     props: { fac: { type: "number", value: 0.5, options: { min: 0, max: 1, step: 1 } } },
-    eval: (inp, p) => {
-      const f = fb(inp[0], p, "fac")[0];
-      const a = inp[1] ?? vec(0);
-      const b = inp[2] ?? vec(1);
-      const l = (i: number): number => a[i] + (b[i] - a[i]) * f;
-      return [[l(0), l(1), l(2), l(3)]];
-    },
   },
 
   "color/over": {
@@ -238,20 +254,10 @@ export const NODES: Record<string, NodeDef> = {
     color: "#aa3",
     desc: "Foreground composited over Background, source-over. Fac fades the foreground",
     in: ["Fac", "Foreground", "Background"],
+    fallback: [{ prop: "fac" }, { value: 0 }, { value: 0 }],
     out: ["Color"],
+    outs: [{ op: OP.OVER }],
     props: { fac: { type: "number", value: 1, options: { min: 0, max: 1, step: 1 } } },
-    eval: (inp, p) => {
-      const fg = inp[1] ?? vec(0);
-      const bg = inp[2] ?? vec(0);
-      const af = clamp01(fg[3]) * clamp01(fb(inp[0], p, "fac")[0]);
-      const ab = clamp01(bg[3]);
-      const a = af + ab * (1 - af);
-      // Straight (un-premultiplied) alpha in and out, so chaining two of these composes.
-      // Fully transparent result: the colour is meaningless, keep it black instead of 0/0.
-      if (a === 0) return [[0, 0, 0, 0]];
-      const c = (i: number): number => (fg[i] * af + bg[i] * ab * (1 - af)) / a;
-      return [[c(0), c(1), c(2), a]];
-    },
   },
 
   "vector/separate": {
@@ -259,11 +265,9 @@ export const NODES: Record<string, NodeDef> = {
     color: "#63a",
     desc: "Also Separate XYZW - same four components",
     in: ["Vector"],
+    fallback: [{ value: 0 }],
     out: ["R / X", "G / Y", "B / Z", "A / W"],
-    eval: (inp) => {
-      const a = inp[0] ?? vec(0);
-      return [vec(a[0]), vec(a[1]), vec(a[2]), vec(a[3])];
-    },
+    outs: [0, 1, 2, 3].map((c) => ({ op: OP.SWIZZLE, aux: () => c })),
   },
 
   "vector/combine": {
@@ -271,21 +275,15 @@ export const NODES: Record<string, NodeDef> = {
     color: "#63a",
     desc: "Each input contributes its first component",
     in: ["R / X", "G / Y", "B / Z", "A / W"],
+    fallback: [{ prop: "r" }, { prop: "g" }, { prop: "b" }, { prop: "a" }],
     out: ["Vector"],
+    outs: [{ op: OP.COMBINE }],
     props: {
       r: { type: "number", value: 0, options: { step: 1 } },
       g: { type: "number", value: 0, options: { step: 1 } },
       b: { type: "number", value: 0, options: { step: 1 } },
       a: { type: "number", value: 1, options: { min: 0, max: 1, step: 1 } },
     },
-    eval: (inp, p) => [
-      [
-        fb(inp[0], p, "r")[0],
-        fb(inp[1], p, "g")[0],
-        fb(inp[2], p, "b")[0],
-        fb(inp[3], p, "a")[0],
-      ],
-    ],
   },
 
   "color/hsv": {
@@ -293,96 +291,60 @@ export const NODES: Record<string, NodeDef> = {
     color: "#aa3",
     desc: "Hue wraps, so a rising Hue is a rainbow",
     in: ["Hue", "Sat", "Val", "Alpha"],
+    fallback: [{ prop: "hue" }, { prop: "sat" }, { prop: "val" }, { prop: "alpha" }],
     out: ["Color"],
+    outs: [{ op: OP.HSV }],
     props: {
       hue: { type: "number", value: 0, options: { min: 0, max: 1, step: 1 } },
       sat: { type: "number", value: 1, options: { min: 0, max: 1, step: 1 } },
       val: { type: "number", value: 1, options: { min: 0, max: 1, step: 1 } },
       alpha: { type: "number", value: 1, options: { min: 0, max: 1, step: 1 } },
     },
-    eval: (inp, p) => [
-      hsvToRgb(
-        fb(inp[0], p, "hue")[0],
-        fb(inp[1], p, "sat")[0],
-        fb(inp[2], p, "val")[0],
-        fb(inp[3], p, "alpha")[0],
-      ),
-    ],
   },
 
   "texture/image": {
     title: "Image",
     color: "#a63",
-    desc: "Upload a PNG/JPG and sample it with a UV vector. Color carries the PNG's alpha",
+    desc: "Upload a PNG/JPG; it is packed into the .bin. Color carries the image's alpha",
     in: ["Vector"],
+    fallback: [{ uv: true }],
     out: ["Color", "Alpha"],
+    asset: true,
+    outs: [
+      { op: OP.TEX, aux2: texFlags },
+      { op: OP.TEX, aux2: (p) => texFlags(p) | 4 },
+    ],
     props: {
       file: { type: "image", value: "" },
       wrap: { type: "combo", value: "repeat", options: { values: ["repeat", "clamp"] } },
       filter: { type: "combo", value: "nearest", options: { values: ["nearest", "linear"] } },
-    },
-    eval: (inp, p, env, id) => {
-      const img = env.images.get(id);
-      // No upload yet: transparent, so an Alpha Over below it shows the background
-      // instead of a black rectangle.
-      if (!img) return [[0, 0, 0, 0], vec(0)];
-      const uv = inp[0] ?? [env.u, env.v, 0, 1];
-      const px = sampleImage(img, uv[0], uv[1], String(p.wrap), String(p.filter));
-      return [px, vec(px[3])];
     },
   },
 
   [OUTPUT_TYPE]: {
     title: "LED Output",
     color: "#a33",
-    desc: "What the panel shows. Exactly one of these drives the preview",
+    desc: "What the panel shows. Exactly one of these drives the render",
     in: ["Color"],
+    fallback: [{ value: 0 }],
+    args: ["brightness"],
     out: [],
+    // Not an output socket - this is the instruction the compiler ends the program with.
+    outs: [{ op: OP.OUTPUT }],
     props: { brightness: { type: "number", value: 1, options: { min: 0, max: 1, step: 1 } } },
-    eval: (inp, p) => {
-      // An LED is on or off, there is nothing behind it to show through: alpha composites
-      // against black here, which is the one place transparency has to be resolved.
-      const c = inp[0] ?? vec(0);
-      const k = num(p.brightness) * clamp01(c[3]);
-      return [[clamp01(c[0] * k), clamp01(c[1] * k), clamp01(c[2] * k), 1]];
-    },
   },
 };
 
-/** RGBA in 0..1 at uv. Nearest by default - an LED panel has no pixels to spare on blur. */
-function sampleImage(img: ImageBuf, u: number, v: number, wrap: string, filter: string): Vec {
-  const fold = (t: number, n: number): number =>
-    wrap === "clamp" ? Math.min(Math.max(t, 0), n - 1) : ((t % n) + n) % n;
-  const texel = (xi: number, yi: number): Vec => {
-    const i = (fold(yi, img.h) * img.w + fold(xi, img.w)) * 4;
-    return [img.data[i] / 255, img.data[i + 1] / 255, img.data[i + 2] / 255, img.data[i + 3] / 255];
-  };
-  if (filter !== "linear") return texel(Math.floor(u * img.w), Math.floor(v * img.h));
-
-  const x = u * img.w - 0.5;
-  const y = v * img.h - 0.5;
-  const x0 = Math.floor(x);
-  const y0 = Math.floor(y);
-  const fx = x - x0;
-  const fy = y - y0;
-  const a = texel(x0, y0);
-  const b = texel(x0 + 1, y0);
-  const c = texel(x0, y0 + 1);
-  const d = texel(x0 + 1, y0 + 1);
-  const lerp = (p: number, q: number, t: number): number => p + (q - p) * t;
-  const at = (k: number): number => lerp(lerp(a[k], b[k], fx), lerp(c[k], d[k], fx), fy);
-  return [at(0), at(1), at(2), at(3)];
-}
-
 // ---------------------------------------------------------------------------
-// Editor side. Everything below touches the DOM or the litegraph globals, so it
-// only runs in the browser - the self-check imports the table above and nothing else.
+// Editor side. Everything below touches the DOM or the litegraph globals, so it only runs
+// in the browser - the self-check imports the tables above and nothing else.
 // ---------------------------------------------------------------------------
 
-/** Decoded uploads, by node id. Lives here because both the widget and Env need it. */
+/** Decoded uploads, by node id. Lives here because both the widget and the compiler need it. */
 export const images = new Map<number, ImageBuf>();
 
-/** The panel is at most 512px wide (format::kMaxDimension); anything above that is waste. */
+/** The panel is at most 512 px a side (format::kMaxDimension); above that is dead weight in
+    a flash partition. */
 const MAX_IMAGE = 512;
 
 /** Decode a data URL into `images`. Rejects if the browser cannot decode it. */
@@ -408,8 +370,7 @@ export function imageLabel(id: number): string {
   return img ? `${img.w} x ${img.h}` : "upload image";
 }
 
-/** Ask for a file, decode it, and store the data URL in node.properties[key] so it
-    survives a reload. */
+/** Ask for a file, decode it, and keep the data URL in node.properties[key] for the save. */
 function pickImage(node: LGraphNode, key: string, widget: { name: string }): void {
   const input = document.createElement("input");
   input.type = "file";
@@ -436,8 +397,8 @@ function pickImage(node: LGraphNode, key: string, widget: { name: string }): voi
 }
 
 /**
- * Replace litegraph's 152 built-in node types with ours, so the right-click menu is
- * only ProtoShade nodes and a saved graph can never reference a node we cannot evaluate.
+ * Replace litegraph's 152 built-in node types with ours, so the right-click menu is only
+ * ProtoShade nodes and a saved graph can never name one the compiler cannot emit.
  */
 export function register(): void {
   LiteGraph.clearRegisteredTypes();

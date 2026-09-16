@@ -32,6 +32,7 @@
     </select>
 
     <span class="flex-1"></span>
+    <button id="download" class="bg-emerald-700 hover:bg-emerald-600 rounded px-3 py-1">download .bin</button>
     <button id="reset" class="bg-neutral-800 hover:bg-neutral-700 rounded px-3 py-1">reset graph</button>
     <span id="status" class="text-neutral-500 tabular-nums"></span>
   </header>
@@ -48,11 +49,15 @@
       <h2 class="text-neutral-400 uppercase tracking-widest text-xs">preview</h2>
       <canvas id="led" class="self-center max-w-full h-auto bg-black rounded ring-1 ring-neutral-700 [image-rendering:pixelated]"></canvas>
       <p id="preview-info" class="text-neutral-500 text-xs tabular-nums"></p>
-      <p id="hint" class="text-neutral-500 text-xs leading-relaxed"></p>
+      <p id="bin-info" class="text-neutral-500 text-xs tabular-nums"></p>
+      <p id="hint" class="text-amber-500 text-xs leading-relaxed"></p>
       <p class="text-neutral-600 text-xs leading-relaxed mt-auto">
         Every value is RGBA. A single number is that number in R, G and B with alpha 1, and a
         node that wants one number reads R. Unconnected inputs fall back to the node's own
         widget. The LED Output flattens alpha against black - the panel has nothing behind it.
+        <br><br>
+        The preview runs the compiled program, not the nodes: download .bin ships exactly
+        this, images included, and the head's upload page takes it from there.
       </p>
     </aside>
   </main>

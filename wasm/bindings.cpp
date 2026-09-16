@@ -44,9 +44,18 @@ public:
   // Renders the whole frame into wasm memory. The browser is single-threaded here, which is
   // exactly why the core does not own the threading: the ESP32 splits this across two cores
   // (ProtoShadeParallel), the browser just calls it straight.
+  // Sensor readings, by slot, standing in for what the head's firmware supplies. Copied,
+  // because the Frame only borrows them and a JS array can be collected under it.
+  void setSensors(const emscripten::val& values) {
+    const unsigned count = values["length"].as<unsigned>();
+    sensors_.resize(count > 255 ? 255 : count);
+    for (size_t i = 0; i < sensors_.size(); i++) sensors_[i] = values[i].as<float>();
+  }
+
   bool render(uint32_t ms) {
     if (frame_.empty()) setResolution(rt_.width(), rt_.height());
-    const Frame f = rt_.beginFrame(ms);
+    const Sensors sensors{sensors_.empty() ? nullptr : sensors_.data(), uint8_t(sensors_.size())};
+    const Frame f = rt_.beginFrame(ms, sensors);
     ctx_.budget_exceeded = false;
     rt_.renderFrame(ctx_, f, frame_.data());
     return !ctx_.budget_exceeded;
@@ -59,9 +68,13 @@ public:
                                                          reinterpret_cast<uint8_t*>(frame_.data())));
   }
 
+  uint16_t instructionCount() const { return rt_.instructionCount(); }
+  uint8_t sensorCount() const { return rt_.sensorCount(); }
+
   // One pixel, for probing/debug. Per-pixel calls from JS are slow - use render() for frames.
   emscripten::val sample(uint16_t x, uint16_t y, uint32_t ms) {
-    const Frame f = rt_.beginFrame(ms);
+    const Sensors sensors{sensors_.empty() ? nullptr : sensors_.data(), uint8_t(sensors_.size())};
+    const Frame f = rt_.beginFrame(ms, sensors);
     const Pixel p = rt_.sample(ctx_, f, x, y);
     emscripten::val out = emscripten::val::object();
     out.set("r", p.r);
@@ -75,6 +88,7 @@ private:
   ExecContext ctx_;
   std::vector<uint8_t> blob_;
   std::vector<Pixel> frame_;
+  std::vector<float> sensors_;
 };
 
 }  // namespace
@@ -92,6 +106,9 @@ EMSCRIPTEN_BINDINGS(protoshade_runtime) {
       .function("width", &WebRuntime::width)
       .function("height", &WebRuntime::height)
       .function("assetCount", &WebRuntime::assetCount)
+      .function("instructionCount", &WebRuntime::instructionCount)
+      .function("sensorCount", &WebRuntime::sensorCount)
+      .function("setSensors", &WebRuntime::setSensors)
       .function("render", &WebRuntime::render)
       .function("pixels", &WebRuntime::pixels)
       .function("sample", &WebRuntime::sample);
