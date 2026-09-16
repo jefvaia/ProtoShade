@@ -51,7 +51,16 @@ output, ordered so every operand is written before it is read. Thirteen opcodes 
 
 That shape is the point. The cost of a pixel is known before the first one is drawn, so the
 step budget is one comparison instead of accounting inside a loop, and a `.bin` from a web
-page cannot spin a head into a watchdog reset. `load()` proves the rest: every offset, every
+page cannot spin a head into a watchdog reset.
+
+It also makes one optimisation free. `load()` splits the program in two: an instruction is
+**uniform** when nothing it reads varies across the frame - time, sensors, constants, and
+everything computed from those - and **per pixel** otherwise, which starts at the three
+coordinate opcodes and spreads from there. The uniform half runs once per core per frame,
+the per-pixel half runs per pixel. A shader whose animation comes from `sine(time)` was
+computing that sine on every one of 4096 pixels and now computes it twice a frame; it is
+usually half the program. That is sound only because every register is written exactly once,
+which `load()` now proves and refuses programs that break. `load()` proves the rest: every offset, every
 opcode, every operand index, that no instruction reads a register nothing has written, and
 that every texel of every image is inside the blob. After that the interpreter has no guards
 in it at all.
@@ -85,6 +94,11 @@ author left in the node.
   `beginFrame()` converts ms to seconds once per frame.
 - Build with `-O2`; the Arduino default is `-Os`. Worth measuring `-O3` on the VM loop.
 - Keep the framebuffer in internal SRAM, not PSRAM.
+- **`sinf`, `cosf`, `powf` and friends are software** on this chip, and newlib's argument
+  reduction gets slower as the argument grows - a sine of `time * speed` that has been
+  running for an hour costs more than one at boot. Uniform hoisting takes most of that
+  sting out by calling them once a frame, and it is the reason a shader can get *slower the
+  longer it runs* if they ever end up in the per-pixel half.
 
 ### The .bin container
 

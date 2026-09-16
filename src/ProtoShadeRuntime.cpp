@@ -241,7 +241,10 @@ bool ProtoShadeRuntime::validateCode() {
   }
 
   uint64_t written = 0;  // one bit per register; kMaxRegisters is 64 for exactly this
+  bool uniform_reg[format::kMaxRegisters] = {};
   uint32_t cost = 0;
+  uniform_count_ = 0;
+  varying_count_ = 0;
   for (uint16_t i = 0; i < instr_count_; i++) {
     const uint8_t* in = code_ + size_t(i) * format::kInstrSize;
     const uint8_t op = in[0];
@@ -277,18 +280,44 @@ bool ProtoShadeRuntime::validateCode() {
       status_ = Status::BadProgram;
       return false;
     }
+    // Written exactly once, never twice. The compiler allocates a fresh register per
+    // instruction, and depending on that is what lets the uniform instructions be pulled
+    // out of the pixel loop below without changing what anything downstream reads.
+    if (written & (uint64_t(1) << dst)) {
+      status_ = Status::BadProgram;
+      return false;
+    }
     written |= uint64_t(1) << dst;
-    // A bilinear fetch is four texels and the lerps between them; everything else is
-    // roughly one step. Rough on purpose: this only has to bound the work, not price it.
-    cost += (op == uint8_t(Op::Tex) && (aux2 & 2)) ? 8 : 1;
+
+    // Uniform: nothing in this instruction's inputs varies across the frame. The three
+    // coordinate ops are where variation enters; everything else inherits it.
+    bool is_uniform = op != uint8_t(Op::UV) && op != uint8_t(Op::Centered) &&
+                      op != uint8_t(Op::PixelPos);
+    for (uint8_t s = 0; s < operands && is_uniform; s++) {
+      const uint8_t o = in[2 + s];
+      if (!(o & kConstFlag) && !uniform_reg[o]) is_uniform = false;
+    }
+    uniform_reg[dst] = is_uniform;
+
+    if (is_uniform) {
+      uniform_[uniform_count_++] = uint8_t(i);
+    } else {
+      varying_[varying_count_++] = uint8_t(i);
+      // A bilinear fetch is four texels and the lerps between them; everything else is
+      // roughly one step. Rough on purpose: this only has to bound the work, not price it.
+      // Uniform instructions are not counted: they are not what a pixel costs.
+      cost += (op == uint8_t(Op::Tex) && (aux2 & 4)) ? 8 : 1;
+    }
   }
 
   // sample() returns the last instruction's register, so the program has to end by writing
   // the pixel. Anything else is a program that computes nothing.
-  if (code_[size_t(instr_count_ - 1) * format::kInstrSize] != uint8_t(Op::Output)) {
+  const uint8_t* last = code_ + size_t(instr_count_ - 1) * format::kInstrSize;
+  if (last[0] != uint8_t(Op::Output)) {
     status_ = Status::BadProgram;
     return false;
   }
+  result_reg_ = last[1];
   cost_ = cost;
   return true;
 }
@@ -299,6 +328,8 @@ void ProtoShadeRuntime::unload() {
   instr_count_ = 0;
   asset_count_ = prog_w_ = prog_h_ = const_count_ = 0;
   reg_count_ = sensor_count_ = 0;
+  uniform_count_ = varying_count_ = 0;
+  result_reg_ = 0;
   cost_ = 0;
   status_ = Status::NoProgram;
 }
@@ -363,18 +394,8 @@ Pixel ProtoShadeRuntime::testPattern(const Frame& frame, uint16_t x, uint16_t y)
   return Pixel{0, v, v};
 }
 
-Pixel ProtoShadeRuntime::sample(ExecContext& ctx, const Frame& frame, uint16_t x, uint16_t y) const {
-  if (x >= w_ || y >= h_) return Pixel{0, 0, 0};
-  if (status_ != Status::Ok) return testPattern(frame, x, y);
-
-  // The ISA has no jumps, so the cost of a pixel is known before the first one is drawn:
-  // one comparison here replaces accounting inside the loop.
-  ctx.steps_used = cost_;
-  if (cost_ > ctx.step_limit) {
-    ctx.budget_exceeded = true;
-    return Pixel{0, 0, 0};
-  }
-
+void ProtoShadeRuntime::exec(ExecContext& ctx, const Frame& frame, uint16_t x, uint16_t y,
+                             const uint8_t* list, uint16_t count) const {
   const float u = (float(x) + 0.5f) * inv_w_;
   const float v = (float(y) + 0.5f) * inv_h_;
   const float t = frame.seconds;
@@ -385,12 +406,11 @@ Pixel ProtoShadeRuntime::sample(ExecContext& ctx, const Frame& frame, uint16_t x
     return (o & kConstFlag) ? consts_[o & kOperandMask] : ctx.regs[o];
   };
 
-  float* dst = ctx.regs[0];
-  for (uint16_t i = 0; i < instr_count_; i++) {
-    const uint8_t* in = code_ + size_t(i) * format::kInstrSize;
+  for (uint16_t n = 0; n < count; n++) {
+    const uint8_t* in = code_ + size_t(list[n]) * format::kInstrSize;
     const uint8_t aux = in[6];
     const uint8_t aux2 = in[7];
-    dst = ctx.regs[in[1]];
+    float* dst = ctx.regs[in[1]];
     const float* a = src(in, 0);
 
     switch (Op(in[0])) {
@@ -508,19 +528,51 @@ Pixel ProtoShadeRuntime::sample(ExecContext& ctx, const Frame& frame, uint16_t x
     }
   }
 
+}
+
+// The per-pixel half. The uniform half must already have run into this same ExecContext,
+// which is what renderRows() and sample() each arrange in their own way.
+Pixel ProtoShadeRuntime::shade(ExecContext& ctx, const Frame& frame, uint16_t x, uint16_t y) const {
+  // The ISA has no jumps, so the cost of a pixel is known before the first one is drawn:
+  // one comparison replaces accounting inside the loop.
+  ctx.steps_used = cost_;
+  if (cost_ > ctx.step_limit) {
+    ctx.budget_exceeded = true;
+    return Pixel{0, 0, 0};
+  }
+  exec(ctx, frame, x, y, varying_, varying_count_);
+
+  const float* out = ctx.regs[result_reg_];
   // Round, do not truncate: the preview does Math.round on the same floats, and half a
   // level of difference on every channel is exactly the kind of drift nobody would chase.
   // Output has already clamped to 0..1, so no negative can reach this.
-  return Pixel{uint8_t(dst[0] * 255.0f + 0.5f), uint8_t(dst[1] * 255.0f + 0.5f),
-               uint8_t(dst[2] * 255.0f + 0.5f)};
+  return Pixel{uint8_t(out[0] * 255.0f + 0.5f), uint8_t(out[1] * 255.0f + 0.5f),
+               uint8_t(out[2] * 255.0f + 0.5f)};
+}
+
+Pixel ProtoShadeRuntime::sample(ExecContext& ctx, const Frame& frame, uint16_t x, uint16_t y) const {
+  if (x >= w_ || y >= h_) return Pixel{0, 0, 0};
+  if (status_ != Status::Ok) return testPattern(frame, x, y);
+
+  // One pixel on its own pays for the uniform half too. renderRows() is the path that
+  // amortises it, and it is the one every renderer actually uses.
+  exec(ctx, frame, x, y, uniform_, uniform_count_);
+  return shade(ctx, frame, x, y);
 }
 
 void ProtoShadeRuntime::renderRows(ExecContext& ctx, const Frame& frame, uint16_t y0, uint16_t y1,
                                    Pixel* dst) const {
   if (!dst || y0 >= y1 || y1 > h_) return;
+
+  // Time, sensors and everything computed from them: once per core per frame, not once per
+  // pixel. Each core has its own ExecContext, so each runs its own copy into its own
+  // registers and the two never touch.
+  const bool ready = status_ == Status::Ok;
+  if (ready) exec(ctx, frame, 0, 0, uniform_, uniform_count_);
+
   for (uint16_t y = y0; y < y1; y++) {
     for (uint16_t x = 0; x < w_; x++) {
-      *dst++ = sample(ctx, frame, x, y);
+      *dst++ = ready ? shade(ctx, frame, x, y) : testPattern(frame, x, y);
     }
   }
 }

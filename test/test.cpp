@@ -487,8 +487,77 @@ void testTexture() {
   assert(near(renderOne(r.blob()).r, 128));
 }
 
+// Frame-uniform instructions - time, sensors, constants, anything derived from them - are
+// hoisted out of the per-pixel loop. A shader driving a sine from time alone was paying for
+// that sine on every pixel.
+void testUniformHoisting() {
+  // Nothing here depends on the pixel: the whole program is uniform and a pixel costs zero.
+  {
+    ProtoShadeRuntime rt(4, 4);
+    auto blob = flatColour(1, 0.5f, 0).blob();
+    assert(rt.load(blob.data(), blob.size()));
+    assert(rt.instructionCount() == 1);
+    assert(rt.uniformInstructions() == 1 && rt.pixelInstructions() == 0);
+    // Still renders the right colour: the value the uniform pass left in the register is
+    // what every pixel reads.
+    ExecContext ctx;
+    const Frame f = rt.beginFrame(0);
+    std::vector<Pixel> frame(16);
+    rt.renderFrame(ctx, f, frame.data());
+    for (const Pixel& p : frame) assert(p.r == 255 && near(p.g, 128) && p.b == 0);
+  }
+
+  // Time in, coordinates in: the time half hoists, the coordinate half does not.
+  {
+    Builder p;
+    const uint8_t t = p.emit(Op::Time, p.scalar(1));
+    const uint8_t wave = p.emit(Op::Math, t, p.scalar(0), 0, 0, 11);   // sine(time)
+    const uint8_t uv = p.emit(Op::UV);
+    const uint8_t mixed = p.emit(Op::Math, uv, wave, 0, 0, 0);         // uv + sine(time)
+    p.emit(Op::Output, mixed, p.scalar(1));
+
+    ProtoShadeRuntime rt(4, 4);
+    auto blob = p.blob();
+    assert(rt.load(blob.data(), blob.size()));
+    assert(rt.instructionCount() == 5);
+    // Time and the sine run once per frame; UV, the add and the output run per pixel.
+    assert(rt.uniformInstructions() == 2);
+    assert(rt.pixelInstructions() == 3);
+
+    // And the answer is unchanged: renderRows (which hoists) must agree with sample()
+    // (which does not), pixel for pixel.
+    ExecContext row_ctx, one_ctx;
+    const Frame f = rt.beginFrame(1500);
+    std::vector<Pixel> rows(16);
+    rt.renderFrame(row_ctx, f, rows.data());
+    for (uint16_t y = 0; y < 4; y++) {
+      for (uint16_t x = 0; x < 4; x++) {
+        const Pixel direct = rt.sample(one_ctx, f, x, y);
+        const Pixel& hoisted = rows[y * 4 + x];
+        assert(direct.r == hoisted.r && direct.g == hoisted.g && direct.b == hoisted.b);
+      }
+    }
+  }
+
+  // Writing a register twice would make hoisting unsound, so it is refused at load.
+  {
+    Builder p;
+    p.emit(Op::UV);          // writes r0
+    p.emit(Op::UV);          // writes r1...
+    p.code[9] = 0;           // ...patched to write r0 as well
+    p.emit(Op::Output, 0, p.scalar(1));
+    ProtoShadeRuntime rt;
+    auto blob = p.blob();
+    assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
+  }
+}
+
 void testStepBudget() {
-  auto blob = flatColour(1, 1, 1).blob();
+  // A program that actually costs something per pixel: a constant colour is entirely
+  // uniform now, so its pixels are free and no budget can be blown by them.
+  Builder heavy;
+  heavy.emit(Op::Output, heavy.emit(Op::UV), heavy.scalar(1));
+  auto blob = heavy.blob();
   ProtoShadeRuntime rt(4, 4);
   assert(rt.load(blob.data(), blob.size()));
 
@@ -498,8 +567,10 @@ void testStepBudget() {
   assert(ctx.budget_exceeded && p.r == 0 && p.g == 0 && p.b == 0);
 
   ExecContext ok;
-  assert(rt.sample(ok, rt.beginFrame(0), 0, 0).r == 255 && !ok.budget_exceeded);
-  assert(ok.steps_used == rt.instructionCount());
+  assert(!ok.budget_exceeded);
+  rt.sample(ok, rt.beginFrame(0), 0, 0);
+  // steps_used is what a PIXEL costs, which is the varying half of the program.
+  assert(ok.steps_used == rt.pixelInstructions() && !ok.budget_exceeded);
 }
 
 // The whole point of the two-core split: halves rendered separately must equal one pass.
@@ -697,6 +768,7 @@ int main() {
   testCombineMixOverHsv();
   testTimeAndSensors();
   testTexture();
+  testUniformHoisting();
   testStepBudget();
   testRowSplitMatchesWholeFrame();
   testPanelMapping();

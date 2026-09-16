@@ -149,8 +149,11 @@ void reportConfig() {
   Serial.printf("canvas %ux%u = %lu pixels\n", CANVAS_W, CANVAS_H, (unsigned long)pixels);
   Serial.printf("runtime %ux%u, program: ", runtime.width(), runtime.height());
   if (runtime.hasProgram()) {
-    Serial.printf("%u instructions, %u images, %u sensor slots\n", runtime.instructionCount(),
-                  runtime.assetCount(), runtime.sensorCount());
+    // The per-pixel count is the one that decides the frame rate. Anything driven only by
+    // time or a sensor is the same for every pixel and runs once a frame instead.
+    Serial.printf("%u instructions (%u once a frame, %u per pixel), %u images, %u sensor slots\n",
+                  runtime.instructionCount(), runtime.uniformInstructions(),
+                  runtime.pixelInstructions(), runtime.assetCount(), runtime.sensorCount());
   } else {
     Serial.printf("none (status %d) - showing the built-in test pattern\n", int(runtime.status()));
   }

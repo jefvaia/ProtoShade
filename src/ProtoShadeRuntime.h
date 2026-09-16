@@ -188,6 +188,10 @@ public:
   bool asset(uint16_t index, Asset& out) const;
 
   uint16_t instructionCount() const { return instr_count_; }
+  // How that splits: uniform instructions run once per core per frame, the rest run per
+  // pixel. A shader whose animation comes only from time is mostly the first kind.
+  uint16_t uniformInstructions() const { return uniform_count_; }
+  uint16_t pixelInstructions() const { return varying_count_; }
   // Sensor slots the program reads. A head with fewer wired up still runs it: missing slots
   // read the value the author left in the Sensor node.
   uint8_t sensorCount() const { return sensor_count_; }
@@ -213,6 +217,12 @@ public:
 private:
   Pixel testPattern(const Frame& frame, uint16_t x, uint16_t y) const;
   bool validateCode();
+  // Runs the instructions named by `list`. One interpreter, two passes: the frame-uniform
+  // one and the per-pixel one.
+  void exec(ExecContext& ctx, const Frame& frame, uint16_t x, uint16_t y, const uint8_t* list,
+            uint16_t count) const;
+  // Per-pixel pass only. Valid once the uniform pass has run into the same ExecContext.
+  Pixel shade(ExecContext& ctx, const Frame& frame, uint16_t x, uint16_t y) const;
   // Reads one asset texel into rgba (0..1). Bounds are already validated at load().
   void texel(uint16_t asset, int32_t x, int32_t y, Wrap wrap, float* rgba) const;
 
@@ -245,7 +255,23 @@ private:
   AssetRef assets_[format::kMaxAssets] = {};
   uint16_t const_count_ = 0;
 
-  // Work one pixel costs. The ISA has no jumps, so this is known before rendering starts.
+  // Instruction indices split by what they depend on.
+  //
+  // Anything not derived from the pixel position - time, sensors, constants, and everything
+  // computed from those - has the same value for every pixel in a frame, so it runs once per
+  // core per frame instead of once per pixel. A shader that drives a sine from time alone
+  // was paying for that sine on every one of 4096 pixels; now it pays twice a frame.
+  //
+  // Safe only because every register is written exactly once (validateCode proves it), so
+  // pulling those instructions out cannot change what anything downstream reads.
+  uint8_t uniform_[format::kMaxInstructions] = {};
+  uint8_t varying_[format::kMaxInstructions] = {};
+  uint16_t uniform_count_ = 0;
+  uint16_t varying_count_ = 0;
+  uint8_t result_reg_ = 0;  // where the Output instruction leaves the pixel
+
+  // Work one PIXEL costs, which is the varying half. The ISA has no jumps, so this is known
+  // before rendering starts.
   uint32_t cost_ = 0;
 
   uint16_t w_ = 8, h_ = 8;
