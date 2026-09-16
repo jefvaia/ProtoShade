@@ -189,6 +189,26 @@ check(
   ),
 );
 
+// --- every blend mode, on two half-transparent colours -----------------------
+for (const mode of ["normal", "multiply", "screen", "add", "lighten", "darken", "difference"]) {
+  check(
+    `blend:${mode}`,
+    graph(
+      [
+        [1, "input/coordinates", {}],
+        [2, "vector/separate", {}, 10],
+        // Two colours whose coverage varies across the panel, so the overlap is partial
+        // everywhere and the (1 - ab) term actually matters.
+        [3, "vector/combine", { r: 0, g: 0, b: 0, a: 1 }, null, 20, null, 21],
+        [4, "const/color", { r: 0.2, g: 0.75, b: 1, a: 0.6 }],
+        [5, "color/over", { mode, fac: 0.8 }, null, 30, 40],
+        out(6, 50),
+      ],
+      { 10: [1, 0], 20: [2, 0], 21: [2, 1], 30: [3, 0], 40: [4, 0], 50: [5, 0] },
+    ),
+  );
+}
+
 // --- images: both packed formats, both filters, both wrap modes ---------------
 for (const opaque of [true, false]) {
   for (const filter of ["nearest", "linear"]) {
@@ -272,33 +292,60 @@ check(
 // Every particle's position is +, - and * on floats. The preview does that arithmetic in
 // Math.fround steps precisely so these cases can demand the same texel as the device, and
 // not "near enough" - under nearest filtering a last-bit difference is a wrong sprite pixel.
+const emitter = (over) => ({
+  count: 12,
+  life: 1.7,
+  fade: 0.8,
+  seed: 7,
+  direction: 25,
+  spread: 140,
+  speed: 0.8,
+  speedSpread: 0.3,
+  accel: -0.2,
+  gravityX: 0.15,
+  gravityY: 0.45,
+  size: 0.4,
+  sizeSpread: 0.12,
+  sizeRate: -0.05,
+  sizeAccel: 0.02,
+  rotation: 30,
+  rotSpread: 200,
+  rotRate: 90,
+  rotAccel: -15,
+  filter: "nearest",
+  ...over,
+});
+
 for (const filter of ["nearest", "linear"]) {
   check(
     `particles:${filter}`,
     graph(
       [
-        [
-          1,
-          "texture/particles",
-          { count: 12, size: 0.45, rise: 0.8, spread: 0.6, gravity: 0.5, life: 1.7, fade: 0.8, seed: 7, speed: 1, filter },
-          null,
-          10,
-        ],
+        [1, "texture/particles", emitter({ filter }), null, 10],
         [2, "input/time", { speed: 1 }],
         out(3, 20),
       ],
       { 10: [2, 0], 20: [1, 0] },
     ),
-    new Map([[1, testImage(6, 6, false)]]),
+    // Not square: a sprite that is 6x4 rotated by a wrong angle cannot pass for itself.
+    new Map([[1, testImage(6, 4, false)]]),
   );
 }
+// Every knob at once, on a swarm that has had time to accelerate, shrink and spin - the case
+// that fails if any one of the nineteen parameters is read out of order on either side.
+check(
+  "particles:all-knobs",
+  graph([[1, "texture/particles", emitter({ count: 20, filter: "linear" }), null, null], out(2, 10)], { 10: [1, 0] }),
+  new Map([[1, testImage(5, 7, false)]]),
+  4321,
+);
 // Sprites cut from a strip: a particle picks a frame from its own hash, so one upload gives
 // a swarm of different shapes.
 check(
   "particles:from-strip",
   graph(
     [
-      [1, "texture/particles", { count: 20, size: 0.3, rise: 0.4, spread: 1, gravity: -0.3, life: 3, fade: 0, seed: 2, speed: 0.5 }, null, null],
+      [1, "texture/particles", emitter({ count: 20, spread: 360, life: 3, fade: 0, seed: 2, rotRate: 0 }), null, null],
       out(2, 10),
     ],
     { 10: [1, 0] },
@@ -306,7 +353,28 @@ check(
   new Map([[1, testImage(4, 12, false, 3)]]),
   900,
 );
-check("particles:empty", graph([[1, "texture/particles", { count: 0 }, null, null], out(2, 10)], { 10: [1, 0] }));
+// Two emitters in one program share the device's particle table, and a sensor may drive the
+// clock - it is uniform across the frame, which is all the device asks of it.
+check(
+  "particles:two-emitters",
+  graph(
+    [
+      [1, "texture/particles", emitter({ count: 30, seed: 3 }), null, 10],
+      [2, "input/sensor", { range: "0..1", index: 0, test: 0.4 }],
+      [3, "texture/particles", emitter({ count: 40, seed: 9, direction: 180 }), null, 11],
+      [4, "color/over", { mode: "add", fac: 1 }, null, 20, 30],
+      out(5, 40),
+    ],
+    { 10: [2, 0], 11: [2, 0], 20: [1, 0], 30: [3, 0], 40: [4, 0] },
+  ),
+  new Map([
+    [1, testImage(5, 5, false)],
+    [3, testImage(3, 6, true)],
+  ]),
+  0,
+  [2.5],
+);
+check("particles:empty", graph([[1, "texture/particles", emitter({ count: 0 }), null, null], out(2, 10)], { 10: [1, 0] }));
 
 // --- bake: the branch is rendered here, the strip is what the head runs -------
 //

@@ -55,10 +55,26 @@ step budget is one comparison instead of accounting inside a loop, and a `.bin` 
 page cannot spin a head into a watchdog reset.
 
 `PARTICLES` is the one loop in the whole VM, and it keeps that property rather than breaking
-it: its trip count is required to be a **constant operand** and is clamped to
-`kMaxParticles`, so the work it adds is still a number `load()` can add up. A particle has no
-state - its position is a closed form of its index and the time - which is also why two cores
-rendering the same frame can never disagree about where one is.
+it: its trip count is required to be a **constant operand** and the whole program shares a
+budget of `kMaxParticles`, so the work it adds is still a number `load()` can add up. A
+particle has no state - its life is a closed form of its index and the clock - which is also
+why two cores rendering the same frame can never disagree about where one is.
+
+It is also the one instruction with a **per-frame pass**. Nineteen parameters do not fit in
+eight bytes, so the instruction points at a block of consecutive constants; and where each
+particle *is*, how big, how turned and how faded depends only on its index and the clock, so
+`prepareParticles()` works all of that out once per core per frame, next to the uniform
+instructions. Four sines per particle per frame instead of four per particle per *pixel*: on
+a 64x32 panel that is 96 of them a frame rather than 98304, on a chip whose `sinf` is
+software. What is left in the pixel loop is a subtract, a rotate, a scale and a fetch. The
+clock operand is therefore required to be frame-uniform, and `load()` refuses a program that
+feeds it a pixel coordinate - the compiler refuses it first, with a sentence rather than a
+status code.
+
+The runtime has its own `sinCos()` rather than calling `sinf`, for the same reason: the
+browser's `Math.sin` is a double's answer and newlib's is not, and one ulp of difference in a
+rotation puts a sprite's edge on the other side of a texel. The same polynomial in the same
+order in both languages is agreement by construction, which `test/crosscheck.mjs` holds to.
 
 It also makes one optimisation free. `load()` splits the program in two: an instruction is
 **uniform** when nothing it reads varies across the frame - time, sensors, constants, and
@@ -169,13 +185,28 @@ the panel resolution in the header - free text, clamped to 1..512 per side, the 
 `kMaxDimension`. Right-click the canvas to add a node.
 
 Every value is **RGBA**: a plain number broadcasts to `[n, n, n, 1]` (opaque), and a node
-that wants a single number reads R. Alpha survives from an uploaded PNG through `Alpha Over`
-to `LED Output`, which flattens it against black - the panel has nothing behind it.
+that wants a single number reads R. Alpha survives from an uploaded PNG through `Blend` to
+`LED Output`, which flattens it against black - the panel has nothing behind it.
+
+**Two things that overlap go through `Blend`.** Foreground over background, straight alpha,
+composing properly - that is what it is for, and doing it by hand with `Math` gets the alpha
+wrong, because `Math` takes its alpha from A alone. Its **mode** decides what happens *inside
+the overlap*: `normal`, `multiply`, `screen`, `add`, `lighten`, `darken`, `difference`. Only
+the overlap changes - the part of the foreground hanging off the background keeps its own
+colour, so `add` brightens where two sprites cross instead of turning one into a silhouette.
+`Mix` is the other one, and a different question: it is a straight lerp between two values on
+a factor, with no notion of coverage at all.
 
 Nodes: `Coordinates` (UV / centered / pixel), `Time`, `Sensor`, `Value`, `Color`, `Math` (21
-component-wise ops), `Mix`, `Alpha Over`, `Separate`/`Combine RGBA`, `HSV`, `Image`,
-`Animation`, `Particles`, `Bake` and `LED Output`. An unconnected input falls back to the
-node's own widget.
+component-wise ops), `Mix`, `Blend`, `Separate`/`Combine RGBA`, `HSV`, `Image`, `Animation`,
+`Particles`, `Bake` and `LED Output`. An unconnected input falls back to the node's own
+widget.
+
+The **examples** dropdown in the header loads a working graph for each of these: a hue
+scroll, blinking eyes, a mouth driven by a sensor as a blend shape, embers, two sprites
+blended, and a plasma behind a `Bake` node. Their art is drawn procedurally when the example
+loads, so none of it is a file in this repository, and `test/examples.test.mjs` compiles
+every one of them and holds it to what a head can actually run.
 
 #### Animation, and blend shapes
 
@@ -203,11 +234,30 @@ twice as much per pixel.
 
 `Particles` scatters an image across the panel: one instruction, no state, nothing stored
 between frames. Every particle's whole life is a function of its index and the clock, so
-sixty-four of them cost sixty-four texel fetches and not one byte of RAM. The knobs are
-count, size, rise, spread, gravity, life, fade and seed; the position input decides the space
-they live in (aspect-corrected by default, so a round sprite stays round). Hand it a strip
-and each particle picks its own frame from it, which is a swarm of different shapes from one
-upload.
+sixty-four of them cost sixty-four texel fetches and not one byte of flash.
+
+| | |
+| --- | --- |
+| **emission** | `count`, `life` (seconds), `fade` (how much of its alpha it loses over that life), `seed` |
+| **launch** | `direction` and `spread` in degrees, `speed`, `speedSpread` |
+| **forces** | `accel` along each particle's own direction, `gravityX` / `gravityY` for the push they all share |
+| **size** | `size`, `sizeSpread`, `sizeRate` per second, `sizeAccel` |
+| **rotation** | `rotation`, `rotSpread`, `rotRate` deg/s, `rotAccel`, all in degrees |
+
+`direction` is a compass bearing: **0 is up the panel, 90 is to the right**. `spread` is the
+full cone, so 0 is a straight line and **360 is all around**. Everything with a `Spread` is
+symmetric about its own value, and every rate is per second with its acceleration on top -
+position, size and rotation all move the same schoolbook way.
+
+The emitter sits wherever the **position input reads zero**, so offsetting that input is how
+you move it: the embers example subtracts 0.9 from the vertical to emit along the bottom
+edge. That input also decides the space the particles live in - aspect-corrected by default,
+so a round sprite stays round on a 64x32 panel.
+
+Hand it a strip and each particle picks its own frame from it, which is a swarm of different
+shapes from one upload. The 64-particle budget belongs to the **program**, not the node: two
+emitters share it, and the compiler clamps the second one rather than letting the head refuse
+a `.bin` the preview was happy with.
 
 #### Bake: trading flash for instructions
 
@@ -528,7 +578,7 @@ One file per head, and `protoshade.ino` never changes. It holds six things:
 ## Tests
 
 ```
-npm test                                     # both JS checks
+npm test                                     # the JS checks
 g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
 ```
 
@@ -537,10 +587,13 @@ g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
   cycles cut, pooled constants, alpha, sensors, the container header, that a strip's phase
   only ever lands on a frame that exists, and that a baked branch still renders what it
   replaced while the rest of the graph stays live.
-- `test/crosscheck.mjs` - **the important one.** Compiles 75 programs, renders every pixel
+- `test/examples.test.mjs` - every example in the header dropdown: that its node types and
+  wires are real, that it compiles, and that it fits both the register file and the head's
+  2 MB partition. The examples are data, so this is the compiler pointed straight at them.
+- `test/crosscheck.mjs` - **the important one.** Compiles 84 programs, renders every pixel
   with the TypeScript interpreter, packs the same Program to a `.bin`, renders that with the
-  C++ VM, and compares. Currently 99.5% of channels are bit-identical and nothing differs by
-  more than 1/255, which is float-vs-double rounding of the last bit. A drifting opcode shows
+  C++ VM, and compares. Nothing differs by more than 1/255, which is float-vs-double rounding
+  of the last bit, and 99.5% of channels are bit-identical. A drifting opcode shows
   up here as a wrong pixel. It is also why the interpreter rounds through `Math.fround` where
   the device would round in single precision: a last-bit difference in a particle's position
   or a texture coordinate is not a rounding difference, it is a different texel. Needs a host C++ compiler; skips without one.

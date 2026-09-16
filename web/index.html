@@ -31,6 +31,10 @@
       <option value="128x64">128 × 64</option>
     </select>
 
+    <select id="example" class="bg-neutral-800 rounded px-2 py-1">
+      <option value="">examples...</option>
+    </select>
+
     <span class="flex-1"></span>
     <button id="mirror" class="bg-neutral-800 hover:bg-neutral-700 rounded px-3 py-1">mirror head</button>
     <button id="flash" class="bg-sky-700 hover:bg-sky-600 rounded px-3 py-1">flash over USB</button>
@@ -51,6 +55,7 @@
       <h2 class="text-neutral-400 uppercase tracking-widest text-xs">preview</h2>
       <canvas id="led" class="self-center max-w-full h-auto bg-black rounded ring-1 ring-neutral-700 [image-rendering:pixelated]"></canvas>
       <p id="preview-info" class="text-neutral-500 text-xs tabular-nums"></p>
+      <p id="example-info" class="text-neutral-400 text-xs leading-relaxed"></p>
 
       <h2 class="text-neutral-400 uppercase tracking-widest text-xs">visor</h2>
       <canvas id="visor" class="w-full h-56 bg-black rounded ring-1 ring-neutral-700"></canvas>
@@ -70,12 +75,20 @@
         The preview runs the compiled program, not the nodes: download .bin ships exactly
         this, images included, and the head's upload page takes it from there.
         <br><br>
+        Two things that overlap go through <b>Blend</b>: foreground over background, alpha
+        and all. Its mode changes only what happens <i>inside</i> the overlap - add for glow,
+        multiply for shadow. Mix is the other thing: a straight lerp, no coverage.
+        <br><br>
         <b>Animation</b> takes a GIF, several PNGs at once, or one sprite sheet, and Phase
         picks the frame: wire Time for an animation, a Sensor for a blend shape. A phase
         between two frames picks one of them - turn crossfade on if you want a dissolve.
-        <b>Particles</b> scatters an image with no state and no flash cost. <b>Bake</b>
-        renders whatever is wired into it here in the browser and ships the frames as an
-        image, so the head stops computing that branch - the rest of the graph keeps running.
+        <b>Particles</b> scatters an image with no state and no flash cost; direction is a
+        compass bearing, 0 is up and spread 360 is all around, and the emitter sits wherever
+        its position input reads zero. <b>Bake</b> renders whatever is wired into it here in
+        the browser and ships the frames as an image, so the head stops computing that branch
+        - the driver and the rest of the graph keep running live.
+        <br><br>
+        Start from the <b>examples</b> dropdown in the header.
       </p>
     </aside>
   </main>

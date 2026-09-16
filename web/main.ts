@@ -8,6 +8,7 @@
 import { compile, Runner, type Program } from "./graph.js";
 import { instructionCount, pack, packedSize } from "./pack.js";
 import { RANGES, decodeInto, imageLabel, images, register, type Env, type Vec } from "./nodes.js";
+import { EXAMPLES, apply } from "./examples.js";
 import { DeviceLink, supported as serialSupported, type SerialFrame } from "./serial.js";
 import { Visor } from "./visor.js";
 
@@ -22,6 +23,8 @@ const led = el<HTMLCanvasElement>("led");
 const resW = el<HTMLInputElement>("res-w");
 const resH = el<HTMLInputElement>("res-h");
 const preset = el<HTMLSelectElement>("res-preset");
+const examplePicker = el<HTMLSelectElement>("example");
+const exampleInfo = el<HTMLElement>("example-info");
 const status = el<HTMLElement>("status");
 const previewInfo = el<HTMLElement>("preview-info");
 const hint = el<HTMLElement>("hint");
@@ -64,6 +67,30 @@ addEventListener("pointermove", (event) => {
   LiteGraph.closeAllContextMenus();
 });
 
+// Double-clicking a number widget opens litegraph's value prompt: a DOM element over the
+// canvas, not something the canvas draws. It closes on Enter, on Escape, or on the pointer
+// leaving it again - but NOT once you have typed in it, and its input re-focuses itself on
+// blur. Type a digit, click away, and it is stuck on screen for good, which is worse on the
+// Image, Animation and Particles nodes because those are the ones with widgets worth typing
+// into. Dismiss it the way every other dialog on the web does: a click outside closes it.
+const openDialogs = document.getElementsByClassName("graphdialog");
+addEventListener(
+  "pointerdown",
+  (event) => {
+    if (openDialogs.length === 0) return;
+    const target = event.target;
+    if (target instanceof Element && target.closest(".graphdialog")) return;
+    // close(), not remove(): litegraph keeps a reference to the open prompt and restores
+    // body scrolling for the search box, and only its own close() undoes either.
+    for (const dialog of [...openDialogs]) {
+      const box = dialog as HTMLElement & { close?: () => void };
+      if (typeof box.close === "function") box.close();
+      else box.remove();
+    }
+  },
+  true, // capture: get there before litegraph opens the next one on the same click
+);
+
 function fitEditor(): void {
   const box = graphCanvas.parentElement;
   if (!box) return;
@@ -73,34 +100,29 @@ function fitEditor(): void {
 }
 addEventListener("resize", fitEditor);
 
-/** The graph the page opens with: a hue ramp scrolling across the panel. */
-function defaultGraph(): void {
-  graph.clear();
-  const add = (type: string, x: number, y: number): LGraphNode => {
-    const node = LiteGraph.createNode(type);
-    if (!node) throw new Error(`node type ${type} is not registered`);
-    node.pos = [x, y];
-    graph.add(node);
-    return node;
-  };
-  const coords = add("input/coordinates", 20, 110);
-  const split = add("vector/separate", 200, 110);
-  const time = add("input/time", 20, 290);
-  const math = add("math/math", 400, 150);
-  const hsv = add("color/hsv", 600, 130);
-  const out = add("output/led", 810, 130);
+// ---------------------------------------------------------------------------
+// Examples. The page opens on the first one; the dropdown loads any of them, art and all.
+// ---------------------------------------------------------------------------
 
-  // setProperty, not properties[x]: it also updates the widget bound to that property,
-  // and a widget showing something the shader is not doing is worse than no widget.
-  time.setProperty("speed", 0.2);
-  math.setProperty("op", "add");
-
-  coords.connect(0, split, 0);
-  split.connect(0, math, 0);
-  time.connect(0, math, 1);
-  math.connect(0, hsv, 0);
-  hsv.connect(0, out, 0);
+for (const [i, ex] of EXAMPLES.entries()) {
+  const option = document.createElement("option");
+  option.value = String(i);
+  option.textContent = ex.name;
+  examplePicker.append(option);
 }
+
+async function loadExample(index: number): Promise<void> {
+  const ex = EXAMPLES[index];
+  if (!ex) return;
+  await apply(graph, ex);
+  exampleInfo.textContent = ex.desc;
+  save();
+}
+
+examplePicker.onchange = () => {
+  void loadExample(Number(examplePicker.value));
+  examplePicker.value = "";
+};
 
 // ---------------------------------------------------------------------------
 // Persistence. Uploaded images ride along as data URLs inside node.properties, so a
@@ -154,10 +176,10 @@ function load(): void {
       void restoreImages();
       return;
     } catch {
-      /* corrupt or from an older layout - fall through to the default graph */
+      /* corrupt or from an older layout - fall through to the first example */
     }
   }
-  defaultGraph();
+  void loadExample(0);
 }
 
 load();
@@ -166,9 +188,7 @@ setInterval(save, 1000);
 addEventListener("beforeunload", save);
 
 el<HTMLButtonElement>("reset").onclick = () => {
-  images.clear();
-  defaultGraph();
-  save();
+  void loadExample(0);
 };
 
 // ---------------------------------------------------------------------------

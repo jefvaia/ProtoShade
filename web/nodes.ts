@@ -78,6 +78,13 @@ export const MATH_OPS = [
 ] as const;
 
 /**
+ * How two colours are combined where they BOTH cover. Order is part of the format.
+ * `normal` is plain source-over - the foreground simply wins - and the rest only differ
+ * inside the overlap, which is the only place there are two colours to combine.
+ */
+export const BLEND_MODES = ["normal", "multiply", "screen", "add", "lighten", "darken", "difference"] as const;
+
+/**
  * What happens outside the image. Order is part of the format.
  *  repeat  tiles
  *  clamp   the edge texel stretches outwards - the smear you get placing a sprite
@@ -91,8 +98,13 @@ export const RANGES = ["0..1", "-1..1", "0..inf", "-inf..inf", "0..360"] as cons
 /** Asset pixel formats, matching protoshade::AssetFormat. */
 export const ASSET = { RGB565: 0, RGBA8888: 1, A8: 2 } as const;
 
-/** Sprites one PARTICLES instruction may draw. Mirrors format::kMaxParticles. */
+/** Sprites one PROGRAM may draw, over all its emitters. Mirrors format::kMaxParticles: it is
+    the size of the per-frame particle table the device keeps per rendering thread. */
 export const MAX_PARTICLES = 64;
+
+/** Constants one PARTICLES instruction reads, starting at its parameter operand. Mirrors
+    format::kParticleQuads. */
+export const PARTICLE_QUADS = 5;
 
 export interface PackedAsset {
   w: number;
@@ -143,8 +155,9 @@ export interface PropDef {
 export type Fallback =
   | { prop: string } // the node's own widget
   | { value: number } // a literal
-  | { emit: OpCode; arg?: string }; // synthesise an instruction - a UV for an unwired image,
-// a Time for an unwired animation phase. `arg` names the widget that becomes its operand.
+  | { emit: OpCode; arg?: string | number }; // synthesise an instruction - a UV for an
+// unwired image, a Time for an unwired animation phase. `arg` is that instruction's own
+// operand: the name of a widget to read it from, or the number itself.
 
 export interface OutSpec {
   op: OpCode;
@@ -162,9 +175,11 @@ export interface NodeDef {
   fallback?: Fallback[];
   /** Extra operands taken straight from widgets, appended after `in`. */
   args?: string[];
-  /** Extra operands as packed quads, appended after `args`. Four knobs for one operand byte
-      is how a particle system fits its parameters into an eight-byte instruction. */
-  argsVec?: (p: Props) => Vec[];
+  /** A block of consecutive constants, appended after `args` as ONE operand pointing at the
+      first of them. Nineteen knobs do not fit in an eight-byte instruction; this is how a
+      particle system carries its parameters. The block is emitted verbatim and in order -
+      never deduplicated - because the VM reads it by walking forward from that operand. */
+  argsBlock?: (p: Props) => Vec[];
   out: string[];
   /** One entry per output. Absent on a node that is purely a constant. */
   outs?: OutSpec[];
@@ -275,14 +290,20 @@ export const NODES: Record<string, NodeDef> = {
   },
 
   "color/over": {
-    title: "Alpha Over",
+    title: "Blend",
     color: "#aa3",
-    desc: "Foreground composited over Background, source-over. Fac fades the foreground",
+    desc:
+      "THE node for two things that overlap: Foreground over Background, alpha and all. " +
+      "Mode says what happens inside the overlap - add for glow, multiply for shadow. " +
+      "Fac fades the foreground",
     in: ["Fac", "Foreground", "Background"],
     fallback: [{ prop: "fac" }, { value: 0 }, { value: 0 }],
     out: ["Color"],
-    outs: [{ op: OP.OVER }],
-    props: { fac: { type: "number", value: 1, options: { min: 0, max: 1, step: 1 } } },
+    outs: [{ op: OP.OVER, aux: (p) => pick(BLEND_MODES, p.mode) }],
+    props: {
+      mode: { type: "combo", value: "normal", options: { values: BLEND_MODES } },
+      fac: { type: "number", value: 1, options: { min: 0, max: 1, step: 1 } },
+    },
   },
 
   "vector/separate": {
@@ -389,33 +410,62 @@ export const NODES: Record<string, NodeDef> = {
     in: ["Vector", "Time"],
     // Centered, not UV: particles live in aspect-corrected space, so a round sprite on a
     // 64x32 panel stays round. Offset the input to move the emitter off the middle.
-    fallback: [{ emit: OP.CENTERED }, { emit: OP.TIME, arg: "speed" }],
+    fallback: [{ emit: OP.CENTERED }, { emit: OP.TIME, arg: 1 }],
     out: ["Color", "Alpha"],
     asset: true,
     outs: [
       { op: OP.PARTICLES, aux2: (p) => (p.filter === "linear" ? 4 : 0) },
       { op: OP.PARTICLES, aux2: (p) => (p.filter === "linear" ? 4 : 0) | 8 },
     ],
-    // Two quads, in the order the VM reads them. Eight knobs, two operand bytes.
-    argsVec: (p) => [
-      [Math.min(MAX_PARTICLES, Math.max(0, Math.round(num(p.count)))), num(p.size), num(p.rise), num(p.spread)],
-      [num(p.gravity), Math.round(num(p.seed)), num(p.life), num(p.fade)],
+    // Nineteen knobs do not fit in an eight-byte instruction, so they go in the constant
+    // pool as one block and the instruction points at it. Order IS the format - mirrored by
+    // prepareParticles() in the C++ VM.
+    argsBlock: (p) => [
+      [Math.max(0, Math.round(num(p.count))), num(p.life), num(p.fade), Math.round(num(p.seed))],
+      [num(p.direction), num(p.spread), num(p.speed), num(p.speedSpread)],
+      [num(p.accel), num(p.gravityX), num(p.gravityY), 0],
+      [num(p.size), num(p.sizeSpread), num(p.sizeRate), num(p.sizeAccel)],
+      [num(p.rotation), num(p.rotSpread), num(p.rotRate), num(p.rotAccel)],
     ],
     props: {
       file: { type: "image", value: "" },
       // A strip works here too: each particle picks one frame and keeps it, so one upload
       // of several drawings is a swarm of different shapes rather than one repeated.
       frames: { type: "number", value: 1, options: { min: 1, max: 1024, step: 10 } },
+
+      // --- emission ---
       count: { type: "number", value: 16, options: { min: 0, max: MAX_PARTICLES, step: 10 } },
-      size: { type: "number", value: 0.25, options: { min: 0.01, max: 4, step: 1 } },
-      rise: { type: "number", value: 0.6, options: { step: 1 } },
-      spread: { type: "number", value: 0.5, options: { step: 1 } },
-      gravity: { type: "number", value: 0.4, options: { step: 1 } },
       life: { type: "number", value: 2, options: { min: 0.01, max: 60, step: 1 } },
       fade: { type: "number", value: 1, options: { min: 0, max: 1, step: 1 } },
       seed: { type: "number", value: 1, options: { min: 0, max: 65535, step: 10 } },
-      // Only used when nothing is wired into Time: 1 is real time.
-      speed: { type: "number", value: 1, options: { step: 10 } },
+
+      // --- how they leave ---
+      // Degrees, read as a compass bearing: 0 is up the panel, 90 is to the right. Spread is
+      // the FULL cone, so 360 really is all around and 0 is a straight line.
+      direction: { type: "number", value: 0, options: { min: -360, max: 360, step: 10 } },
+      spread: { type: "number", value: 60, options: { min: 0, max: 360, step: 10 } },
+      speed: { type: "number", value: 0.7, options: { step: 1 } },
+      speedSpread: { type: "number", value: 0.2, options: { step: 1 } },
+
+      // --- what pushes them ---
+      // accel runs along each particle's own spawn direction; gravity is the same push for
+      // all of them, so it is a vector.
+      accel: { type: "number", value: 0, options: { step: 1 } },
+      gravityX: { type: "number", value: 0, options: { step: 1 } },
+      gravityY: { type: "number", value: 0.35, options: { step: 1 } },
+
+      // --- size over a life ---
+      size: { type: "number", value: 0.28, options: { min: 0.001, max: 8, step: 1 } },
+      sizeSpread: { type: "number", value: 0.08, options: { step: 1 } },
+      sizeRate: { type: "number", value: 0, options: { step: 1 } },
+      sizeAccel: { type: "number", value: 0, options: { step: 1 } },
+
+      // --- rotation over a life, all in degrees ---
+      rotation: { type: "number", value: 0, options: { min: -360, max: 360, step: 10 } },
+      rotSpread: { type: "number", value: 0, options: { min: 0, max: 360, step: 10 } },
+      rotRate: { type: "number", value: 0, options: { step: 10 } },
+      rotAccel: { type: "number", value: 0, options: { step: 10 } },
+
       filter: { type: "combo", value: "nearest", options: { values: ["nearest", "linear"] } },
     },
   },

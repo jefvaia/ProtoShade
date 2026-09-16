@@ -22,11 +22,11 @@ writeFileSync(
   entry,
   `export { compile, Runner, packImage } from ${JSON.stringify(join(root, "web/graph.ts"))};\n` +
     `export { pack, packedSize, instructionCount, HEADER_SIZE, FORMAT_VERSION } from ${JSON.stringify(join(root, "web/pack.ts"))};\n` +
-    `export { OP, INSTR_SIZE, MAX_REGISTERS, MAX_PARTICLES } from ${JSON.stringify(join(root, "web/nodes.ts"))};\n`,
+    `export { OP, INSTR_SIZE, MAX_REGISTERS, MAX_PARTICLES, PARTICLE_QUADS } from ${JSON.stringify(join(root, "web/nodes.ts"))};\n`,
 );
 const bundle = join(work, "bundle.mjs");
 await esbuild.build({ entryPoints: [entry], outfile: bundle, bundle: true, format: "esm", logLevel: "warning" });
-const { compile, Runner, packImage, pack, packedSize, instructionCount, HEADER_SIZE, FORMAT_VERSION, OP, INSTR_SIZE, MAX_REGISTERS, MAX_PARTICLES } =
+const { compile, Runner, packImage, pack, packedSize, instructionCount, HEADER_SIZE, FORMAT_VERSION, OP, INSTR_SIZE, MAX_REGISTERS, MAX_PARTICLES, PARTICLE_QUADS } =
   await import(pathToFileURL(bundle));
 
 const env = (over = {}) => ({ x: 0, y: 0, u: 0.25, v: 0.5, w: 64, h: 32, t: 2, frame: 0, ...over });
@@ -274,6 +274,38 @@ const near = (got, want, what) => {
   assert.equal(view.getUint16(table + 8, true), 2, "asset width");
 }
 
+// --- blending two things that overlap ----------------------------------------
+{
+  const blend = (mode, fg, bg) =>
+    shade(
+      graph(
+        [
+          [1, "const/color", fg],
+          [2, "const/color", bg],
+          [3, "color/over", { mode, fac: 1 }, null, 10, 20],
+          out(4, 30),
+        ],
+        { 10: [1, 0], 20: [2, 0], 30: [3, 0] },
+      ),
+    ).colour;
+
+  const red = { r: 1, g: 0, b: 0, a: 1 };
+  const blue = { r: 0, g: 0, b: 1, a: 1 };
+  near(blend("normal", red, blue), [1, 0, 0, 1], "normal: the foreground wins");
+  near(blend("add", red, blue), [1, 0, 1, 1], "add: magenta where two opaque sprites overlap");
+  near(blend("multiply", { r: 1, g: 1, b: 1, a: 1 }, { r: 0.5, g: 0.5, b: 0.5, a: 1 }), [0.5, 0.5, 0.5, 1], "multiply");
+  near(blend("difference", red, red), [0, 0, 0, 1], "difference of a colour with itself is black");
+
+  // The part of the foreground hanging off the background keeps its own colour: with no
+  // background under it there is no second colour to add to. Adding over nothing must not
+  // darken or brighten it.
+  near(blend("add", red, { r: 0, g: 0, b: 1, a: 0 }), [1, 0, 0, 1], "add over nothing is the foreground");
+  near(blend("multiply", red, { r: 0, g: 1, b: 0, a: 0 }), [1, 0, 0, 1], "multiply over nothing is not black");
+
+  // Half-covered background: half the foreground blends, half does not.
+  near(blend("add", red, { r: 0, g: 0, b: 1, a: 0.5 }), [1, 0, 0.5, 1], "add over half coverage");
+}
+
 // --- a strip, and the two ways to read its phase -----------------------------
 //
 // Four frames, one solid grey each: 0, 0.25, 0.5, 0.75. Whatever comes out has to be one of
@@ -321,19 +353,67 @@ const near = (got, want, what) => {
   assert.ok(Math.abs(mid - 0.375) < 0.02, "crossfade halfway is halfway between two frames");
 }
 
-// --- particles: bounded, and a count that is always a constant ---------------
+// --- particles: bounded, and parameters the device can find ------------------
 {
   const dot = new Map([[1, { w: 1, h: 1, frames: 1, data: new Uint8ClampedArray([255, 255, 255, 255]) }]]);
+  const emitter = (over) => ({ count: 8, life: 1, size: 1, seed: 3, speed: 0.5, spread: 90, ...over });
   const { program } = shade(
-    graph([[1, "texture/particles", { count: 1e6, size: 1, life: 1, seed: 3 }, null, null], out(2, 10)], { 10: [1, 0] }),
+    graph([[1, "texture/particles", emitter({ count: 1e6 }), null, null], out(2, 10)], { 10: [1, 0] }),
     dot,
   );
   const instr = [...program.code.filter((_, i) => i % INSTR_SIZE === 0)];
   assert.ok(instr.includes(OP.PARTICLES), "a Particles instruction is emitted");
   const at = instr.indexOf(OP.PARTICLES) * INSTR_SIZE;
   const params = program.code[at + 4];
-  assert.ok(params & 0x80, "the parameter quad is a constant, so the cost is known at load");
-  assert.equal(program.consts[(params & 0x7f) * 4], MAX_PARTICLES, "a silly count is clamped");
+  assert.ok(params & 0x80, "the parameters are constants, so the cost is known at load");
+  const block = (params & 0x7f) * 4;
+  assert.equal(program.consts[block], MAX_PARTICLES, "a silly count is clamped to the budget");
+  // Five quads, in the order prepareParticles() walks them. If the block were pooled like an
+  // ordinary constant, an equal quad elsewhere would break exactly this.
+  assert.equal(program.consts.length - block, PARTICLE_QUADS * 4, "the block is five quads, and last");
+  assert.equal(program.consts[block + 1], emitter({}).life, "quad 0 is count, life, fade, seed");
+  assert.equal(program.consts[block + 5], 90, "quad 1 is direction, spread, speed, speed spread");
+
+  // The particle table belongs to the program, so two emitters share it rather than each
+  // getting 64. Clamped here, because a .bin the head would refuse is not a preview.
+  const two = compile(
+    graph(
+      [
+        [1, "texture/particles", emitter({ count: 50, seed: 1 }), null, null],
+        [2, "texture/particles", emitter({ count: 50, seed: 2 }), null, null],
+        [3, "color/over", { mode: "add", fac: 1 }, null, 10, 20],
+        out(4, 30),
+      ],
+      { 10: [1, 0], 20: [2, 0], 30: [3, 0] },
+    ),
+    dot,
+    64,
+    32,
+  );
+  assert.ok(two.ok, two.ok ? "" : two.reason);
+  const counts = [];
+  for (let i = 0; i < two.program.code.length; i += INSTR_SIZE) {
+    if (two.program.code[i] === OP.PARTICLES) counts.push(two.program.consts[(two.program.code[i + 4] & 0x7f) * 4]);
+  }
+  assert.deepEqual(counts, [50, 14], "the second emitter gets what is left of the 64");
+
+  // The clock is read once per frame on the device, so a per-pixel one cannot be honoured.
+  // Better a clear refusal here than a preview that works and a .bin the head rejects.
+  const perPixel = compile(
+    graph(
+      [
+        [1, "input/coordinates", {}],
+        [2, "texture/particles", emitter({}), null, 10],
+        out(3, 20),
+      ],
+      { 10: [1, 0], 20: [2, 0] },
+    ),
+    dot,
+    64,
+    32,
+  );
+  assert.equal(perPixel.ok, false);
+  assert.match(perPixel.reason, /Time/);
 }
 
 // --- bake: the branch is rendered here, and what ships must still be it -------

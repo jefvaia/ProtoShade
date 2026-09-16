@@ -71,7 +71,7 @@ struct Frame {
 
 namespace format {
 constexpr uint8_t kMagic[4] = {'P', 'S', 'H', 'D'};
-constexpr uint16_t kVersion = 4;       // bump on every layout change; old firmware then refuses new bins
+constexpr uint16_t kVersion = 5;       // bump on every layout change; old firmware then refuses new bins
 constexpr size_t kHeaderSize = 48;
 constexpr size_t kAssetEntrySize = 16;
 constexpr size_t kInstrSize = 8;
@@ -83,10 +83,16 @@ constexpr uint16_t kMaxConstants = 128;  // operand encoding is 7 bits + the con
 // few KB on a chip with 512 KB of SRAM.
 constexpr uint16_t kMaxInstructions = 256;
 constexpr uint16_t kMaxAssets = 32;
-// Sprites one Particles instruction may draw. It is the only loop in the VM, so this is
-// what keeps "cost of a pixel" knowable: 64 sprites is 64 texel fetches, still well inside
-// ExecContext::step_limit, and the count in the program is clamped to it at load.
+// Sprites one program may draw, across ALL its Particles instructions. It is the only loop
+// in the VM, so this is what keeps "cost of a pixel" knowable: 64 sprites is 64 texel
+// fetches, still well inside ExecContext::step_limit. It is also the size of the per-frame
+// state table in ExecContext, which is why it is a budget for the program and not per
+// instruction - two emitters share the 64 rather than each getting their own.
 constexpr uint8_t kMaxParticles = 64;
+// Constants one Particles instruction reads, starting at its src2 operand. Nineteen knobs
+// do not fit in an eight-byte instruction, so the instruction points at a block in the
+// constant pool instead. Mirrored by PARTICLE_QUADS in web/nodes.ts.
+constexpr uint8_t kParticleQuads = 5;
 }  // namespace format
 
 // The instruction set. Mirrored in web/nodes.ts (OP) - the numbering IS the format, so
@@ -99,7 +105,7 @@ enum class Op : uint8_t {
   Sensor,     // aux = slot, aux2 = range << 1 | unit; src0 = value used when the slot is absent
   Math,       // aux = op index; src0 = A, src1 = B
   Mix,        // src0 = fac, src1 = A, src2 = B
-  Over,       // src0 = fac, src1 = foreground, src2 = background
+  Over,       // aux = blend mode; src0 = fac, src1 = foreground, src2 = background
   Swizzle,    // aux = component 0..3, broadcast; src0 = vector
   Combine,    // src0..3 contribute their component 0
   Hsv,        // src0..3 = hue, sat, val, alpha
@@ -107,12 +113,13 @@ enum class Op : uint8_t {
   Output,     // src0 = colour, src1 = brightness. Always the last instruction.
   Anim,       // aux = asset, aux2 = tex flags | crossfade << 4 | loop << 5; src0 = uv, src1 = phase
   Particles,  // aux = asset, aux2 = filter << 2; src0 = position, src1 = time,
-              // src2 = (count, size, speed, spread), src3 = (gravity, seed, life, fade)
+              // src2 = the FIRST of kParticleQuads consecutive constants (see ParticleParams)
   kCount,
 };
 
 constexpr uint8_t kMathOpCount = 21;  // web/nodes.ts MATH_OPS
 constexpr uint8_t kRangeCount = 5;    // web/nodes.ts RANGES
+constexpr uint8_t kBlendCount = 7;    // web/nodes.ts BLEND_MODES
 
 // What a Tex instruction does outside the image (aux2 bits 0-1). web/nodes.ts WRAPS.
 enum class Wrap : uint8_t {
@@ -122,10 +129,26 @@ enum class Wrap : uint8_t {
   kCount,
 };
 
+// One particle, as the pixel loop needs it: where it is, how big, how turned, how faded.
+//
+// Worked out ONCE PER FRAME, not once per pixel. Everything in here comes from the particle's
+// index and the clock, neither of which varies across a frame, and computing it per pixel
+// would put four sines per particle inside the hottest loop in the firmware - on a chip where
+// sinf is software. This struct is that decision made concrete.
+struct Particle {
+  float x, y;          // centre, in whatever space the position input is in
+  float inv_scale;     // 1 / size, so the pixel loop multiplies
+  float cos_r, sin_r;  // rotation, resolved here so no pixel ever calls a trig function
+  float alpha;         // coverage after fade
+  uint16_t frame;      // which frame of the sprite strip this one drew
+  uint16_t reserved;
+};
+
 // Per-thread scratch. One per rendering thread - never share one across cores.
 //
-// ~1 KB because of the register file, so keep it a member or a global, not a stack local
-// inside loop(). That is also why it is caller-owned: the two render tasks each keep one.
+// A few KB because of the register file and the particle table, so keep it a member or a
+// global, not a stack local inside loop(). That is also why it is caller-owned: the two
+// render tasks each keep one.
 struct ExecContext {
   // Hard ceiling on work per pixel. A program from the web is untrusted input: without a
   // budget a bad loop is a watchdog reset with the visor on someone's head. The code has no
@@ -135,6 +158,9 @@ struct ExecContext {
   bool budget_exceeded = false;  // sticky, so a frame can be flagged without checking per pixel
 
   float regs[format::kMaxRegisters][4] = {};
+  // Filled by prepareParticles() once per frame, read by every pixel. Each Particles
+  // instruction owns a slice, handed out at load().
+  Particle particles[format::kMaxParticles] = {};
 };
 
 // Binary container layout, little-endian. Both targets are little-endian, but the fields are
@@ -246,10 +272,13 @@ private:
   // here, so there is exactly one bilinear fetch in the VM.
   void sampleFrame(uint16_t asset, uint16_t frame, float u, float v, uint8_t flags,
                    float* rgba) const;
-  // Sprites a Particles instruction draws, clamped to kMaxParticles. Its operand is
-  // required to be a constant (validateCode enforces it), so this is known at load - which
-  // is what keeps the per-pixel budget a number rather than a guess.
+  // Sprites a Particles instruction draws, clamped to what is left of the program's budget.
+  // Its operand is required to be a constant (validateCode enforces it), so this is known at
+  // load - which is what keeps the per-pixel budget a number rather than a guess.
   uint8_t particleCount(const uint8_t* instruction) const;
+  // Works out every particle of every Particles instruction for this frame, into ctx. Runs
+  // once per core per frame, right after the uniform instructions that feed it.
+  void prepareParticles(ExecContext& ctx, const Frame& frame) const;
 
   // Asset header, copied out of the blob at load. Four fields the sampler needs per texel,
   // in RAM, instead of re-parsing a 16-byte table entry out of mapped flash every time.
@@ -296,6 +325,14 @@ private:
   uint16_t uniform_count_ = 0;
   uint16_t varying_count_ = 0;
   uint8_t result_reg_ = 0;  // where the Output instruction leaves the pixel
+
+  // Where each instruction's slice of ExecContext::particles starts, by instruction index,
+  // and the list of which instructions are emitters at all. Both worked out at load, so the
+  // frame setup knows what to fill and the pixel loop knows what to read without looking.
+  uint8_t particle_base_[format::kMaxInstructions] = {};
+  uint8_t particle_instr_[format::kMaxParticles] = {};
+  uint8_t particle_emitters_ = 0;
+  uint8_t particle_total_ = 0;
 
   // Work one PIXEL costs, which is the varying half. The ISA has no jumps, so this is known
   // before rendering starts.

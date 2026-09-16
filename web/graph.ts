@@ -11,6 +11,7 @@
 
 import {
   ASSET,
+  BLEND_MODES,
   CONST_FLAG,
   INSTR_SIZE,
   MATH_OPS,
@@ -107,6 +108,7 @@ function compileFrom(
   const visiting = new Set<number>();
   let regs = 0;
   let sensorCount = 0;
+  let particleBudget = 0;
   let overflow = "";
 
   /** Constants are pooled and deduped: the same 0.5 from ten widgets costs four bytes once. */
@@ -127,6 +129,29 @@ function compileFrom(
 
   const scalar = (n: number): number => constant([n, n, n, 1]);
 
+  /**
+   * A run of constants the VM reads by walking forward from one operand. Appended in order
+   * and never deduplicated - pooling would happily put an equal quad somewhere else and
+   * break the only thing the block guarantees, which is that the next one is next.
+   */
+  function constBlock(quads: Vec[]): number {
+    const at = consts.length / 4;
+    if (at + quads.length > MAX_CONSTS) {
+      overflow ||= `too many constants (max ${MAX_CONSTS}) - simplify the graph`;
+      return CONST_FLAG;
+    }
+    for (const v of quads) consts.push(v[0], v[1], v[2], v[3]);
+    return CONST_FLAG | at;
+  }
+
+  // Whether each register holds a value that is the same for every pixel in a frame. Same
+  // rule the device applies when it hoists the uniform instructions out of the pixel loop,
+  // mirrored here for the one thing the compiler has to refuse: a particle system whose
+  // clock changes from pixel to pixel, which the head could not honour.
+  const uniformReg: boolean[] = [];
+  const isUniform = (operand: number): boolean =>
+    (operand & CONST_FLAG) !== 0 || uniformReg[operand] === true;
+
   function emit(op: number, src: number[], aux = 0, aux2 = 0): number {
     const dst = regs++;
     if (dst >= MAX_REGISTERS) {
@@ -134,13 +159,18 @@ function compileFrom(
       return 0;
     }
     code.push(op, dst, src[0] ?? 0, src[1] ?? 0, src[2] ?? 0, src[3] ?? 0, aux, aux2);
+    uniformReg[dst] =
+      op !== OP.UV && op !== OP.CENTERED && op !== OP.PIXEL && src.every((o) => isUniform(o));
     return dst;
   }
 
   function fromFallback(f: Fallback | undefined, p: Props): number {
     if (!f) return scalar(0);
     if ("value" in f) return scalar(f.value);
-    if ("emit" in f) return emit(f.emit, f.arg === undefined ? [] : [scalar(num(p[f.arg]))]);
+    if ("emit" in f) {
+      const arg = typeof f.arg === "number" ? f.arg : f.arg === undefined ? undefined : num(p[f.arg]);
+      return emit(f.emit, arg === undefined ? [] : [scalar(arg)]);
+    }
     return scalar(num(p[f.prop]));
   }
 
@@ -254,7 +284,23 @@ function compileFrom(
       );
     });
     for (const name of def.args ?? []) src.push(scalar(num(node.properties[name])));
-    for (const v of def.argsVec?.(node.properties) ?? []) src.push(constant(v));
+    if (def.argsBlock) {
+      const quads = def.argsBlock(node.properties);
+      // The particle budget is the PROGRAM's, not the node's: every emitter draws out of
+      // the one table the device keeps per rendering thread. Clamping here rather than
+      // letting the head refuse the .bin means the preview shows what will actually run.
+      if (spec.op === OP.PARTICLES) {
+        const want = Math.max(0, Math.round(quads[0][0]));
+        const got = Math.min(want, MAX_PARTICLES - particleBudget);
+        particleBudget += got;
+        quads[0][0] = got;
+        // The clock is read once per frame on the device, so it may not vary per pixel.
+        if (!isUniform(src[1])) {
+          overflow ||= "Particles: the Time input has to be the same for every pixel - it cannot come from Coordinates";
+        }
+      }
+      src.push(constBlock(quads));
+    }
     visiting.delete(node.id);
 
     const aux = def.asset ? assetFor(node) : (spec.aux?.(node.properties) ?? 0);
@@ -447,6 +493,18 @@ const MATH: MathFn[] = [
 ];
 if (MATH.length !== MATH_OPS.length) throw new Error("MATH table does not match MATH_OPS");
 
+/** Mirrors blendOp() in the C++ VM. `cb` is the background, `cs` the foreground. */
+const BLEND: MathFn[] = [
+  (_cb, cs) => cs,
+  (cb, cs) => cb * cs,
+  (cb, cs) => cb + cs - cb * cs,
+  (cb, cs) => Math.min(1, cb + cs),
+  (cb, cs) => Math.max(cb, cs),
+  (cb, cs) => Math.min(cb, cs),
+  (cb, cs) => Math.abs(cb - cs),
+];
+if (BLEND.length !== BLEND_MODES.length) throw new Error("BLEND table does not match BLEND_MODES");
+
 /** Squash a sensor reading into 0..1 by saturating, so an unbounded one never flatlines. */
 const UNIT: ((x: number) => number)[] = [
   clamp01,
@@ -461,8 +519,33 @@ if (UNIT.length !== RANGES.length) throw new Error("UNIT table does not match RA
 /** Reusable machine state, so a frame does not allocate once per pixel. */
 export class Runner {
   private readonly regs: Float32Array;
+  /** Per Particles instruction: the particles, and the clock they were worked out for. */
+  private readonly swarms = new Map<number, { t: number; list: Particle[] }>();
+
   constructor(private readonly p: Program) {
     this.regs = new Float32Array(Math.max(1, p.regCount) * 4);
+  }
+
+  /**
+   * The particles of instruction `i` at clock `t`, worked out again only when the clock has
+   * moved. On the device this is a per-frame pass; here the clock IS the frame, and keying
+   * on it keeps a sensor-driven emitter correct without the interpreter knowing what a
+   * frame is.
+   */
+  private readyParticles(i: number, n: number, t: number, block: number, frames: number): Particle[] {
+    let swarm = this.swarms.get(i);
+    if (!swarm) {
+      swarm = { t: NaN, list: [] };
+      this.swarms.set(i, swarm);
+    }
+    while (swarm.list.length < n) {
+      swarm.list.push({ x: 0, y: 0, invScale: 0, cosR: 1, sinR: 0, alpha: 0, frame: 0 });
+    }
+    if (swarm.t !== t) {
+      prepareParticles(swarm.list, n, t, this.p.consts, block, frames);
+      swarm.t = t;
+    }
+    return swarm.list;
   }
 
   /** Colour of one pixel, 0..1 per channel, written into `out`. */
@@ -547,7 +630,15 @@ export class Runner {
             regs[d] = regs[d + 1] = regs[d + 2] = regs[d + 3] = 0;
           } else {
             // Straight (un-premultiplied) alpha in and out, so two of these compose.
-            for (let c = 0; c < 3; c++) regs[d + c] = (F[j + c] * af + B[k + c] * ab * (1 - af)) / a;
+            //
+            // The blend mode applies only where both layers cover - the (1 - ab) term. Over
+            // the part of the foreground hanging off the background there is no second
+            // colour to combine with, so it keeps its own.
+            const blend = BLEND[aux % BLEND.length];
+            for (let c = 0; c < 3; c++) {
+              const blended = (1 - ab) * F[j + c] + ab * blend(B[k + c], F[j + c]);
+              regs[d + c] = (blended * af + B[k + c] * ab * (1 - af)) / a;
+            }
             regs[d + 3] = a;
           }
           break;
@@ -574,21 +665,33 @@ export class Runner {
         case OP.ANIM:
           animation(regs, d, assets[aux], a0[i0], a0[i0 + 1], of(code[b + 3])[at(code[b + 3])], aux2);
           break;
-        case OP.PARTICLES:
-          particles(
-            regs,
-            d,
-            assets[aux],
-            a0[i0],
-            a0[i0 + 1],
-            of(code[b + 3])[at(code[b + 3])],
-            of(code[b + 4]),
-            at(code[b + 4]),
-            of(code[b + 5]),
-            at(code[b + 5]),
-            aux2,
-          );
+        case OP.PARTICLES: {
+          regs[d] = regs[d + 1] = regs[d + 2] = regs[d + 3] = 0;
+          const asset = assets[aux];
+          const block = (code[b + 4] & 0x7f) * 4;
+          const n = Math.min(MAX_PARTICLES, Math.max(0, Math.floor(consts[block]) || 0));
+          if (!asset || n === 0) break;
+          // Prepared per value of the clock, not per pixel - the device works the same way,
+          // once per frame, and a rotated sprite would otherwise cost four sines a pixel.
+          const list = this.readyParticles(i, n, of(code[b + 3])[at(code[b + 3])], block, Math.max(1, asset.frames));
+          const f = Math.fround;
+          for (let k = 0; k < n; k++) {
+            const p = list[k];
+            if (!(p.alpha > 0)) continue; // faded out, or scaled to nothing
+            const dx = f(a0[i0] - p.x);
+            const dy = f(a0[i0 + 1] - p.y);
+            sampleFrame(
+              asset,
+              p.frame,
+              f(f(f(f(dx * p.cosR) + f(dy * p.sinR)) * p.invScale) + 0.5),
+              f(f(f(f(dy * p.cosR) - f(dx * p.sinR)) * p.invScale) + 0.5),
+              (aux2 & 4) | 2, // clip: a particle is its sprite and nothing else
+              t4,
+            );
+            overInto(regs, d, t4, p.alpha);
+          }
           break;
+        }
         case OP.OUTPUT: {
           // An LED is on or off; there is nothing behind it to show through, so alpha
           // composites against black here - the one place transparency gets resolved.
@@ -738,50 +841,134 @@ function animation(r: Float32Array, d: number, a: PackedAsset | undefined, u: nu
 }
 
 /**
- * The particle system, pixel by pixel. Mirrors the Particles case in the C++ VM step for
- * step, including Math.fround around every arithmetic operation: the device does this in
- * single precision, and a particle position that differs in the last bit picks a different
- * texel under nearest filtering, which is a visibly wrong pixel rather than a rounding
- * difference. Doubles here would be the preview quietly lying.
+ * One particle, ready for the pixel loop. Mirrors protoshade::Particle.
+ *
+ * The device works these out once per frame, right after the instructions it hoists out of
+ * the pixel loop, because none of it varies across a frame and four sines per particle per
+ * pixel would melt the ESP32. Doing the same here is not an optimisation for the browser's
+ * sake - it is what makes the preview run the same arithmetic the head does.
  */
-function particles(r: Float32Array, d: number, a: PackedAsset | undefined, px: number, py: number, t: number, pa: Float32Array, ia: number, pb: Float32Array, ib: number, flags: number): void {
-  r[d] = r[d + 1] = r[d + 2] = r[d + 3] = 0;
-  const size = pa[ia + 1];
-  const n = Math.min(MAX_PARTICLES, Math.max(0, Math.floor(pa[ia]) || 0));
-  if (!a || n === 0 || !(size > 0)) return;
+interface Particle {
+  x: number;
+  y: number;
+  invScale: number;
+  cosR: number;
+  sinR: number;
+  alpha: number;
+  frame: number;
+}
 
+const DEG_TO_RAD = 0.017453292;
+
+/**
+ * Sine and cosine to the same bits as the C++ VM: the identical range reduction and the
+ * identical polynomial, each step rounded to a float with Math.fround. Math.sin would be a
+ * double's answer, and one ulp of difference in a rotation puts a sprite's edge on the
+ * other side of a texel - a wrong pixel, not a rounding difference.
+ */
+function sinCos(x: number, out: { s: number; c: number }): void {
   const f = Math.fround;
-  const speed = pa[ia + 2];
-  const spread = pa[ia + 3];
-  const gravity = pb[ib];
-  const seed = Math.min(65535, Math.max(0, pb[ib + 1])) >>> 0;
-  const life = pb[ib + 2] > 0 ? pb[ib + 2] : 1;
-  const fade = clamp01(pb[ib + 3]);
-  const invSize = f(1 / size);
+  if (!(x > -1e6 && x < 1e6)) x = 0; // sane, finite, and small enough for the |0 below
+  const k = Math.floor(f(f(x * 0.63661977) + 0.5));
+  const r = f(x - f(k * 1.5707964));
+  const r2 = f(r * r);
+  const sr = f(r * f(1 + f(r2 * f(-0.16666667 + f(r2 * f(0.008333333 + f(r2 * -0.0001984127)))))));
+  const cr = f(1 + f(r2 * f(-0.5 + f(r2 * f(0.041666668 + f(r2 * -0.0013888889))))));
+  const q = k & 3;
+  switch (q < 0 ? q + 4 : q) {
+    case 1:
+      out.s = cr;
+      out.c = -sr;
+      break;
+    case 2:
+      out.s = -sr;
+      out.c = -cr;
+      break;
+    case 3:
+      out.s = -cr;
+      out.c = sr;
+      break;
+    default:
+      out.s = sr;
+      out.c = cr;
+  }
+}
+
+const trig = { s: 0, c: 0 };
+
+/**
+ * Every particle of one emitter, for one value of the clock. The parameter block is five
+ * constants - see prepareParticles() in the C++ VM, which reads them in this same order.
+ */
+function prepareParticles(out: Particle[], n: number, t: number, p: Float32Array, at: number, frames: number): void {
+  const f = Math.fround;
+  const life = p[at + 1] > 0 ? p[at + 1] : 1;
   const invLife = f(1 / life);
-  const frames = Math.max(1, a.frames);
+  const fade = clamp01(p[at + 2]);
+  const seed = Math.min(65535, Math.max(0, p[at + 3])) >>> 0;
+  const direction = p[at + 4];
+  const spread = p[at + 5];
+  const speed = p[at + 6];
+  const speedSpread = p[at + 7];
+  const accel = p[at + 8];
+  const gx = p[at + 9];
+  const gy = p[at + 10];
+  const size = p[at + 12];
+  const sizeSpread = p[at + 13];
+  const sizeRate = p[at + 14];
+  const sizeAccel = p[at + 15];
+  const rotation = p[at + 16];
+  const rotSpread = p[at + 17];
+  const rotRate = p[at + 18];
+  const rotAccel = p[at + 19];
 
   for (let i = 0; i < n; i++) {
-    const h0 = hashU32((Math.imul(i, 0x9e3779b9) + seed) >>> 0);
+    // The offset is not decoration: the finaliser maps 0 to 0, so particle 0 of seed 0
+    // would come out with every random exactly zero - frozen at the emitter, in the one
+    // configuration somebody reaching for defaults will hit first.
+    const h0 = hashU32((Math.imul(i, 0x9e3779b9) + seed + 0x2545f491) >>> 0);
     const h1 = hashU32(h0);
     const h2 = hashU32(h1);
     const h3 = hashU32(h2);
+    const h4 = hashU32(h3);
+    const h5 = hashU32(h4);
+
     const phase = f(f(t * invLife) + unitOf(h0));
     const age = f(phase - Math.floor(phase)); // staggered, so the swarm does not restart as one
     const lived = f(age * life);
-    const vx = f(f(f(f(unitOf(h1) * 2) - 1) * spread) * speed);
-    const vy = f(-speed * f(0.5 + f(0.5 * unitOf(h2))));
-    const cx = f(vx * lived);
-    const cy = f(f(vy * lived) + f(f(0.5 * gravity) * f(lived * lived)));
-    sampleFrame(
-      a,
-      Math.floor(unitOf(h3) * frames),
-      f(f(f(px - cx) * invSize) + 0.5),
-      f(f(f(py - cy) * invSize) + 0.5),
-      (flags & 4) | 2, // clip: a particle is its sprite and nothing else
-      t4,
+
+    // Spread is the full cone, so 360 really is all around and 0 is a straight line.
+    const dir = f(f(direction + f(f(f(f(unitOf(h1) * 2) - 1) * spread) * 0.5)) * DEG_TO_RAD);
+    const sp = f(speed + f(f(f(unitOf(h2) * 2) - 1) * speedSpread));
+    sinCos(dir, trig);
+    // 0 degrees is up the panel, degrees clockwise - a compass bearing, not school trig.
+    const dx = trig.s;
+    const dy = f(-trig.c);
+    const ax = f(f(dx * accel) + gx);
+    const ay = f(f(dy * accel) + gy);
+    const particle = out[i];
+    particle.x = f(f(f(dx * sp) * lived) + f(f(0.5 * ax) * f(lived * lived)));
+    particle.y = f(f(f(dy * sp) * lived) + f(f(0.5 * ay) * f(lived * lived)));
+
+    const scale = f(
+      f(f(size + f(f(f(unitOf(h3) * 2) - 1) * sizeSpread)) + f(sizeRate * lived)) +
+        f(f(0.5 * sizeAccel) * f(lived * lived)),
     );
-    overInto(r, d, t4, f(1 - f(fade * age)));
+    const rot = f(
+      f(
+        f(rotation + f(f(f(f(unitOf(h4) * 2) - 1) * rotSpread) * 0.5)) +
+          f(rotRate * lived) +
+          f(f(0.5 * rotAccel) * f(lived * lived)),
+      ) * DEG_TO_RAD,
+    );
+    sinCos(rot, trig);
+    particle.sinR = trig.s;
+    particle.cosR = trig.c;
+    // Scaled to nothing is skipped rather than divided by: alpha 0 is how the pixel loop is
+    // told there is nothing here, and it already has that branch for fade.
+    particle.invScale = scale > 0 ? f(1 / scale) : 0;
+    particle.alpha = scale > 0 ? f(1 - f(fade * age)) : 0;
+    particle.frame = Math.floor(unitOf(h5) * frames);
   }
 }
 

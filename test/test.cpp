@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>  // std::abs(int); libc++ does not hand it over via <cmath>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "../src/ProtoShadeDisplay.h"
@@ -240,6 +241,14 @@ void testCodeValidation() {
     Builder p;
     const uint8_t m = p.emit(Op::Math, p.scalar(1), p.scalar(1), 0, 0, kMathOpCount);
     p.emit(Op::Output, m, p.scalar(1));
+    auto b = p.blob();
+    assert(!rt.load(b.data(), b.size()) && rt.status() == Status::BadProgram);
+  }
+  // Blend mode index that does not exist.
+  {
+    Builder p;
+    const uint8_t o = p.emit(Op::Over, p.scalar(1), p.scalar(1), p.scalar(0), 0, kBlendCount);
+    p.emit(Op::Output, o, p.scalar(1));
     auto b = p.blob();
     assert(!rt.load(b.data(), b.size()) && rt.status() == Status::BadProgram);
   }
@@ -543,36 +552,157 @@ void testAnimation() {
 void testParticles() {
   const AssetSpec dot{1, 1, AssetFormat::RGBA8888, {255, 255, 255, 255}};
 
-  auto build = [&](uint8_t count_operand_is_const, float count) {
+  // The five-quad parameter block, in the order prepareParticles() reads it. Defaults here
+  // are a single motionless particle, so a case only has to say what it is testing.
+  struct Params {
+    float count = 1, life = 1, fade = 0, seed = 0;
+    float direction = 0, spread = 0, speed = 0, speed_spread = 0;
+    float accel = 0, gx = 0, gy = 0;
+    float size = 1, size_spread = 0, size_rate = 0, size_accel = 0;
+    float rotation = 0, rot_spread = 0, rot_rate = 0, rot_accel = 0;
+  };
+  auto block = [](Builder& p, const Params& v) {
+    const uint8_t at = p.konst(v.count, v.life, v.fade, v.seed);
+    p.konst(v.direction, v.spread, v.speed, v.speed_spread);
+    p.konst(v.accel, v.gx, v.gy, 0.0f);
+    p.konst(v.size, v.size_spread, v.size_rate, v.size_accel);
+    p.konst(v.rotation, v.rot_spread, v.rot_rate, v.rot_accel);
+    return at;  // the block is contiguous, and the VM walks forward from here
+  };
+
+  auto build = [&](const Params& v, bool clock_is_const = true, uint16_t asset = 0) {
     Builder p;
     p.addAsset(dot);
     const uint8_t pos = p.emit(Op::Centered);
-    const uint8_t pa = p.konst(count, 1.0f, 0.0f, 0.0f);  // count, size, speed, spread
-    const uint8_t pb = p.konst(0.0f, 0.0f, 1.0f, 0.0f);   // gravity, seed, life, fade
-    const uint8_t src2 = count_operand_is_const ? pa : p.emit(Op::Time, p.scalar(0));
-    p.emit(Op::Output, p.emit(Op::Particles, pos, p.scalar(0), src2, pb, 0, 0), p.scalar(1));
+    // A per-pixel clock: legal as an operand, refused for Particles, because the particle
+    // state is worked out once per frame and a pixel coordinate would make that a lie.
+    const uint8_t clock = clock_is_const ? p.scalar(0) : p.emit(Op::Swizzle, pos, 0, 0, 0, 0);
+    p.emit(Op::Output, p.emit(Op::Particles, pos, clock, block(p, v), 0, uint8_t(asset), 0),
+           p.scalar(1));
     return p.blob();
   };
 
   // One still particle, a sprite as wide as the space: the middle pixel is covered.
-  assert(renderOne(build(1, 1.0f), 0, 0, 0, 1, 1).r == 255);
+  assert(renderOne(build({}), 0, 0, 0, 1, 1).r == 255);
   // No particles is transparent, which the output flattens to black.
-  assert(renderOne(build(1, 0.0f), 0, 0, 0, 1, 1).r == 0);
-
-  // A count that is not a constant could be anything by the time the pixel runs, so the
-  // budget could not be proven at load. Refused there rather than clamped at run time.
+  assert(renderOne(build({0}), 0, 0, 0, 1, 1).r == 0);
+  // Faded out at the end of its life, and scaled to nothing, are both invisible.
   {
-    auto blob = build(0, 1.0f);
+    Params gone;
+    gone.fade = 1;
+    assert(renderOne(build(gone), 0, 0, 0, 1, 1).r < 255);
+    Params tiny;
+    tiny.size = 0;
+    assert(renderOne(build(tiny), 0, 0, 0, 1, 1).r == 0);
+  }
+  // Direction is a compass bearing: 0 sends them up the panel, 180 sends them down, 90 to
+  // the right. How FAR a particle has gone depends on its age, which is random - so the
+  // check is the same swarm under two settings, which share every random and differ only in
+  // where they went.
+  {
+    auto centre = [&](const Params& v, uint16_t w, uint16_t h) {
+      ProtoShadeRuntime rt(w, h);
+      auto blob = build(v);
+      assert(rt.load(blob.data(), blob.size()));
+      ExecContext ctx;
+      std::vector<Pixel> px(size_t(w) * h);
+      rt.renderFrame(ctx, rt.beginFrame(0), px.data());
+      float sum = 0, wx = 0, wy = 0;
+      for (uint16_t y = 0; y < h; y++) {
+        for (uint16_t x = 0; x < w; x++) {
+          const float lit = float(px[size_t(y) * w + x].r);
+          sum += lit;
+          wx += lit * float(x);
+          wy += lit * float(y);
+        }
+      }
+      assert(sum > 0);  // something was actually drawn
+      return std::pair<float, float>{wx / sum, wy / sum};
+    };
+
+    // A square panel, so Centered runs -1..1 on both axes and a displacement means the same
+    // thing either way.
+    Params v;
+    v.count = 12;
+    v.seed = 11;
+    v.life = 1;
+    v.size = 0.5f;
+    v.speed = 0.5f;
+    v.direction = 0;
+    const auto up = centre(v, 9, 9);
+    v.direction = 180;
+    const auto down = centre(v, 9, 9);
+    assert(up.second < down.second);  // up the panel is a smaller row number
+
+    v.direction = 90;
+    const auto east = centre(v, 9, 9);
+    v.direction = 270;
+    const auto west = centre(v, 9, 9);
+    assert(west.first < east.first);  // 90 degrees is to the right
+
+    // Gravity is a vector, and pushes every particle the same way whatever its direction.
+    v.direction = 0;
+    v.speed = 0;
+    v.gx = 1.5f;
+    const auto right = centre(v, 9, 9);
+    v.gx = -1.5f;
+    const auto left = centre(v, 9, 9);
+    assert(left.first < right.first);
+  }
+  // Rotation turns the sprite rather than moving it: a 1x1 sprite stays put either way, so
+  // what this pins down is that a wild angle is still a finite number and renders.
+  {
+    Params spun;
+    spun.rotation = 1.0e12f;  // nonsense from a web page
+    spun.rot_rate = 720;
+    assert(renderOne(build(spun), 0, 0, 0, 1, 1).r == 255);
+  }
+
+  // A parameter block that is not constants at all.
+  {
+    Builder p;
+    p.addAsset(dot);
+    const uint8_t pos = p.emit(Op::Centered);
+    const uint8_t reg = p.emit(Op::Time, p.scalar(0));
+    p.emit(Op::Output, p.emit(Op::Particles, pos, p.scalar(0), reg, 0, 0, 0), p.scalar(1));
+    auto blob = p.blob();
+    ProtoShadeRuntime rt;
+    assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
+  }
+  // A block that starts inside the pool but runs off the end of it.
+  {
+    Builder p;
+    p.addAsset(dot);
+    const uint8_t pos = p.emit(Op::Centered);
+    const uint8_t at = p.konst(1, 1, 0, 0);  // one quad where five are needed
+    p.emit(Op::Output, p.emit(Op::Particles, pos, p.scalar(0), at, 0, 0, 0), p.scalar(1));
+    auto blob = p.blob();
+    ProtoShadeRuntime rt;
+    assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
+  }
+  // A clock that changes from pixel to pixel.
+  {
+    auto blob = build({}, false);
     ProtoShadeRuntime rt;
     assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
   }
   // An asset index that was never packed.
   {
+    auto blob = build({}, true, 7);
+    ProtoShadeRuntime rt;
+    assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
+  }
+  // The particle table is the PROGRAM's, not the instruction's: two emitters that together
+  // want more than kMaxParticles are refused, because there is nowhere to put the state.
+  {
     Builder p;
+    p.addAsset(dot);
     const uint8_t pos = p.emit(Op::Centered);
-    p.emit(Op::Output,
-           p.emit(Op::Particles, pos, p.scalar(0), p.konst(1, 1, 0, 0), p.konst(0, 0, 1, 0), 0, 0),
-           p.scalar(1));
+    Params many;
+    many.count = format::kMaxParticles;
+    const uint8_t a = p.emit(Op::Particles, pos, p.scalar(0), block(p, many), 0, 0, 0);
+    const uint8_t b = p.emit(Op::Particles, pos, p.scalar(0), block(p, many), 0, 0, 0);
+    p.emit(Op::Output, p.emit(Op::Over, p.scalar(1), a, b, 0, 0), p.scalar(1));
     auto blob = p.blob();
     ProtoShadeRuntime rt;
     assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
@@ -580,15 +710,15 @@ void testParticles() {
   // A silly count is clamped to kMaxParticles, so the per-pixel cost stays bounded however
   // the .bin was built - and the program still runs.
   {
-    auto blob = build(1, 1e9f);
+    Params silly;
+    silly.count = 1e9f;
+    auto blob = build(silly);
     ProtoShadeRuntime rt(1, 1);
     assert(rt.load(blob.data(), blob.size()));
     ExecContext ctx;
-    rt.renderFrame(ctx, rt.beginFrame(0), nullptr);
-    assert(!ctx.budget_exceeded);
     Pixel px{};
     rt.renderRows(ctx, rt.beginFrame(0), 0, 1, &px);
-    assert(ctx.steps_used <= format::kMaxParticles * 14 && !ctx.budget_exceeded);
+    assert(ctx.steps_used <= format::kMaxParticles * 16 && !ctx.budget_exceeded);
   }
 }
 

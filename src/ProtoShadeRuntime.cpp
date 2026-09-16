@@ -67,6 +67,22 @@ float mathOp(uint8_t op, float a, float b) {
   }
 }
 
+// How the foreground's colour is mixed with the background's WHERE THEY BOTH COVER. Index
+// order is the format - keep it in step with BLEND_MODES in web/nodes.ts. Mode 0 is plain
+// source-over, and the formula below reduces to exactly that, so every .bin built before
+// blend modes existed renders the same byte for byte.
+float blendOp(uint8_t mode, float cb, float cs) {
+  switch (mode) {
+    case 1: return cb * cs;                    // multiply
+    case 2: return cb + cs - cb * cs;          // screen
+    case 3: return cb + cs > 1.0f ? 1.0f : cb + cs;  // add
+    case 4: return cb > cs ? cb : cs;          // lighten
+    case 5: return cb < cs ? cb : cs;          // darken
+    case 6: return std::fabs(cb - cs);         // difference
+    default: return cs;                        // normal
+  }
+}
+
 // Squash a sensor reading into 0..1 by saturating, so an unbounded one never flatlines.
 float toUnit(uint8_t range, float x) {
   switch (range) {
@@ -159,6 +175,41 @@ uint32_t hashU32(uint32_t x) {
 // bit-identical numbers. Off by one ulp is normally invisible, but it lands on the wrong
 // side of a texel edge often enough to show up as a wrong pixel in test/crosscheck.mjs.
 float unitOf(uint32_t h) { return float(h >> 16) * (1.0f / 65536.0f); }
+
+// Sine and cosine, ours rather than newlib's.
+//
+// Two reasons, and neither is speed for its own sake. First, web/graph.ts has to agree with
+// this to the last bit or a rotated sprite picks a different texel in the preview than on
+// the head - and the browser's Math.sin is a double's, which newlib's sinf is not. The same
+// polynomial in the same order in both languages is agreement by construction. Second, this
+// runs per particle per frame on a chip with no hardware trig, where sinf is a software call
+// whose cost grows with the argument - and a rotation that has been spinning for an hour is
+// a big argument.
+//
+// Range-reduced to a quadrant, then a 7th-order polynomial on |r| <= pi/4, where it is good
+// to about 3e-7 - a third of a millionth of a turn, on a sprite a few pixels across.
+void sinCos(float x, float& s, float& c) {
+  // An angle that is finite and sane. Past a million radians a float has no fractional
+  // angle left anyway, and the int() below must not be handed something out of its range -
+  // the number came from a web page. This also catches NaN, which fails every comparison.
+  if (!(x > -1.0e6f && x < 1.0e6f)) x = 0.0f;
+  const float k = std::floor(x * 0.63661977f + 0.5f);  // 2/pi: which quadrant
+  const float r = x - k * 1.5707964f;                  // pi/2
+  const float r2 = r * r;
+  // sin(r) and cos(r), Taylor, on the reduced angle.
+  const float sr = r * (1.0f + r2 * (-0.16666667f + r2 * (0.008333333f + r2 * -0.00019841270f)));
+  const float cr = 1.0f + r2 * (-0.5f + r2 * (0.041666668f + r2 * -0.0013888889f));
+  // The quadrant decides which of the two is which, and the signs.
+  const int q = int(k) & 3;
+  switch (q < 0 ? q + 4 : q) {
+    case 1: s = cr; c = -sr; break;
+    case 2: s = -sr; c = -cr; break;
+    case 3: s = -cr; c = sr; break;
+    default: s = sr; c = cr; break;
+  }
+}
+
+constexpr float kDegToRad = 0.017453292f;
 
 // Straight-alpha source-over, in place: `dst` ends up as fg over dst. Same algebra as
 // Op::Over, kept separate because that one is an instruction and this one runs in a loop.
@@ -290,6 +341,8 @@ bool ProtoShadeRuntime::validateCode() {
   uint32_t cost = 0;
   uniform_count_ = 0;
   varying_count_ = 0;
+  particle_emitters_ = 0;
+  particle_total_ = 0;
   for (uint16_t i = 0; i < instr_count_; i++) {
     const uint8_t* in = code_ + size_t(i) * format::kInstrSize;
     const uint8_t op = in[0];
@@ -317,6 +370,10 @@ bool ProtoShadeRuntime::validateCode() {
       status_ = Status::BadProgram;
       return false;
     }
+    if (op == uint8_t(Op::Over) && aux >= kBlendCount) {
+      status_ = Status::BadProgram;
+      return false;
+    }
     if (op == uint8_t(Op::Sensor) && (aux2 >> 1) >= kRangeCount) {
       status_ = Status::BadProgram;
       return false;
@@ -326,12 +383,40 @@ bool ProtoShadeRuntime::validateCode() {
       status_ = Status::BadProgram;
       return false;
     }
-    // src2 carries (count, size, speed, spread). The count has to be a constant: a register
-    // could hold anything by the time the pixel runs, and then the cost of a pixel would no
-    // longer be known before rendering starts, which is the whole safety story.
-    if (op == uint8_t(Op::Particles) && (aux >= asset_count_ || !(in[4] & kConstFlag))) {
-      status_ = Status::BadProgram;
-      return false;
+    if (op == uint8_t(Op::Particles)) {
+      // src2 names a block of kParticleQuads consecutive constants. Constants, not
+      // registers: the count lives in there, and a register could hold anything by the time
+      // the pixel runs - then the cost of a pixel would no longer be known before rendering
+      // starts, which is the whole safety story.
+      const uint8_t base = in[4] & kOperandMask;
+      if (aux >= asset_count_ || !(in[4] & kConstFlag) ||
+          uint16_t(base) + format::kParticleQuads > const_count_) {
+        status_ = Status::BadProgram;
+        return false;
+      }
+      // The clock must not vary across the frame either, because the per-particle state is
+      // worked out once per frame from it. A constant or anything hoisted into the uniform
+      // pass is fine; a pixel coordinate is not.
+      const uint8_t clock = in[3];
+      if (!(clock & kConstFlag) && !uniform_reg[clock]) {
+        status_ = Status::BadProgram;
+        return false;
+      }
+      // Each emitter gets a slice of the one particle table in ExecContext, so the budget
+      // is the program's, not the instruction's.
+      const float want = consts_[base][0];
+      const uint32_t n = !(want > 0.0f) ? 0
+                                        : (want >= float(format::kMaxParticles)
+                                               ? format::kMaxParticles
+                                               : uint32_t(want));
+      if (particle_emitters_ >= format::kMaxParticles ||
+          particle_total_ + n > format::kMaxParticles) {
+        status_ = Status::BadProgram;
+        return false;
+      }
+      particle_base_[i] = particle_total_;
+      particle_instr_[particle_emitters_++] = uint8_t(i);
+      particle_total_ += uint8_t(n);
     }
     // Written exactly once, never twice. The compiler allocates a fresh register per
     // instruction, and depending on that is what lets the uniform instructions be pulled
@@ -367,7 +452,7 @@ bool ProtoShadeRuntime::validateCode() {
       } else if (op == uint8_t(Op::Particles)) {
         // The only loop in the VM, and the reason its trip count is clamped rather than
         // trusted: the budget has to be knowable before the first pixel is drawn.
-        cost += particleCount(code_ + size_t(i) * format::kInstrSize) * (fetch + 6);
+        cost += particleCount(code_ + size_t(i) * format::kInstrSize) * (fetch + 8);
       } else {
         cost += 1;
       }
@@ -393,6 +478,7 @@ void ProtoShadeRuntime::unload() {
   asset_count_ = prog_w_ = prog_h_ = const_count_ = 0;
   reg_count_ = sensor_count_ = 0;
   uniform_count_ = varying_count_ = 0;
+  particle_emitters_ = particle_total_ = 0;
   result_reg_ = 0;
   cost_ = 0;
   status_ = Status::NoProgram;
@@ -426,6 +512,93 @@ uint8_t ProtoShadeRuntime::particleCount(const uint8_t* in) const {
   const float n = consts_[in[4] & kOperandMask][0];
   if (!(n > 0.0f)) return 0;  // also catches NaN
   return n >= float(format::kMaxParticles) ? format::kMaxParticles : uint8_t(n);
+}
+
+// Every particle of every emitter, for this frame.
+//
+// Called once per core per frame, straight after the uniform instructions - which is the
+// whole point. A particle's position, size, rotation and fade depend only on its index and
+// the clock, so working them out here costs four sines per particle per frame instead of
+// four sines per particle per PIXEL. On a 64x32 panel that is the difference between 24
+// sines a frame and 98304 of them, on a chip whose sinf is software.
+//
+// The parameter block, five constants starting at the src2 operand:
+//   0  count, life, fade, seed
+//   1  direction deg, spread deg, speed, speed spread
+//   2  acceleration (along the spawn direction), gravity x, gravity y, -
+//   3  size, size spread, size rate, size acceleration
+//   4  rotation deg, rotation spread deg, rotation rate deg/s, rotation acceleration deg/s2
+void ProtoShadeRuntime::prepareParticles(ExecContext& ctx, const Frame& frame) const {
+  (void)frame;
+  for (uint8_t e = 0; e < particle_emitters_; e++) {
+    const uint8_t idx = particle_instr_[e];
+    const uint8_t* in = code_ + size_t(idx) * format::kInstrSize;
+    const uint8_t n = particleCount(in);
+    if (n == 0) continue;
+
+    const uint8_t base = in[4] & kOperandMask;
+    const float* emit = consts_[base];
+    const float* motion = consts_[base + 1];
+    const float* force = consts_[base + 2];
+    const float* scale = consts_[base + 3];
+    const float* spin = consts_[base + 4];
+
+    // The clock. Validated at load to be a constant or a frame-uniform register, which is
+    // what makes it safe to read once here rather than per pixel.
+    const uint8_t o = in[3];
+    const float t = (o & kConstFlag) ? consts_[o & kOperandMask][0] : ctx.regs[o][0];
+
+    const float life = emit[1] > 0.0f ? emit[1] : 1.0f;
+    const float inv_life = 1.0f / life;
+    const float fade = clamp01(emit[2]);
+    const float seed = emit[3] < 0.0f ? 0.0f : (emit[3] > 65535.0f ? 65535.0f : emit[3]);
+    const uint16_t frames = assets_[in[6]].frames;
+    Particle* out = ctx.particles + particle_base_[idx];
+
+    for (uint8_t i = 0; i < n; i++) {
+      // The odd-looking offset is not decoration: the finaliser maps 0 to 0, so particle 0
+      // of seed 0 would come out with every random exactly zero - a particle frozen at the
+      // emitter, in the one configuration somebody reaching for defaults will hit first.
+      const uint32_t h0 = hashU32(uint32_t(i) * 0x9E3779B9U + uint32_t(seed) + 0x2545F491U);
+      const uint32_t h1 = hashU32(h0);
+      const uint32_t h2 = hashU32(h1);
+      const uint32_t h3 = hashU32(h2);
+      const uint32_t h4 = hashU32(h3);
+      const uint32_t h5 = hashU32(h4);
+
+      // Staggered by h0, so the whole swarm does not restart on the same frame.
+      const float age = fract(t * inv_life + unitOf(h0));
+      const float lived = age * life;
+
+      // Spread is the full cone, so 360 really is all around and 0 is a straight line.
+      const float dir = (motion[0] + (unitOf(h1) * 2.0f - 1.0f) * motion[1] * 0.5f) * kDegToRad;
+      const float speed = motion[2] + (unitOf(h2) * 2.0f - 1.0f) * motion[3];
+      float sd, cd;
+      sinCos(dir, sd, cd);
+      // 0 degrees is up the panel, and degrees go clockwise from there - which is what you
+      // get by reading the widget as a compass bearing rather than as school trigonometry.
+      const float dx = sd;
+      const float dy = -cd;
+      // Acceleration pushes along the spawn direction; gravity pushes the same way for all
+      // of them. Both are constant, so the path is the schoolbook s = vt + at^2/2.
+      const float ax = dx * force[0] + force[1];
+      const float ay = dy * force[0] + force[2];
+      out[i].x = dx * speed * lived + 0.5f * ax * lived * lived;
+      out[i].y = dy * speed * lived + 0.5f * ay * lived * lived;
+
+      const float size = scale[0] + (unitOf(h3) * 2.0f - 1.0f) * scale[1] + scale[2] * lived +
+                         0.5f * scale[3] * lived * lived;
+      const float rot = (spin[0] + (unitOf(h4) * 2.0f - 1.0f) * spin[1] * 0.5f + spin[2] * lived +
+                         0.5f * spin[3] * lived * lived) *
+                        kDegToRad;
+      sinCos(rot, out[i].sin_r, out[i].cos_r);
+      // A particle shrunk to nothing is skipped rather than divided by: alpha 0 is how the
+      // pixel loop is told there is nothing here, and it already has that branch for fade.
+      out[i].inv_scale = size > 0.0f ? 1.0f / size : 0.0f;
+      out[i].alpha = size > 0.0f ? 1.0f - fade * age : 0.0f;
+      out[i].frame = uint16_t(unitOf(h5) * float(frames));
+    }
+  }
 }
 
 void ProtoShadeRuntime::texel(uint16_t index, int32_t x, int32_t y, int32_t base, int32_t rows,
@@ -511,7 +684,8 @@ void ProtoShadeRuntime::exec(ExecContext& ctx, const Frame& frame, uint16_t x, u
   };
 
   for (uint16_t n = 0; n < count; n++) {
-    const uint8_t* in = code_ + size_t(list[n]) * format::kInstrSize;
+    const uint8_t idx = list[n];
+    const uint8_t* in = code_ + size_t(idx) * format::kInstrSize;
     const uint8_t aux = in[6];
     const uint8_t aux2 = in[7];
     float* dst = ctx.regs[in[1]];
@@ -570,7 +744,16 @@ void ProtoShadeRuntime::exec(ExecContext& ctx, const Frame& frame, uint16_t x, u
           dst[0] = dst[1] = dst[2] = dst[3] = 0.0f;
         } else {
           // Straight (un-premultiplied) alpha in and out, so two of these compose.
-          for (int c = 0; c < 3; c++) dst[c] = (fg[c] * af + bg[c] * ab * (1.0f - af)) / alpha;
+          //
+          // The blend mode only applies where BOTH layers cover: over the part of the
+          // foreground that hangs off the background there is nothing to multiply or add
+          // with, so it stays its own colour. That is what the (1 - ab) term does, and it
+          // is why "add" on two sprites brightens the overlap instead of turning the whole
+          // foreground into a silhouette of itself.
+          for (int c = 0; c < 3; c++) {
+            const float blended = (1.0f - ab) * fg[c] + ab * blendOp(aux, bg[c], fg[c]);
+            dst[c] = (blended * af + bg[c] * ab * (1.0f - af)) / alpha;
+          }
           dst[3] = alpha;
         }
         break;
@@ -633,52 +816,26 @@ void ProtoShadeRuntime::exec(ExecContext& ctx, const Frame& frame, uint16_t x, u
         break;
       }
       case Op::Particles: {
-        // A whole particle system in one instruction. Every particle's life is a closed
-        // form of its index and the time, so there is no state to keep between frames and
-        // nothing for two cores to disagree about - the same reason the rest of the VM has
-        // no memory either.
+        // A whole particle system in one instruction, and the only loop in the VM.
         //
-        // Kept to +, -, * and floor on purpose: web/graph.ts runs the identical arithmetic
-        // in Math.fround steps, so the preview picks the same texel as the head does. A
-        // sine in here would diverge (the browser's is a double's, newlib's is not) and a
-        // nearest-neighbour fetch turns that into a visibly wrong pixel.
-        const float* pa = src(in, 2);  // count, size, speed, spread
-        const float* pb = src(in, 3);  // gravity, seed, life, fade
+        // Every particle was worked out for this frame by prepareParticles(); all that is
+        // left per pixel is "where am I inside this sprite" - a subtract, a rotate, a scale
+        // and a fetch. No trig, no hashing, no division.
         const uint8_t n = particleCount(in);
-        const float size = pa[1];
+        const Particle* ps = ctx.particles + particle_base_[idx];
         dst[0] = dst[1] = dst[2] = dst[3] = 0.0f;
-        if (n == 0 || !(size > 0.0f)) break;
-
-        const float t = src(in, 1)[0];
-        const float speed = pa[2];
-        const float spread = pa[3];
-        const float gravity = pb[0];
-        const float seed = pb[1] < 0.0f ? 0.0f : (pb[1] > 65535.0f ? 65535.0f : pb[1]);
-        const float life = pb[2] > 0.0f ? pb[2] : 1.0f;
-        const float fade = clamp01(pb[3]);
-        const float inv_size = 1.0f / size;
-        const float inv_life = 1.0f / life;
-        const uint16_t frames = assets_[aux].frames;
-
         for (uint8_t i = 0; i < n; i++) {
-          const uint32_t h0 = hashU32(uint32_t(i) * 0x9E3779B9U + uint32_t(seed));
-          const uint32_t h1 = hashU32(h0);
-          const uint32_t h2 = hashU32(h1);
-          const uint32_t h3 = hashU32(h2);
-          // Staggered by r0, so the whole swarm does not restart on the same frame.
-          const float age = fract(t * inv_life + unitOf(h0));
-          const float lived = age * life;
-          const float vx = (unitOf(h1) * 2.0f - 1.0f) * spread * speed;
-          const float vy = -speed * (0.5f + 0.5f * unitOf(h2));
-          const float px = vx * lived;
-          const float py = vy * lived + 0.5f * gravity * lived * lived;
+          const Particle& p = ps[i];
+          if (!(p.alpha > 0.0f)) continue;  // faded out, or scaled to nothing
+          const float dx = a[0] - p.x;
+          const float dy = a[1] - p.y;
           float rgba[4];
           // Clip: outside its own sprite a particle is transparent, never a tiled or
           // smeared copy - the one wrap mode that makes sense here, so it is not a knob.
-          sampleFrame(aux, uint16_t(unitOf(h3) * float(frames)),
-                      (a[0] - px) * inv_size + 0.5f, (a[1] - py) * inv_size + 0.5f,
+          sampleFrame(aux, p.frame, (dx * p.cos_r + dy * p.sin_r) * p.inv_scale + 0.5f,
+                      (dy * p.cos_r - dx * p.sin_r) * p.inv_scale + 0.5f,
                       uint8_t((aux2 & 4) | uint8_t(Wrap::Clip)), rgba);
-          overInto(dst, rgba, 1.0f - fade * age);
+          overInto(dst, rgba, p.alpha);
         }
         break;
       }
@@ -727,6 +884,7 @@ Pixel ProtoShadeRuntime::sample(ExecContext& ctx, const Frame& frame, uint16_t x
   // One pixel on its own pays for the uniform half too. renderRows() is the path that
   // amortises it, and it is the one every renderer actually uses.
   exec(ctx, frame, x, y, uniform_, uniform_count_);
+  prepareParticles(ctx, frame);
   return shade(ctx, frame, x, y);
 }
 
@@ -738,7 +896,12 @@ void ProtoShadeRuntime::renderRows(ExecContext& ctx, const Frame& frame, uint16_
   // pixel. Each core has its own ExecContext, so each runs its own copy into its own
   // registers and the two never touch.
   const bool ready = status_ == Status::Ok;
-  if (ready) exec(ctx, frame, 0, 0, uniform_, uniform_count_);
+  if (ready) {
+    exec(ctx, frame, 0, 0, uniform_, uniform_count_);
+    // Particle state for this frame, from the uniform registers that were just written.
+    // Once per core per frame, next to the other work that does not vary across a frame.
+    prepareParticles(ctx, frame);
+  }
 
   for (uint16_t y = y0; y < y1; y++) {
     for (uint16_t x = 0; x < w_; x++) {
