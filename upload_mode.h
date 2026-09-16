@@ -14,6 +14,15 @@ namespace upload {
 // test pattern, which is what a freshly flashed head shows.
 bool loadProgramFromFlash(protoshade::ProtoShadeRuntime& runtime);
 
+// Takes a .bin over the USB serial port the head already logs on, in place of joining its
+// access point - which is the only way in on a computer with no WiFi. Blocks until the
+// transfer finishes or times out, and reloads the runtime either way. Rendering must be
+// stopped before calling it: writing flash takes the cache down with it, and the VM reads
+// the program straight out of the mapped partition.
+//
+// The protocol is at the definition. Returns true when the head is running the new program.
+bool receiveOverSerial(protoshade::ProtoShadeRuntime& runtime);
+
 // Brings up WiFi (access point, or a network if you set ssid) and the web server. The
 // runtime is unloaded while a write is in flight, so nothing renders out of bytes that are
 // being erased - which is why program mode must stop rendering before calling this.

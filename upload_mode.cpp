@@ -13,6 +13,12 @@ namespace {
 
 constexpr const char* kPartitionLabel = "protoshade";
 
+// Serial upload. The chunk is small enough to sit on the loop task's stack and big enough
+// that the acks are not the thing setting the transfer rate; the timeout is per read, so a
+// host that dies mid-file costs one of these and not the face.
+constexpr size_t kSerialChunk = 1024;
+constexpr uint32_t kSerialTimeoutMs = 3000;
+
 ProtoShadeRuntime* runtime_ = nullptr;
 WebServer server(80);
 const esp_partition_t* partition = nullptr;
@@ -174,61 +180,77 @@ void handleStatus() {
   server.send(200, "application/json", json);
 }
 
-// Streams the upload straight into flash. Nothing is buffered in RAM beyond one sector,
-// because a .bin with a few images in it is bigger than the heap.
+// One chunk of an incoming .bin, wherever it arrived from. Both ways in - the browser over
+// WiFi and the editor over USB - go through here, so the header check, the erase and the
+// sector writes cannot drift apart between them. Returns false once the upload has failed;
+// state.error says why.
+//
+// Nothing is buffered in RAM beyond one sector, because a .bin with a few images in it is
+// bigger than the heap.
+bool feed(const uint8_t* data, size_t len) {
+  if (state.failed) return false;
+  for (size_t i = 0; i < len;) {
+    const size_t take = min(len - i, sizeof(state.sector) - state.inSector);
+    memcpy(state.sector + state.inSector, data + i, take);
+    state.inSector += take;
+    i += take;
+
+    // The header is in the first 48 bytes. Check it before erasing anything, so a garbage
+    // upload cannot wipe a program that works.
+    if (state.declared == 0 && state.written == 0 && state.inSector >= format::kHeaderSize) {
+      const uint8_t* h = state.sector;
+      uint32_t declared = 0;
+      for (int b = 0; b < 4; b++) declared |= uint32_t(h[36 + b]) << (8 * b);
+      if (memcmp(h, format::kMagic, 4) != 0) {
+        state.fail("not a ProtoShade .bin");
+        return false;
+      }
+      if (uint16_t(h[4] | (h[5] << 8)) != format::kVersion) {
+        state.fail("built by a different ProtoShade version");
+        return false;
+      }
+      if (declared < format::kHeaderSize || declared > partition->size) {
+        state.fail("program does not fit the partition");
+        return false;
+      }
+      state.declared = declared;
+
+      // Erase only what this program needs, rounded up to whole sectors. Erasing a
+      // megabyte we are not going to use would cost a second for nothing.
+      const uint32_t span = (declared + 4095) & ~uint32_t(4095);
+      if (esp_partition_erase_range(partition, 0, span) != ESP_OK) {
+        state.fail("flash erase failed");
+        return false;
+      }
+    }
+
+    if (state.inSector == sizeof(state.sector) && !flushSector()) return false;
+  }
+  return true;
+}
+
+// Ready to take a program: the partition is known and nothing is rendering out of it.
+bool beginWrite() {
+  state.reset();
+  if (!partition) {
+    state.fail("no 'protoshade' partition - check partitions.csv");
+    return false;
+  }
+  unmapProgram();  // rendering is about to lose the bytes under it
+  return true;
+}
+
+// Streams the upload straight into flash.
 void handleUploadChunk() {
   HTTPUpload& chunk = server.upload();
 
   if (chunk.status == UPLOAD_FILE_START) {
-    state.reset();
-    if (!partition) {
-      state.fail("no 'protoshade' partition - check partitions.csv");
-      return;
-    }
-    // Rendering is about to lose the bytes under it.
-    unmapProgram();
-    Serial.printf("upload: %s\n", chunk.filename.c_str());
+    if (beginWrite()) Serial.printf("upload: %s\n", chunk.filename.c_str());
     return;
   }
 
-  if (chunk.status == UPLOAD_FILE_WRITE && !state.failed) {
-    for (size_t i = 0; i < chunk.currentSize;) {
-      const size_t take = min(chunk.currentSize - i, sizeof(state.sector) - state.inSector);
-      memcpy(state.sector + state.inSector, chunk.buf + i, take);
-      state.inSector += take;
-      i += take;
-
-      // The header is in the first 48 bytes. Check it before erasing anything, so a garbage
-      // upload cannot wipe a program that works.
-      if (state.declared == 0 && state.written == 0 && state.inSector >= format::kHeaderSize) {
-        const uint8_t* h = state.sector;
-        uint32_t declared = 0;
-        for (int b = 0; b < 4; b++) declared |= uint32_t(h[36 + b]) << (8 * b);
-        if (memcmp(h, format::kMagic, 4) != 0) {
-          state.fail("not a ProtoShade .bin");
-          return;
-        }
-        if (uint16_t(h[4] | (h[5] << 8)) != format::kVersion) {
-          state.fail("built by a different ProtoShade version");
-          return;
-        }
-        if (declared < format::kHeaderSize || declared > partition->size) {
-          state.fail("program does not fit the partition");
-          return;
-        }
-        state.declared = declared;
-
-        // Erase only what this program needs, rounded up to whole sectors. Erasing a
-        // megabyte we are not going to use would cost a second for nothing.
-        const uint32_t span = (declared + 4095) & ~uint32_t(4095);
-        if (esp_partition_erase_range(partition, 0, span) != ESP_OK) {
-          state.fail("flash erase failed");
-          return;
-        }
-      }
-
-      if (state.inSector == sizeof(state.sector) && !flushSector()) return;
-    }
+  if (chunk.status == UPLOAD_FILE_WRITE) {
+    feed(chunk.buf, chunk.currentSize);
     return;
   }
 
@@ -263,6 +285,79 @@ void handleUploadDone() {
                   " images, " + runtime_->sensorCount() + " sensor slots.");
 }
 }  // namespace
+
+// Takes a .bin over the USB port the head already logs on, so a computer with no WiFi -
+// or nobody who wants to join an access point to change a face - can flash it with the
+// cable that is already plugged in.
+//
+//   host -> head:  0x02 "PSUP" length_u32_le, then the bytes
+//   head -> host:  "psflash ready <n>", one "psflash ack <n>" per chunk consumed,
+//                  then "psflash done ..." or "psflash error ...", as lines in the log
+//
+// The ack is flow control, not politeness: writing a sector takes tens of milliseconds and
+// the USB receive buffer is a few hundred bytes, so the host has to be told when to send
+// more. It also means a transfer that dies halfway stops rather than silently truncating.
+//
+// The sketch calls this with rendering stopped; the erase takes the flash cache down with
+// it and the VM would be reading the bytes being erased.
+bool receiveOverSerial(ProtoShadeRuntime& runtime) {
+  runtime_ = &runtime;
+  if (!partition) {
+    partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, kPartitionLabel);
+  }
+
+  Serial.setTimeout(kSerialTimeoutMs);
+  uint8_t head[8];
+  if (Serial.readBytes(head, sizeof(head)) != sizeof(head) || memcmp(head, "PSUP", 4) != 0) {
+    Serial.println("psflash error - no PSUP header, nothing was touched");
+    return false;
+  }
+  uint32_t declared = 0;
+  for (int i = 0; i < 4; i++) declared |= uint32_t(head[4 + i]) << (8 * i);
+
+  last_failed = true;  // until it is not
+  if (!beginWrite()) {
+    Serial.printf("psflash error - %s\n", state.error);
+    return false;
+  }
+  if (declared < format::kHeaderSize || declared > partition->size) {
+    Serial.println("psflash error - that length does not fit the partition");
+    loadProgram();
+    return false;
+  }
+  Serial.printf("psflash ready %lu\n", (unsigned long)declared);
+
+  uint8_t chunk[kSerialChunk];
+  uint32_t received = 0;
+  while (received < declared) {
+    const size_t want = min(size_t(declared - received), sizeof(chunk));
+    if (Serial.readBytes(chunk, want) != want) {
+      state.fail("the transfer stopped halfway");
+      break;
+    }
+    if (!feed(chunk, want)) break;
+    received += want;
+    // After the write, not before: this is what tells the host the head is ready for more.
+    Serial.printf("psflash ack %lu\n", (unsigned long)received);
+  }
+
+  if (!state.failed) flushSector();
+  if (state.failed) {
+    Serial.printf("psflash error - %s\n", state.error);
+    loadProgram();  // whatever was there before, if the erase never happened
+    return false;
+  }
+  if (!loadProgram()) {
+    Serial.printf("psflash error - stored, but the runtime refused it (status %d)\n",
+                  int(runtime_->status()));
+    return false;
+  }
+  last_failed = false;
+  Serial.printf("psflash done %lu bytes, %u instructions, %u images, %u sensor slots\n",
+                (unsigned long)declared, runtime_->instructionCount(), runtime_->assetCount(),
+                runtime_->sensorCount());
+  return true;
+}
 
 bool loadProgramFromFlash(ProtoShadeRuntime& runtime) {
   runtime_ = &runtime;

@@ -182,11 +182,20 @@ void streamFrame(const Pixel* canvas) {
 // Typing u on the serial monitor does the same thing, window or not. A button is one wire
 // and one pin number away from not working; this path has neither, so it is also the answer
 // for a head that has no button on it yet.
-bool uploadRequestedOverSerial() {
-  bool asked = false;
+enum class Request : uint8_t { None, UploadMode, Flash };
+
+// 0x02 rather than a letter: this port is shared with a person typing at a serial monitor,
+// and every printable character is either a command already or one someone might send by
+// accident. Nothing else is read here - the rest of the handshake belongs to
+// upload::receiveOverSerial(), and is still sitting in the receive buffer for it.
+constexpr uint8_t kFlashRequest = 0x02;
+
+Request serialRequest() {
+  Request asked = Request::None;
   while (Serial.available() > 0) {
     const int c = Serial.read();
-    if (c == 'u' || c == 'U') asked = true;
+    if (c == kFlashRequest) return Request::Flash;
+    if (c == 'u' || c == 'U') asked = Request::UploadMode;
     if (c == 'p' || c == 'P') {
       streaming = !streaming;
       Serial.printf("pixel stream %s\n", streaming ? "on" : "off");
@@ -335,6 +344,25 @@ void enterUploadMode() {
   }
 }
 
+// Flashing over USB, which is upload mode's job without any of upload mode: no WiFi, no
+// access point, no browser, and the face is back a second later. The editor drives it over
+// the cable it already uses to mirror the head.
+void flashOverSerial() {
+  Serial.println("flashing over USB: the face pauses while flash is written");
+  // Both for the same reason: erasing flash takes the cache down with it, and neither the
+  // VM nor an interrupt handler may be reading out of flash while that happens.
+  disarmButton();
+  pusher.wait();
+  setLed(LedState::Upload, "taking a .bin over USB");
+
+  upload::receiveOverSerial(runtime);
+
+  // The transfer is not a frame, and averaging it into the frame time would report a face
+  // running at 0.4 fps for the next two seconds.
+  stats = Stats{};
+  stats.since = millis();
+}
+
 // A slow blue pulse across every panel, so you can see from the other side of the room that
 // the head is waiting for a file rather than rendering a face. The VM is deliberately not
 // running here: upload mode erases the bytes it would be reading.
@@ -391,7 +419,8 @@ void setup() {
   // The time, because the light is red for all of it: if the head sits red for seconds on
   // end, this line and the one from the first frame say which half of the boot ate them.
   Serial.printf("face running at %ux%u, setup took %lu ms. Press the button within %lu s for\n"
-                "upload mode, or type u here at any time, or p to mirror the canvas.\n",
+                "upload mode, or type u here at any time, p to mirror the canvas, or flash it\n"
+                "straight over USB from the editor.\n",
                 CANVAS_W, CANVAS_H, (unsigned long)millis(),
                 (unsigned long)(UPLOAD_WINDOW_MS / 1000));
 }
@@ -408,9 +437,15 @@ void loop() {
     return;
   }
 
-  if (uploadRequestedOverSerial()) {
-    enterUploadMode();
-    return;
+  switch (serialRequest()) {
+    case Request::UploadMode:
+      enterUploadMode();
+      return;
+    case Request::Flash:
+      flashOverSerial();
+      return;
+    case Request::None:
+      break;
   }
 
   // The window is measured from boot. Past it the button does nothing at all, which is the

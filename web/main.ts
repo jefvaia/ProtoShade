@@ -28,6 +28,7 @@ const hint = el<HTMLElement>("hint");
 const binInfo = el<HTMLElement>("bin-info");
 const mirrorInfo = el<HTMLElement>("mirror-info");
 const mirrorButton = el<HTMLButtonElement>("mirror");
+const flashButton = el<HTMLButtonElement>("flash");
 
 // The 3D view of the panels. It reads the same canvas the flat preview draws, so it follows
 // the interpreter and the mirrored head without caring which one produced the frame.
@@ -249,9 +250,28 @@ function mirrorStatus(text: string): void {
 }
 
 if (!serialSupported()) {
-  mirrorButton.disabled = true;
-  mirrorButton.title = "Web Serial needs Chrome or Edge on the desktop";
-  mirrorButton.classList.add("opacity-40");
+  for (const button of [mirrorButton, flashButton]) {
+    button.disabled = true;
+    button.title = "Web Serial needs Chrome or Edge on the desktop";
+    button.classList.add("opacity-40");
+  }
+}
+
+/** Opens the port, if it is not open already. Mirroring and flashing share the one cable. */
+async function openLink(): Promise<void> {
+  if (link.connected) return;
+  await link.connect(
+    (frame) => {
+      deviceFrame = frame;
+      deviceAt = performance.now();
+      deviceFrames++;
+    },
+    (why) => {
+      deviceFrame = null;
+      mirrorButton.textContent = "mirror head";
+      mirrorStatus(why === "disconnected" ? "" : why);
+    },
+  );
 }
 
 mirrorButton.onclick = async () => {
@@ -264,24 +284,39 @@ mirrorButton.onclick = async () => {
     return;
   }
   try {
-    await link.connect(
-      (frame) => {
-        deviceFrame = frame;
-        deviceAt = performance.now();
-        deviceFrames++;
-      },
-      (why) => {
-        deviceFrame = null;
-        mirrorButton.textContent = "mirror head";
-        mirrorStatus(why === "disconnected" ? "" : why);
-      },
-    );
+    await openLink();
     mirrorButton.textContent = "stop mirroring";
     mirrorStatus("connected, waiting for frames...");
     await link.send("p"); // same command the serial monitor takes
   } catch (err) {
     // Includes the user simply closing the port picker, which is not worth shouting about.
     mirrorStatus(String(err).replace(/^Error:\s*/, ""));
+  }
+};
+
+// Flashing over the cable, in place of joining the head's access point - which is the only
+// way in on a computer with no WiFi. The head pauses the face, writes the .bin into its
+// flash partition and starts running it; the whole trip is a second or two.
+flashButton.onclick = async () => {
+  if (!current) {
+    mirrorStatus("nothing to flash - the graph does not compile");
+    return;
+  }
+  const bin = pack(current);
+  flashButton.disabled = true;
+  const label = flashButton.textContent;
+  try {
+    await openLink();
+    flashButton.textContent = "flashing...";
+    const summary = await link.flash(bin, (sent, total) => {
+      flashButton.textContent = `flashing ${Math.round((100 * sent) / total)}%`;
+    });
+    mirrorStatus(`flashed over USB: ${summary}`);
+  } catch (err) {
+    mirrorStatus(String(err).replace(/^Error:\s*/, ""));
+  } finally {
+    flashButton.textContent = label;
+    flashButton.disabled = false;
   }
 };
 

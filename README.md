@@ -280,7 +280,7 @@ render into a;      // a is free: submit(b) did not return until its push finish
 
 ### Upload mode
 
-**Two ways in.** Press the button within 60 seconds of power-on - `BUTTON_PIN` in
+**Three ways in.** Press the button within 60 seconds of power-on - `BUTTON_PIN` in
 `head_config.h`, GPIO 0 (the BOOT button) by default - holding it for a moment, since a
 contact bounce is ignored on purpose.
 
@@ -295,6 +295,9 @@ while resetting puts the chip in its ROM download mode, which is a different thi
 
 Or **type `u` in the serial monitor**, any time, window or not. No button, no wiring, no
 window to miss. Use this one when the button is not behaving.
+
+Or skip upload mode entirely and **flash over USB from the editor** - see below. That one
+needs no WiFi at either end.
 
 The serial log says which of those is failing:
 
@@ -369,6 +372,38 @@ stalling the face.
 Web Serial is Chrome or Edge on the desktop, over https or localhost; elsewhere the button
 is disabled and says why. **Only one program can hold the port** - close the Arduino Serial
 Monitor first, and disconnect here before flashing.
+
+### Flashing over USB
+
+**flash over USB** in the header writes the `.bin` straight into the head's flash partition
+over the cable that is already there. No access point to join, no browser hop, no WiFi at
+either end - which is the only way in on a desktop that has no radio in it. The face pauses,
+the partition is written, and the head is running the new program a second or two later.
+
+```
+host -> head:  0x02 "PSUP" length_u32_le, then the bytes
+head -> host:  "psflash ready <n>", one "psflash ack <n>" per chunk, then
+               "psflash done ..." or "psflash error ..."
+```
+
+The ack is flow control, not politeness: writing a sector takes tens of milliseconds and the
+device's receive buffer is a few hundred bytes, so the head has to say when it is ready for
+more. One chunk is in flight at a time, and a transfer that dies halfway stops instead of
+quietly storing a truncated program.
+
+The trigger byte is `0x02` rather than a letter because a person typing in a serial monitor
+shares this port, and every printable character is either a command already or one someone
+could send by accident. Everything after it is read by `upload::receiveOverSerial()`, which
+is also where the protocol is written down.
+
+The head checks the header *before* erasing anything, exactly as the web upload does - both
+go through the same `feed()` - so a bad file cannot wipe a face that works. Rendering stops
+first: erasing flash takes the cache down with it, and the VM reads the program straight out
+of the mapped partition. The button interrupt is detached for the same reason.
+
+`test/serial.test.mjs` drives the whole exchange against a fake port: the magic and the
+length, one chunk in flight at a time, the tail chunk, and a head that refuses mid-transfer
+surfacing as a refusal rather than a stall.
 
 ### The status LED
 
@@ -451,7 +486,7 @@ g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
   - it catches our own typos, collisions and signatures. It also compiles
   `ProtoShadeParallel.cpp`, which is `#if`-guarded to ESP32 and invisible to every other
   check here. Compiled as `gnu++11`, the older core's standard, because it is the stricter one.
-- `test/serial.test.mjs` - the frame parser, against text mixed into the stream, a magic
+- `test/serial.test.mjs` - the frame parser and the USB flash protocol: text mixed into the stream, a magic
   appearing inside a log line, an impossible header, a truncated frame, one byte at a time,
   and **every possible split point** of a two-frame stream. A chunk boundary landing
   mid-header happens once in a thousand reads on real hardware and is trivial to write down

@@ -66,5 +66,7 @@ public:
   int read() { return -1; }
   size_t write(const uint8_t*, size_t) { return 0; }
   size_t write(uint8_t) { return 0; }
+  void setTimeout(unsigned long) {}
+  size_t readBytes(uint8_t*, size_t) { return 0; }
 };
 extern SerialStub Serial;

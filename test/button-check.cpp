@@ -59,6 +59,7 @@ void PanelPusher::wait() {}
 namespace upload {
 bool loadProgramFromFlash(ProtoShadeRuntime&) { return false; }
 bool begin(ProtoShadeRuntime&, const char*, const char*) { return true; }
+bool receiveOverSerial(ProtoShadeRuntime&) { return true; }
 void handle() {}
 bool lastUploadFailed() { return false; }
 }  // namespace upload

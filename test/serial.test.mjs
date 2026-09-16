@@ -19,10 +19,13 @@ import * as esbuild from "esbuild";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const work = mkdtempSync(join(tmpdir(), "protoshade-"));
 const entry = join(work, "entry.ts");
-writeFileSync(entry, `export { FrameParser, FRAME_HEADER } from ${JSON.stringify(join(root, "web/serial.ts"))};\n`);
+writeFileSync(
+  entry,
+  `export { FrameParser, FRAME_HEADER, FLASH_CHUNK, flashHeader, DeviceLink } from ${JSON.stringify(join(root, "web/serial.ts"))};\n`,
+);
 const bundle = join(work, "bundle.mjs");
 await esbuild.build({ entryPoints: [entry], outfile: bundle, bundle: true, format: "esm", logLevel: "warning" });
-const { FrameParser, FRAME_HEADER } = await import(pathToFileURL(bundle));
+const { FrameParser, FRAME_HEADER, FLASH_CHUNK, flashHeader, DeviceLink } = await import(pathToFileURL(bundle));
 
 const text = (s) => new TextEncoder().encode(s);
 
@@ -133,6 +136,131 @@ const concat = (...parts) => {
   const got = p.push(frame(2, 2, 12));
   assert.equal(got.length, 1, "still finds a frame after a megabyte of logs");
   assert.equal(got[0].rgb[0], 12);
+}
+
+// --- the log comes back out, frames and all ---------------------------------
+{
+  const p = new FrameParser();
+  p.push(text("psflash ready 96\n"));
+  p.push(frame(2, 2, 3));
+  p.push(text("psflash ack 1024\n"));
+  assert.equal(p.takeText(), "psflash ready 96\npsflash ack 1024\n", "the frame is not in the log");
+  assert.equal(p.takeText(), "", "and it is handed over only once");
+}
+
+// --- flashing a .bin over the cable -----------------------------------------
+//
+// The head writes this into flash on hardware strapped to someone's face, so the framing is
+// worth holding down: the right magic, the right length, one chunk in flight at a time, and
+// a refusal that surfaces as a refusal instead of a timeout. A fake port is the only way to
+// see any of that without a board.
+{
+  const head = flashHeader(0x01020304);
+  assert.deepEqual([...head.slice(0, 5)], [0x02, 0x50, 0x53, 0x55, 0x50], "0x02 then PSUP");
+  assert.deepEqual([...head.slice(5)], [0x04, 0x03, 0x02, 0x01], "length, little endian");
+}
+
+/** A port that answers like the sketch does: ready, an ack per chunk, then done. */
+function fakePort({ refuseAt = -1 } = {}) {
+  const written = [];
+  let emit = null;
+  const say = (line) => emit?.(text(line + "\n"));
+  let chunks = 0;
+  let received = 0;
+  let declared = 0;
+  return {
+    written,
+    opened: false,
+    async open() {
+      this.opened = true;
+    },
+    async close() {},
+    readable: {
+      getReader() {
+        const queue = [];
+        let wake = null;
+        emit = (bytes) => {
+          queue.push(bytes);
+          wake?.();
+          wake = null;
+        };
+        return {
+          async read() {
+            if (queue.length === 0) await new Promise((resolve) => (wake = resolve));
+            return { value: queue.shift(), done: false };
+          },
+          releaseLock() {},
+          async cancel() {},
+        };
+      },
+    },
+    writable: {
+      getWriter() {
+        return {
+          async write(bytes) {
+            written.push(bytes);
+            if (bytes.length === 9 && bytes[0] === 0x02) {
+              declared = new DataView(bytes.buffer, bytes.byteOffset).getUint32(5, true);
+              say("psflash ready " + declared);
+              return;
+            }
+            if (chunks++ === refuseAt) {
+              say("psflash error - flash write failed");
+              return;
+            }
+            received += bytes.length;
+            say("psflash ack " + received);
+            // The sketch says this once the last byte is in, and then goes quiet.
+            if (received === declared) say(`psflash done ${declared} bytes, 6 instructions, 0 images, 0 sensor slots`);
+          },
+          releaseLock() {},
+        };
+      },
+    },
+  };
+}
+
+async function withFakeSerial(port, run) {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", {
+    value: { serial: { async requestPort() { return port; } } },
+    configurable: true,
+  });
+  try {
+    return await run();
+  } finally {
+    if (original) Object.defineProperty(globalThis, "navigator", original);
+  }
+}
+
+{
+  const port = fakePort();
+  const bin = new Uint8Array(FLASH_CHUNK * 2 + 17).map((_, i) => i & 0xff);
+  const progress = [];
+  const summary = await withFakeSerial(port, async () => {
+    const link = new DeviceLink();
+    await link.connect(() => {}, () => {});
+    return link.flash(bin, (sent, total) => progress.push([sent, total]));
+  });
+  assert.equal(summary, `${bin.length} bytes, 6 instructions, 0 images, 0 sensor slots`);
+  assert.deepEqual(progress, [[FLASH_CHUNK, bin.length], [FLASH_CHUNK * 2, bin.length], [bin.length, bin.length]]);
+  // Header, then one write per chunk - never two in flight, and the tail is short.
+  assert.equal(port.written.length, 4);
+  assert.equal(port.written[1].length, FLASH_CHUNK);
+  assert.equal(port.written[3].length, 17);
+  assert.equal(port.written[3][0], bin[FLASH_CHUNK * 2], "the tail is the tail of the file");
+}
+
+// A head that refuses mid-transfer must surface as an error, not as a stall.
+{
+  const port = fakePort({ refuseAt: 1 });
+  const failed = await withFakeSerial(port, async () => {
+    const link = new DeviceLink();
+    await link.connect(() => {}, () => {});
+    return link.flash(new Uint8Array(FLASH_CHUNK * 3)).then(() => null, (err) => String(err));
+  });
+  assert.match(failed, /the head refused it: flash write failed/);
+  assert.equal(port.written.length, 3, "it stopped sending rather than finishing the file");
 }
 
 console.log("serial: ok");
