@@ -21,7 +21,7 @@ using namespace protoshade;
 // rectangles out of it. Canvas area no panel reads is rendered and thrown away - that
 // costs time but nothing else, so size this to the face, not to the biggest panel.
 
-constexpr uint16_t CANVAS_W = 128;
+constexpr uint16_t CANVAS_W = 64;
 constexpr uint16_t CANVAS_H = 32;
 
 // ---------------------------------------------------------------------------
