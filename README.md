@@ -155,6 +155,47 @@ The graph autosaves to `localStorage` (uploads included) and reloads with the pa
 
 `examples/ProtoShadeHead` is the whole thing: boot, face, upload mode, panel mapping.
 
+### Compiling it in the Arduino IDE
+
+`#include <ProtoShadeParallel.h>` searches Arduino's **libraries** folder, not the folder
+the sketch happens to sit in. Cloning the repo into your sketchbook is not enough - the IDE
+has to see this repository *as a library*, which it already is (`library.properties` plus
+`src/` at the root). Pick one:
+
+**Junction (best while developing)** - the repo stays where it is, git and all, and the IDE
+follows a link to it. In a Windows terminal, with the repo at `Documents\Arduino\protoshade`:
+
+```
+mklink /J "%USERPROFILE%\Documents\Arduino\libraries\ProtoShade" "%USERPROFILE%\Documents\Arduino\protoshade"
+```
+
+macOS/Linux: `ln -s ~/Documents/Arduino/protoshade ~/Documents/Arduino/libraries/ProtoShade`
+
+**Or move it**: put the repo at `Documents/Arduino/libraries/ProtoShade` outright.
+
+**Or zip it**: Sketch ▸ Include Library ▸ Add .ZIP Library, pointing at a zip of the repo
+root. Fine for using it, annoying for editing it - you reinstall on every change.
+
+Restart the IDE. The examples then show up under File ▸ Examples ▸ ProtoShade-Runtime, and
+that is the copy to open - opening the `.ino` by path works too, once the library is visible.
+
+Then in **Tools**:
+
+| Setting | Value |
+| --- | --- |
+| Board | ESP32S3 Dev Module |
+| Flash Size | **8MB** - `partitions.csv` is laid out for 8 MB and the upload fails if the table does not fit |
+| Partition Scheme | **Custom** - it uses the `partitions.csv` sitting next to the `.ino` |
+| PSRAM | whatever your board has; the framebuffers are small and stay in internal SRAM |
+
+If your board is 4 or 16 MB, edit the offsets in `partitions.csv` to match - the comment at
+the top of that file says which two partitions matter and why.
+
+Serving the editor off the head also needs `examples/ProtoShadeHead/data/` (from
+`npm run build:device`) uploaded to LittleFS, which IDE 2.x needs the
+`arduino-littlefs-upload` extension for. Skip it entirely and `/upload` still works - that
+page is built into the sketch.
+
 ### Boot
 
 The face starts rendering **immediately**. For the first 60 seconds the button is armed -

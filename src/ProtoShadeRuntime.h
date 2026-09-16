@@ -49,9 +49,12 @@ struct Asset {
 // They live in Frame rather than being read inside sample() because two cores render one
 // frame at the same time. A reading that changed halfway through would put a different
 // value in the top half of the face than the bottom, and you would see the seam.
+// Plain members, no default initialisers: that keeps it an aggregate under -std=gnu++11,
+// which the ESP32 Arduino core 2.x still compiles with, so Sensors{values, count} works
+// there too. Fields you leave out of the braces are zero-initialised.
 struct Sensors {
-  const float* values = nullptr;
-  uint8_t count = 0;
+  const float* values;
+  uint8_t count;
 };
 
 // Per-frame values, computed once and shared read-only by every core rendering that frame.

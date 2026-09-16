@@ -37,17 +37,21 @@ public:
 // How a panel is mounted relative to the canvas, clockwise.
 enum class Orient : uint8_t { Normal = 0, Rotate90, Rotate180, Rotate270 };
 
+// Plain members, no default initialisers: that keeps it an aggregate under -std=gnu++11,
+// which the ESP32 Arduino core 2.x still compiles with, so the Panel{...} lists in
+// head_config.h work there too. Fields left out of the braces are zero-initialised, which
+// is Orient::Normal and no mirroring.
 struct Panel {
-  Display* display = nullptr;
-  uint16_t src_x = 0;   // top-left of the rectangle this panel reads from the canvas
-  uint16_t src_y = 0;
-  uint16_t width = 0;   // the panel's own resolution, after rotation
-  uint16_t height = 0;
-  Orient orient = Orient::Normal;
+  Display* display;
+  uint16_t src_x;   // top-left of the rectangle this panel reads from the canvas
+  uint16_t src_y;
+  uint16_t width;   // the panel's own resolution, after rotation
+  uint16_t height;
+  Orient orient;
   // Mirroring happens in panel space, before rotation. The usual use is one drawing of half
   // a face feeding a left panel straight and a right panel with mirror_x set.
-  bool mirror_x = false;
-  bool mirror_y = false;
+  bool mirror_x;
+  bool mirror_y;
 
   // How much canvas this panel covers. A quarter turn swaps the two.
   uint16_t sourceWidth() const {
@@ -83,8 +87,8 @@ void pushPanels(const Panel* panels, size_t count, const Pixel* canvas, uint16_t
 // compass, an unbounded count for an encoder. Converting raw ADC counts into that range is
 // this function's job; the shader only ever sees the result.
 struct SensorInput {
-  uint8_t slot = 0;
-  float (*read)() = nullptr;
+  uint8_t slot;
+  float (*read)();
 };
 
 // Fills `values` (length slots) from `inputs`. Slots with no sensor are left at 0, and a
