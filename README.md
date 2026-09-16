@@ -37,7 +37,11 @@ shared mutable state, so two cores can run it at once - per-frame values arrive 
 immutable `Frame`, per-thread scratch as a caller-owned `ExecContext`.
 
 `src/ProtoShadeParallel.{h,cpp}` is the ESP32 half of that: two tasks pinned to core 0 and
-core 1, each rendering half the frame. It is the only non-portable file, `#if`-guarded.
+core 1 each rendering half the frame, plus `PanelPusher`, which sends finished frames to the
+panels from a third task. It is the only non-portable file, `#if`-guarded.
+
+`src/ProtoShadeDisplay.{h,cpp}` maps the rendered canvas onto the panels actually screwed
+into a head - rotation, mirroring, which rectangle goes where - and is portable and tested.
 
 ### The shader VM
 
@@ -102,7 +106,7 @@ Three independent builds, all writing into `dist/`:
 build.bat              # em++: runs test/test.cpp, then emits dist/protoshade.js + .wasm
 npm install
 npm run build          # typecheck + tests + minified dist/index.html, main.js, styles.css
-npm run build:device   # the above, plus examples/ProtoShadeWeb/data/ for the head
+npm run build:device   # the above, plus examples/ProtoShadeHead/data/ for the head
 ```
 
 Serve `dist/` over HTTP (not `file://` - it is an ES module) and open `index.html`.
@@ -135,20 +139,65 @@ component-wise ops), `Mix`, `Alpha Over`, `Separate`/`Combine RGBA`, `HSV`, `Ima
 
 The graph autosaves to `localStorage` (uploads included) and reloads with the page.
 
-## Getting a shader onto the head
+## The head
 
-1. Wire a graph, hit **download .bin**. The sidebar shows what it weighs first.
-2. Flash `examples/ProtoShadeWeb` with `partitions.csv` selected as a custom partition
-   scheme. It carves out a 1 MB `protoshade` data partition for the program.
-3. Join the head's WiFi (an access point called `ProtoShade` by default) and open
-   **http://192.168.4.1/upload**.
-4. Pick the `.bin`. The sketch validates the header *before* erasing anything, streams it
-   into flash a sector at a time, then maps and loads it - so a bad upload cannot wipe a
-   program that works. It survives power loss because it is in flash, not RAM.
+`examples/ProtoShadeHead` is the whole thing: boot, face, upload mode, panel mapping.
+
+### Boot
+
+The face starts rendering **immediately**. For the first 60 seconds the button is armed -
+press it and the head switches to upload mode instead. After the window it is ignored, so a
+knock mid-con cannot drop your face into an access point.
+
+Deliberately not a 60-second wait before anything lights up: a dark visor for a minute on
+every power-up is the wrong trade. If you want the hard wait, move the check into `setup()`.
+
+### Program mode (the face)
+
+Three tasks. `ParallelRenderer` renders the top half of the frame on core 0 and the bottom
+on core 1; `PanelPusher` sends the finished frame to the panels from its own task, so the
+next frame renders while the last one is still going out. Two canvases alternate between
+them and that is the entire synchronisation - no lock in the render path:
+
+```cpp
+pusher.submit(a);   // returns as soon as the push task takes it
+render into b;      // overlaps the push of a
+pusher.submit(b);   // waits out a's push, then hands over b
+render into a;      // a is free: submit(b) did not return until its push finished
+```
+
+### Upload mode
+
+WiFi comes up as an access point (`ProtoShade`), the panels show a slow blue pulse so you
+can see what mode the head is in from across the room, and the VM stops - upload mode erases
+the bytes it would be reading. Open **http://192.168.4.1/upload**, pick the `.bin`.
+
+The sketch validates the header *before* erasing anything, so a garbage upload cannot wipe a
+program that works, then streams it into flash a sector at a time and loads it. It survives
+power loss because it is in flash, not RAM.
 
 `npm run build:device` also puts the whole editor (gzipped, 133 KB) into
-`examples/ProtoShadeWeb/data/` for the LittleFS partition, so the head can serve the editor
+`examples/ProtoShadeHead/data/` for the LittleFS partition, so the head serves the editor
 itself at `http://192.168.4.1/` with no computer involved. Skip it and `/upload` still works.
+
+### Wiring a head: `head_config.h`
+
+One file per head, and `ProtoShadeHead.ino` never changes. It holds five things:
+
+1. **The canvas** - the whole face as one drawing, at the resolution you author at.
+2. **The button** - pin, polarity, how long the window stays open.
+3. **The display drivers** - one `Display` subclass per panel type. A `SerialDisplay` that
+   needs no hardware is included; HUB75-over-DMA and WS2812 sketches are in the comments.
+   The library depends on no driver library, and neither does the sketch until you pick one.
+4. **The map** - which rectangle of the canvas each panel shows, and how it is mounted
+   (`Orient` quarter turns, `mirror_x`, `mirror_y`). Two panels may read the *same*
+   rectangle: that is how one drawing feeds both sides of a face, mirrored. Canvas no panel
+   reads is simply never displayed - nothing has to be masked off - and a panel mapped past
+   the edge shows black there rather than whatever is next to the framebuffer.
+5. **The sensors** - slot number plus a function returning that sensor's value in the range
+   its Sensor node declares. A slot nothing is wired to reads 0; a slot the program wants
+   but this head lacks falls back to the value baked into the `.bin`, so a half-wired head
+   still renders.
 
 ## Tests
 
@@ -165,6 +214,8 @@ g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
   more than 1/255, which is float-vs-double rounding of the last bit. A drifting opcode shows
   up here as a wrong pixel. Needs a host C++ compiler; skips without one.
 - `test/test.cpp` — the runtime: container validation against malformed input, every opcode,
-  the step budget, and that two half-frames equal one whole one.
+  the step budget, that two half-frames equal one whole one, and the panel mapping - every
+  rotation and mirror against a canvas tagged with its own coordinates, because that is what
+  looks fine in a comment and comes out upside down on a head.
 - `test/render.cpp` — renders a `.bin` to raw RGB on stdout. Used by the cross-check, handy
   on its own when a shader looks wrong.

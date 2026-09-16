@@ -1,4 +1,4 @@
-# Partition table for ProtoShadeWeb on an 8 MB ESP32-S3.
+# Partition table for ProtoShadeHead on an 8 MB ESP32-S3.
 #
 # Arduino IDE:   put this file next to the .ino and pick Tools > Partition Scheme > Custom.
 # arduino-cli:   --build-property build.partitions=partitions --build-property

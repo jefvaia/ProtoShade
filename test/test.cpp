@@ -15,6 +15,7 @@
 #include <cstring>
 #include <vector>
 
+#include "../src/ProtoShadeDisplay.h"
 #include "../src/ProtoShadeRuntime.h"
 
 using namespace protoshade;
@@ -480,6 +481,160 @@ void testRowSplitMatchesWholeFrame() {
   assert(guard[0].r == 7);
 }
 
+// ---------------------------------------------------------------------------
+// Panel mapping: the canvas -> physical display step. Rotation and mirroring are the two
+// things that look fine in a comment and come out wrong on a head, so they get a canvas
+// with a known value in every pixel and an exact expected layout.
+// ---------------------------------------------------------------------------
+
+struct RecordingDisplay : Display {
+  std::vector<Pixel> got;
+  uint16_t w = 0, h = 0;
+  int pushes = 0;
+  void push(const Pixel* rgb, uint16_t width, uint16_t height) override {
+    got.assign(rgb, rgb + size_t(width) * height);
+    w = width;
+    h = height;
+    pushes++;
+  }
+};
+
+// Canvas 3x2, every pixel tagged with its own coordinates: red = x, green = y.
+std::vector<Pixel> tagCanvas(uint16_t w, uint16_t h) {
+  std::vector<Pixel> c(size_t(w) * h);
+  for (uint16_t y = 0; y < h; y++) {
+    for (uint16_t x = 0; x < w; x++) c[size_t(y) * w + x] = Pixel{uint8_t(x), uint8_t(y), 9};
+  }
+  return c;
+}
+
+bool at(const RecordingDisplay& d, uint16_t x, uint16_t y, uint8_t cx, uint8_t cy) {
+  const Pixel& p = d.got[size_t(y) * d.w + x];
+  return p.r == cx && p.g == cy;
+}
+
+void testPanelMapping() {
+  const auto canvas = tagCanvas(3, 2);
+  std::vector<Pixel> scratch(64);
+
+  // Straight through: panel pixel (x,y) is canvas pixel (x,y).
+  {
+    RecordingDisplay d;
+    Panel p{&d, 0, 0, 3, 2, Orient::Normal, false, false};
+    pushPanel(p, canvas.data(), 3, 2, scratch.data());
+    assert(d.pushes == 1 && d.w == 3 && d.h == 2);
+    assert(at(d, 0, 0, 0, 0) && at(d, 2, 1, 2, 1));
+  }
+
+  // A rectangle out of the middle: the rest of the canvas is simply never displayed.
+  {
+    RecordingDisplay d;
+    Panel p{&d, 1, 0, 2, 2, Orient::Normal, false, false};
+    pushPanel(p, canvas.data(), 3, 2, scratch.data());
+    assert(d.w == 2 && d.h == 2);
+    assert(at(d, 0, 0, 1, 0) && at(d, 1, 1, 2, 1));
+  }
+
+  // Mirrored: the same drawing feeding the other side of the face.
+  {
+    RecordingDisplay d;
+    Panel p{&d, 0, 0, 3, 2, Orient::Normal, true, false};
+    pushPanel(p, canvas.data(), 3, 2, scratch.data());
+    assert(at(d, 0, 0, 2, 0) && at(d, 2, 0, 0, 0));
+  }
+  {
+    RecordingDisplay d;
+    Panel p{&d, 0, 0, 3, 2, Orient::Normal, false, true};
+    pushPanel(p, canvas.data(), 3, 2, scratch.data());
+    assert(at(d, 0, 0, 0, 1) && at(d, 0, 1, 0, 0));
+  }
+
+  // Quarter turn clockwise: a 3x2 piece of canvas lands on a 2x3 panel, and the canvas
+  // top-left corner ends up in the panel's top-right.
+  {
+    RecordingDisplay d;
+    Panel p{&d, 0, 0, 2, 3, Orient::Rotate90, false, false};
+    assert(p.sourceWidth() == 3 && p.sourceHeight() == 2);
+    pushPanel(p, canvas.data(), 3, 2, scratch.data());
+    assert(d.w == 2 && d.h == 3);
+    assert(at(d, 1, 0, 0, 0));  // canvas (0,0) -> panel top-right
+    assert(at(d, 0, 0, 0, 1));  // canvas (0,1) -> panel top-left
+    assert(at(d, 1, 2, 2, 0));  // canvas (2,0) -> panel bottom-right
+  }
+
+  // Three quarter turns is the other way round.
+  {
+    RecordingDisplay d;
+    Panel p{&d, 0, 0, 2, 3, Orient::Rotate270, false, false};
+    pushPanel(p, canvas.data(), 3, 2, scratch.data());
+    assert(at(d, 0, 2, 0, 0));  // canvas (0,0) -> panel bottom-left
+    assert(at(d, 1, 0, 2, 1));
+  }
+
+  // Half turn.
+  {
+    RecordingDisplay d;
+    Panel p{&d, 0, 0, 3, 2, Orient::Rotate180, false, false};
+    pushPanel(p, canvas.data(), 3, 2, scratch.data());
+    assert(at(d, 0, 0, 2, 1) && at(d, 2, 1, 0, 0));
+  }
+
+  // Mapped past the edge: the part that has no canvas under it is black, not garbage.
+  {
+    RecordingDisplay d;
+    Panel p{&d, 2, 1, 3, 2, Orient::Normal, false, false};
+    pushPanel(p, canvas.data(), 3, 2, scratch.data());
+    assert(at(d, 0, 0, 2, 1));
+    const Pixel& off = d.got[1];
+    assert(off.r == 0 && off.g == 0 && off.b == 0);
+  }
+
+  // Two panels reading the same rectangle, one mirrored: one drawing, both sides of a face.
+  {
+    RecordingDisplay left, right;
+    Panel panels[] = {
+        Panel{&left, 0, 0, 3, 2, Orient::Normal, false, false},
+        Panel{&right, 0, 0, 3, 2, Orient::Normal, true, false},
+    };
+    pushPanels(panels, 2, canvas.data(), 3, 2, scratch.data());
+    assert(left.pushes == 1 && right.pushes == 1);
+    assert(at(left, 0, 0, 0, 0) && at(right, 0, 0, 2, 0));
+  }
+
+  // Nothing wired up must not crash: no display, no canvas, zero-sized panel.
+  {
+    RecordingDisplay d;
+    Panel none{nullptr, 0, 0, 3, 2, Orient::Normal, false, false};
+    pushPanel(none, canvas.data(), 3, 2, scratch.data());
+    Panel empty{&d, 0, 0, 0, 0, Orient::Normal, false, false};
+    pushPanel(empty, canvas.data(), 3, 2, scratch.data());
+    Panel p{&d, 0, 0, 3, 2, Orient::Normal, false, false};
+    pushPanel(p, nullptr, 3, 2, scratch.data());
+    pushPanels(nullptr, 3, canvas.data(), 3, 2, scratch.data());
+    assert(d.pushes == 0);
+  }
+}
+
+float kFlex = 0.0f;
+float readFlex() { return kFlex; }
+
+void testSensorReading() {
+  float values[4] = {7, 7, 7, 7};
+  kFlex = 0.75f;
+  const SensorInput inputs[] = {{2, readFlex}, {0, nullptr}};
+  readSensors(inputs, 2, values, 4);
+  assert(values[2] == 0.75f);
+  // Slots with nothing wired to them read 0, not whatever was in the buffer last frame.
+  assert(values[0] == 0.0f && values[1] == 0.0f && values[3] == 0.0f);
+
+  // A slot past the end of the array is a wiring mistake, not a buffer overrun.
+  const SensorInput past[] = {{9, readFlex}};
+  readSensors(past, 1, values, 4);
+  assert(values[0] == 0.0f);
+  readSensors(nullptr, 0, values, 4);
+  readSensors(inputs, 2, nullptr, 4);
+}
+
 }  // namespace
 
 int main() {
@@ -496,5 +651,7 @@ int main() {
   testTexture();
   testStepBudget();
   testRowSplitMatchesWholeFrame();
+  testPanelMapping();
+  testSensorReading();
   std::puts("all asserts passed");
 }

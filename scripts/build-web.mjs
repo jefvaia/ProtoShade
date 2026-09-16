@@ -5,7 +5,7 @@
 //   --no-minify   readable output + JS sourcemap
 //   --watch       rebuild on change, serve dist/ over HTTP, reload the browser
 //   --port <n>    dev server port (default 8000)
-//   --device      also gzip the editor into examples/ProtoShadeWeb/data/ for LittleFS
+//   --device      also gzip the editor into examples/ProtoShadeHead/data/ for LittleFS
 import { spawnSync } from "node:child_process";
 import { gzipSync } from "node:zlib";
 import { createServer } from "node:http";
@@ -167,7 +167,7 @@ function serve() {
 // Content-Encoding: gzip is what the sketch sends; litegraph goes from 491 KB to about 120,
 // which is the difference between fitting comfortably and not.
 function buildDeviceFs() {
-  const data = join(root, "examples", "ProtoShadeWeb", "data");
+  const data = join(root, "examples", "ProtoShadeHead", "data");
   rmSync(data, { recursive: true, force: true });
   let total = 0;
   for (const name of ["index.html", "main.js", "styles.css", join("vendor", "litegraph.min.js")]) {
@@ -179,7 +179,7 @@ function buildDeviceFs() {
     total += gz.length;
     console.log(`  ${name}.gz  ${(statSync(from).size / 1024).toFixed(0)} KB -> ${(gz.length / 1024).toFixed(0)} KB`);
   }
-  console.log(`device filesystem: ${(total / 1024).toFixed(0)} KB in examples/ProtoShadeWeb/data/`);
+  console.log(`device filesystem: ${(total / 1024).toFixed(0)} KB in examples/ProtoShadeHead/data/`);
 }
 
 if (!watch) {

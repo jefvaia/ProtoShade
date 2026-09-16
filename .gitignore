@@ -1,6 +1,6 @@
 # Build output (build.bat, scripts/build-web.mjs)
 dist/
-examples/ProtoShadeWeb/data/
+examples/ProtoShadeHead/data/
 
 # npm
 node_modules/

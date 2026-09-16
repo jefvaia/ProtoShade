@@ -1,4 +1,5 @@
-// ProtoShade-Runtime on an ESP32-S3: load a .bin from flash, render it across both cores.
+// The smallest useful sketch: load a .bin from flash and render it across both cores.
+// No WiFi, no upload, no panel mapping - see examples/ProtoShadeHead for a whole head.
 //
 // The .bin (code + assets, see the format comment in ProtoShadeRuntime.h) lives in its own
 // flash partition, NOT in RTC memory - RTC RAM is 8 KB and loses its contents on power loss.
@@ -38,9 +39,11 @@ bool loadProgramFromFlash() {
   }
 
   // The header's total_length says how long the blob really is; the partition is bigger.
+  // Offset 36, see the layout at the top of ProtoShadeRuntime.h - it moved when the VM
+  // landed, which is exactly why the header carries a format version.
   const uint8_t* bytes = static_cast<const uint8_t*>(data);
   uint32_t declared = 0;
-  for (int i = 0; i < 4; i++) declared |= uint32_t(bytes[28 + i]) << (8 * i);
+  for (int i = 0; i < 4; i++) declared |= uint32_t(bytes[36 + i]) << (8 * i);
   if (declared == 0 || declared > part->size) {
     Serial.println("no program flashed yet");
     return false;
@@ -50,8 +53,9 @@ bool loadProgramFromFlash() {
     Serial.printf("bad program, status %d\n", int(runtime.status()));
     return false;
   }
-  Serial.printf("loaded: %u assets, authored for %ux%u\n", runtime.assetCount(),
-                runtime.programWidthHint(), runtime.programHeightHint());
+  Serial.printf("loaded: %u instructions, %u assets, authored for %ux%u\n",
+                runtime.instructionCount(), runtime.assetCount(), runtime.programWidthHint(),
+                runtime.programHeightHint());
   return true;
 }
 

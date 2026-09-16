@@ -1,62 +1,28 @@
-// The head as a web server: serves the ProtoShade editor, takes a .bin upload, stores it in
-// flash, and renders it across both cores.
-//
-//   http://<device>/          the editor (from LittleFS, if you uploaded the data folder)
-//   http://<device>/upload    upload page, built into this sketch - always there
-//   http://<device>/status    what is loaded right now, as JSON
-//
-// Flashing this needs two things beyond the sketch:
-//
-//   1. partitions.csv next to this file, selected as the custom partition scheme. It carves
-//      out a 1 MB "protoshade" data partition for the .bin and a LittleFS partition for the
-//      editor. Without it there is nowhere to put a program.
-//   2. npm run build:device, which writes examples/ProtoShadeWeb/data/ - the editor,
-//      gzipped. Upload it with the LittleFS uploader plugin or arduino-cli. Skip this and
-//      everything still works, you just use the built-in upload page instead of the editor.
-//
-// The program blob belongs in flash, NOT in RTC memory: RTC RAM is 8 KB and loses its
-// contents on power loss. esp_partition_mmap() maps the partition into the address space, so
-// the images inside a .bin cost no RAM no matter how many you pack.
+#include "upload_mode.h"
 
+#include <Arduino.h>
 #include <LittleFS.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_partition.h>
 
-#include <ProtoShadeParallel.h>
-#include <ProtoShadeRuntime.h>
-
 using namespace protoshade;
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
+namespace upload {
+namespace {
 
-// Leave WIFI_SSID empty to run as an access point instead of joining a network.
-#define WIFI_SSID ""
-#define WIFI_PASSWORD ""
-#define AP_SSID "ProtoShade"
-#define AP_PASSWORD "protogen"  // at least 8 characters, or the AP silently stays open
+constexpr const char* kPartitionLabel = "protoshade";
 
-constexpr uint16_t WIDTH = 64;
-constexpr uint16_t HEIGHT = 32;
-constexpr uint8_t SENSOR_SLOTS = 8;
-constexpr const char* PARTITION_LABEL = "protoshade";
-
-// ---------------------------------------------------------------------------
-
-ProtoShadeRuntime runtime;
-ParallelRenderer renderer;
+ProtoShadeRuntime* runtime_ = nullptr;
 WebServer server(80);
-
-Pixel framebuffer[WIDTH * HEIGHT];
-float sensorValues[SENSOR_SLOTS];
-
 const esp_partition_t* partition = nullptr;
 esp_partition_mmap_handle_t mapping = 0;
 bool mapped = false;
+String address_;
 
 // Upload state. The handler is called chunk by chunk from loop(), never concurrently.
+// Named `state`, not `upload`: a variable with the same name as the enclosing namespace
+// hides it, and then nothing inside here can say upload:: again.
 struct Upload {
   uint8_t sector[4096];
   size_t inSector;
@@ -78,14 +44,14 @@ struct Upload {
     failed = true;
     error = why;
   }
-} upload;
+} state;
 
 // ---------------------------------------------------------------------------
 // Flash
 // ---------------------------------------------------------------------------
 
 void unmapProgram() {
-  runtime.unload();  // stop rendering out of bytes that are about to be erased
+  if (runtime_) runtime_->unload();  // stop rendering out of bytes that are about to be erased
   if (mapped) {
     esp_partition_munmap(mapping);
     mapped = false;
@@ -94,7 +60,8 @@ void unmapProgram() {
 
 // Maps the partition and hands the runtime whatever is in it. Returns false when there is
 // no valid program yet - the runtime then draws its built-in test pattern instead of nothing.
-bool loadProgramFromFlash() {
+bool loadProgram() {
+  if (!runtime_) return false;
   unmapProgram();
   if (!partition) return false;
 
@@ -114,31 +81,31 @@ bool loadProgramFromFlash() {
     return false;
   }
 
-  if (!runtime.load(bytes, declared)) {
-    Serial.printf("bad program, status %d\n", int(runtime.status()));
+  if (!runtime_->load(bytes, declared)) {
+    Serial.printf("bad program, status %d\n", int(runtime_->status()));
     return false;
   }
   Serial.printf("loaded: %u instructions, %u assets, %u sensor slots, authored for %ux%u\n",
-                runtime.instructionCount(), runtime.assetCount(), runtime.sensorCount(),
-                runtime.programWidthHint(), runtime.programHeightHint());
+                runtime_->instructionCount(), runtime_->assetCount(), runtime_->sensorCount(),
+                runtime_->programWidthHint(), runtime_->programHeightHint());
   return true;
 }
 
 // Writes one 4096-byte sector. Flash wants whole sectors, and an upload arrives in chunks of
 // whatever size the browser felt like, so everything goes through this.
 bool flushSector() {
-  if (upload.inSector == 0) return true;
+  if (state.inSector == 0) return true;
   // Pad the tail: the region is erased to 0xFF anyway, and total_length says where the
   // program really ends.
-  memset(upload.sector + upload.inSector, 0xFF, sizeof(upload.sector) - upload.inSector);
-  const esp_err_t err = esp_partition_write(partition, upload.written, upload.sector, sizeof(upload.sector));
+  memset(state.sector + state.inSector, 0xFF, sizeof(state.sector) - state.inSector);
+  const esp_err_t err = esp_partition_write(partition, state.written, state.sector, sizeof(state.sector));
   if (err != ESP_OK) {
-    upload.failed = true;
-    upload.error = "flash write failed";
+    state.failed = true;
+    state.error = "flash write failed";
     return false;
   }
-  upload.written += sizeof(upload.sector);
-  upload.inSector = 0;
+  state.written += sizeof(state.sector);
+  state.inSector = 0;
   return true;
 }
 
@@ -189,12 +156,12 @@ bool serveFromFs(String path) {
 }
 
 void handleStatus() {
-  String json = "{\"status\":" + String(int(runtime.status()));
-  json += ",\"loaded\":" + String(runtime.hasProgram() ? "true" : "false");
-  json += ",\"instructions\":" + String(runtime.instructionCount());
-  json += ",\"assets\":" + String(runtime.assetCount());
-  json += ",\"sensors\":" + String(runtime.sensorCount());
-  json += ",\"width\":" + String(runtime.width()) + ",\"height\":" + String(runtime.height());
+  String json = "{\"status\":" + String(int(runtime_->status()));
+  json += ",\"loaded\":" + String(runtime_->hasProgram() ? "true" : "false");
+  json += ",\"instructions\":" + String(runtime_->instructionCount());
+  json += ",\"assets\":" + String(runtime_->assetCount());
+  json += ",\"sensors\":" + String(runtime_->sensorCount());
+  json += ",\"width\":" + String(runtime_->width()) + ",\"height\":" + String(runtime_->height());
   json += ",\"partition\":" + String(partition ? partition->size : 0) + "}";
   server.send(200, "application/json", json);
 }
@@ -205,9 +172,9 @@ void handleUploadChunk() {
   HTTPUpload& chunk = server.upload();
 
   if (chunk.status == UPLOAD_FILE_START) {
-    upload.reset();
+    state.reset();
     if (!partition) {
-      upload.fail("no 'protoshade' partition - check partitions.csv");
+      state.fail("no 'protoshade' partition - check partitions.csv");
       return;
     }
     // Rendering is about to lose the bytes under it.
@@ -216,121 +183,100 @@ void handleUploadChunk() {
     return;
   }
 
-  if (chunk.status == UPLOAD_FILE_WRITE && !upload.failed) {
+  if (chunk.status == UPLOAD_FILE_WRITE && !state.failed) {
     for (size_t i = 0; i < chunk.currentSize;) {
-      const size_t take = min(chunk.currentSize - i, sizeof(upload.sector) - upload.inSector);
-      memcpy(upload.sector + upload.inSector, chunk.buf + i, take);
-      upload.inSector += take;
+      const size_t take = min(chunk.currentSize - i, sizeof(state.sector) - state.inSector);
+      memcpy(state.sector + state.inSector, chunk.buf + i, take);
+      state.inSector += take;
       i += take;
 
       // The header is in the first 48 bytes. Check it before erasing anything, so a garbage
       // upload cannot wipe a program that works.
-      if (upload.declared == 0 && upload.written == 0 && upload.inSector >= format::kHeaderSize) {
-        const uint8_t* h = upload.sector;
+      if (state.declared == 0 && state.written == 0 && state.inSector >= format::kHeaderSize) {
+        const uint8_t* h = state.sector;
         uint32_t declared = 0;
         for (int b = 0; b < 4; b++) declared |= uint32_t(h[36 + b]) << (8 * b);
         if (memcmp(h, format::kMagic, 4) != 0) {
-          upload.fail("not a ProtoShade .bin");
+          state.fail("not a ProtoShade .bin");
           return;
         }
         if (uint16_t(h[4] | (h[5] << 8)) != format::kVersion) {
-          upload.fail("built by a different ProtoShade version");
+          state.fail("built by a different ProtoShade version");
           return;
         }
         if (declared < format::kHeaderSize || declared > partition->size) {
-          upload.fail("program does not fit the partition");
+          state.fail("program does not fit the partition");
           return;
         }
-        upload.declared = declared;
+        state.declared = declared;
 
         // Erase only what this program needs, rounded up to whole sectors. Erasing a
         // megabyte we are not going to use would cost a second for nothing.
         const uint32_t span = (declared + 4095) & ~uint32_t(4095);
         if (esp_partition_erase_range(partition, 0, span) != ESP_OK) {
-          upload.fail("flash erase failed");
+          state.fail("flash erase failed");
           return;
         }
       }
 
-      if (upload.inSector == sizeof(upload.sector) && !flushSector()) return;
+      if (state.inSector == sizeof(state.sector) && !flushSector()) return;
     }
     return;
   }
 
-  if (chunk.status == UPLOAD_FILE_END && !upload.failed) {
+  if (chunk.status == UPLOAD_FILE_END && !state.failed) {
     flushSector();
   }
 }
 
 void handleUploadDone() {
-  if (upload.failed) {
-    server.send(400, "text/plain", String("upload rejected: ") + upload.error);
-    loadProgramFromFlash();  // whatever was there before, if the erase never happened
+  if (state.failed) {
+    server.send(400, "text/plain", String("upload rejected: ") + state.error);
+    loadProgram();  // whatever was there before, if the erase never happened
     return;
   }
-  if (upload.declared == 0) {
+  if (state.declared == 0) {
     server.send(400, "text/plain", "upload rejected: file is too short to be a .bin");
-    loadProgramFromFlash();
+    loadProgram();
     return;
   }
 
-  if (!loadProgramFromFlash()) {
+  if (!loadProgram()) {
     server.send(400, "text/plain",
-                String("stored, but the runtime refused it (status ") + int(runtime.status()) +
+                String("stored, but the runtime refused it (status ") + int(runtime_->status()) +
                     "). The head is showing its test pattern.");
     return;
   }
   server.send(200, "text/plain",
-              String("ok - ") + upload.declared + " bytes stored and running: " +
-                  runtime.instructionCount() + " instructions, " + runtime.assetCount() +
-                  " images, " + runtime.sensorCount() + " sensor slots.");
+              String("ok - ") + state.declared + " bytes stored and running: " +
+                  runtime_->instructionCount() + " instructions, " + runtime_->assetCount() +
+                  " images, " + runtime_->sensorCount() + " sensor slots.");
+}
+}  // namespace
+
+bool loadProgramFromFlash(ProtoShadeRuntime& runtime) {
+  runtime_ = &runtime;
+  if (!partition) {
+    partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, kPartitionLabel);
+  }
+  if (!partition) {
+    Serial.println("no 'protoshade' partition in the partition table - check partitions.csv");
+    return false;
+  }
+  return loadProgram();
 }
 
-// ---------------------------------------------------------------------------
-// Sensors
-// ---------------------------------------------------------------------------
-
-// Your hardware goes here. Fill the slots the Sensor nodes in the editor point at, in the
-// range each one declares: slot 0 is Sensor index 0. A slot you never write reads 0, and a
-// slot the program expects but this sketch does not fill falls back to the value baked into
-// the .bin - so a half-wired head still renders.
-void readSensors() {
-  // Example: a flex sensor on GPIO 1, reported as 0..1.
-  // sensorValues[0] = analogRead(1) / 4095.0f;
-  sensorValues[0] = 0.5f + 0.5f * sinf(millis() / 800.0f);  // placeholder, remove
-}
-
-// ---------------------------------------------------------------------------
-
-void setup() {
-  Serial.begin(115200);
-  delay(200);
-
-  runtime.setResolution(WIDTH, HEIGHT);
-
-  partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, PARTITION_LABEL);
-  if (!partition) Serial.println("no 'protoshade' partition in the partition table");
-  loadProgramFromFlash();
-
+bool begin(ProtoShadeRuntime& runtime, const char* ap_ssid, const char* ap_password) {
+  runtime_ = &runtime;
+  if (!partition) {
+    partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, kPartitionLabel);
+  }
   if (!LittleFS.begin(true)) Serial.println("LittleFS mount failed - /upload still works");
 
-  if (strlen(WIFI_SSID) > 0) {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.printf("joining %s", WIFI_SSID);
-    for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
-      delay(250);
-      Serial.print(".");
-    }
-    Serial.println();
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-    Serial.printf("access point %s, open http://%s/\n", AP_SSID, WiFi.softAPIP().toString().c_str());
-  } else {
-    Serial.printf("open http://%s/\n", WiFi.localIP().toString().c_str());
-  }
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_password);
+  address_ = WiFi.softAPIP().toString();
+  Serial.printf("upload mode: join %s, open http://%s/\n", ap_ssid, address_.c_str());
 
   server.on("/upload", HTTP_GET, []() { server.send_P(200, "text/html", kUploadPage); });
   server.on("/status", HTTP_GET, handleStatus);
@@ -345,28 +291,11 @@ void setup() {
     server.send(404, "text/plain", "not found - try /upload");
   });
   server.begin();
-
-  // Two pinned tasks, created once. Core 0 takes the top half, core 1 the bottom - and core
-  // 0 is also running WiFi now, so the top half is the slower one.
-  if (!renderer.begin()) Serial.println("renderer.begin() failed - out of memory?");
+  return true;
 }
 
-void loop() {
-  server.handleClient();
+void handle() { server.handleClient(); }
 
-  readSensors();
-  // One snapshot per frame, shared by both cores: a reading that changed halfway through
-  // would render the top half of the face differently from the bottom.
-  const Sensors sensors{sensorValues, SENSOR_SLOTS};
-  const Frame frame = runtime.beginFrame(millis(), sensors);
-  if (!renderer.render(runtime, frame, framebuffer)) {
-    Serial.println("step budget exceeded - the shader is too heavy");
-  }
+const char* address() { return address_.c_str(); }
 
-  // Your panel driver goes here: push `framebuffer` (WIDTH * HEIGHT RGB pixels) out over
-  // HUB75 / WS2812 / whatever the visor uses.
-  const Pixel& p = framebuffer[0];
-  rgbLedWrite(RGB_BUILTIN, p.r / 8, p.g / 8, p.b / 8);  // /8 because it is blinding
-
-  delay(5);
-}
+}  // namespace upload
