@@ -31,7 +31,13 @@ export interface Env {
   h: number;
   t: number; // seconds since the page loaded
   frame: number;
-  images: Map<number, ImageBuf>; // by node id, filled by uploadInto()
+  images: Map<number, ImageBuf>; // by node id, filled by decodeInto()
+  /**
+   * Live sensor readings by index, as the head's firmware will supply them. Absent in the
+   * browser, where nothing is plugged in - Sensor nodes then fall back to their own test
+   * widget, so the seam is already here for when a real feed arrives.
+   */
+  sensors?: number[];
 }
 
 /** A node's widget values, straight off LGraphNode.properties. */
@@ -111,6 +117,23 @@ const hsvToRgb = (h: number, s: number, v: number, a: number): Vec => {
   return [t[0] + m, t[1] + m, t[2] + m, a];
 };
 
+/**
+ * What a sensor reports, and how to squash it into 0..1. The range is the sensor's own
+ * format - a flex sensor gives 0..1, an encoder counts up forever, an IMU axis swings both
+ * ways - so the node declares it instead of pretending everything is already normalised.
+ * `unit` is what makes an unbounded reading usable as a hue or a mix factor: it saturates
+ * instead of clipping, so a value of 3 and a value of 300 still look different.
+ */
+const RANGES: Record<string, { unit: (x: number) => number; sweep: (t: number) => number }> = {
+  "0..1": { unit: clamp01, sweep: (t) => 0.5 - 0.5 * Math.cos(t) },
+  "-1..1": { unit: (x) => clamp01(x * 0.5 + 0.5), sweep: (t) => Math.sin(t) },
+  "0..inf": { unit: (x) => (x <= 0 ? 0 : x / (1 + x)), sweep: (t) => 5 - 5 * Math.cos(t) },
+  "-inf..inf": { unit: (x) => 0.5 + (0.5 * x) / (1 + Math.abs(x)), sweep: (t) => 5 * Math.sin(t) },
+  // Degrees wrap rather than clamp: at 359 deg a head is a degree from 0, not at the far end.
+  "0..360": { unit: (x) => (((x % 360) + 360) % 360) / 360, sweep: (t) => ((t * 60) % 360) },
+};
+const RANGE_NAMES = Object.keys(RANGES);
+
 export const OUTPUT_TYPE = "output/led";
 
 export const NODES: Record<string, NodeDef> = {
@@ -134,6 +157,29 @@ export const NODES: Record<string, NodeDef> = {
     out: ["Time"],
     props: { speed: { type: "number", value: 1, options: { step: 10 } } },
     eval: (_i, p, env) => [vec(env.t * num(p.speed))],
+  },
+
+  "input/sensor": {
+    title: "Sensor",
+    color: "#3a5",
+    desc: "A sensor on the head, by index. Value is raw, Unit is that value squashed to 0..1",
+    out: ["Value", "Unit"],
+    props: {
+      range: { type: "combo", value: "0..1", options: { values: RANGE_NAMES } },
+      index: { type: "number", value: 0, options: { min: 0, max: 255, step: 10 } },
+      // No hardware is attached to a browser, so the editor drives the node itself:
+      // `test` holds a reading, `sweep` walks the range so you can watch it animate.
+      test: { type: "number", value: 0.5, options: { step: 1 } },
+      sweep: { type: "toggle", value: false },
+    },
+    eval: (_i, p, env) => {
+      const r = RANGES[String(p.range)] ?? RANGES["0..1"];
+      // Index is a widget: round it, floor it at 0, and read past the end as 0 rather
+      // than letting a typo hand undefined to the maths.
+      const live = env.sensors?.[Math.max(0, Math.round(num(p.index)))];
+      const raw = live ?? (p.sweep ? r.sweep(env.t * 1.5) : num(p.test));
+      return [vec(raw), vec(r.unit(raw))];
+    },
   },
 
   "const/value": {

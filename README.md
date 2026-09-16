@@ -78,10 +78,23 @@ that wants a single number reads R. One type means no coercion rules to remember
 alpha survives all the way from an uploaded PNG to the `Alpha Over` node. `LED Output`
 flattens alpha against black — the panel has nothing behind it.
 
-Nodes: `Coordinates` (UV / centered / pixel), `Time`, `Value`, `Color`, `Math` (20
-component-wise ops), `Mix`, `Alpha Over`, `Separate`/`Combine RGBA`, `HSV`, `Image`
+Nodes: `Coordinates` (UV / centered / pixel), `Time`, `Sensor`, `Value`, `Color`, `Math`
+(20 component-wise ops), `Mix`, `Alpha Over`, `Separate`/`Combine RGBA`, `HSV`, `Image`
 (uploads a PNG/JPG, downscaled to 512px, sampled nearest or linear, repeat or clamp) and
 `LED Output`. An unconnected input falls back to the node's own widget.
+
+### Sensors
+
+`Sensor` reads one of the head's sensors by **index**, and declares the **range** that
+sensor reports in (`0..1`, `-1..1`, `0..inf`, `-inf..inf`, `0..360`). It has two outputs:
+`Value` is the reading as-is, `Unit` is that reading squashed into 0..1 — saturating, not
+clipping, so an unbounded encoder count still drives a hue sensibly and 3 and 300 remain
+distinguishable. Degrees wrap instead of clamping.
+
+Nothing is plugged into a browser, so the node drives itself while you author: `test`
+holds a reading and `sweep` walks the declared range. Both are ignored the moment a real
+reading exists — the runtime fills `Env.sensors[index]` and that always wins. That array
+is the seam the firmware will write into; nothing else changes when it does.
 
 The graph autosaves to `localStorage` (uploads included, as data URLs) and reloads with
 the page. "reset graph" puts the starter graph back.

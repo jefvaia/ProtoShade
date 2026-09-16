@@ -153,6 +153,45 @@ assert.equal(compile(graph([[1, "const/value", { value: 1 }]], {})), null);
   near(c.shade(env()), [0, 0, 0, 1], "no upload renders as transparent, not a crash");
 }
 
+// --- sensor: declared range, test value, live feed, index --------------------
+{
+  const sensor = (props, slot, e = {}) => {
+    const c = compile(
+      graph(
+        [
+          [1, "input/sensor", props],
+          [2, "output/led", { brightness: 1 }, 20],
+        ],
+        { 20: [1, slot] },
+      ),
+    );
+    return c.shade(env(e));
+  };
+  // Raw output is the reading itself; Unit squashes it into 0..1 without clipping.
+  near(sensor({ range: "0..inf", index: 0, test: 3 }, 0), [1, 1, 1, 1], "raw 3 clamps at the LED");
+  near(sensor({ range: "0..inf", index: 0, test: 3 }, 1), [0.75, 0.75, 0.75, 1], "3 -> 0.75 unit");
+  near(sensor({ range: "0..inf", index: 0, test: 300 }, 1), [300 / 301, 300 / 301, 300 / 301, 1], "300 saturates but still differs");
+  near(sensor({ range: "-inf..inf", index: 0, test: -1 }, 1), [0.25, 0.25, 0.25, 1], "signed midpoint is 0.5");
+  near(sensor({ range: "0..360", index: 0, test: 450 }, 1), [0.25, 0.25, 0.25, 1], "degrees wrap");
+  near(sensor({ range: "-1..1", index: 0, test: -5 }, 1), [0, 0, 0, 1], "out of declared range clamps");
+
+  // A live feed wins over the test widget; a missing index reads 0, not undefined.
+  near(sensor({ range: "0..1", index: 1, test: 0.5 }, 0, { sensors: [0.1, 0.9] }), [0.9, 0.9, 0.9, 1], "live reading by index");
+  near(sensor({ range: "0..1", index: 7, test: 0.5 }, 0, { sensors: [0.1] }), [0.5, 0.5, 0.5, 1], "index past the feed falls back to test");
+  near(sensor({ range: "0..1", index: -2.6, test: 0.25 }, 0, { sensors: [0.8] }), [0.8, 0.8, 0.8, 1], "index is rounded and floored at 0");
+
+  // Sweep ignores the test widget and walks the declared range instead.
+  const swept = (t) => sensor({ range: "-1..1", index: 0, test: 0.123, sweep: true }, 1, { t });
+  near(swept(0), [0.5, 0.5, 0.5, 1], "sweep starts mid-range");
+  near(swept(Math.PI / 3), [1, 1, 1, 1], "sweep reaches the top of the range");
+  // ...but a live reading still wins over the sweep.
+  near(
+    sensor({ range: "-1..1", index: 0, test: 0.123, sweep: true }, 1, { t: Math.PI / 3, sensors: [-1] }),
+    [0, 0, 0, 1],
+    "live reading beats the sweep",
+  );
+}
+
 // --- a cycle must not hang or blow the stack ---------------------------------
 {
   const c = compile(
