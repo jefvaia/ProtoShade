@@ -6,7 +6,7 @@
 // what the panel will do, minus the panel.
 
 import { compile, Runner, type Program } from "./graph.js";
-import { instructionCount, pack, packedSize } from "./pack.js";
+import { PARTITION_BYTES, instructionCount, pack, packedSize } from "./pack.js";
 import { RANGES, decodeInto, imageLabel, images, register, type Env, type Vec } from "./nodes.js";
 import { EXAMPLES, apply } from "./examples.js";
 import { DeviceLink, supported as serialSupported, type SerialFrame } from "./serial.js";
@@ -198,9 +198,6 @@ el<HTMLButtonElement>("reset").onclick = () => {
 
 let W = 64;
 let H = 32;
-
-/** The head's `protoshade` partition, from partitions.csv. A bake can reach it. */
-const PARTITION_BYTES = 2 * 1024 * 1024;
 
 function setResolution(w: number, h: number): void {
   const clamp = (n: number): number => Math.min(512, Math.max(1, Math.round(n) || 1));
@@ -458,11 +455,11 @@ function render(now: number): void {
     }
     const size = current ? packedSize(current) : 0;
     // Baking buys instructions with flash, so both numbers have to be on screen at once -
-    // and the partition it has to fit in is 2 MB (partitions.csv).
+    // and it still has to fit the head's partition (partitions.csv).
     hint.textContent = !result.ok
       ? result.reason
       : size > PARTITION_BYTES
-        ? `${(size / 1048576).toFixed(2)} MB will not fit the head's 2 MB partition - fewer baked frames, or a smaller panel`
+        ? `${(size / 1048576).toFixed(2)} MB will not fit the head's ${PARTITION_BYTES / 1048576} MB partition - fewer baked frames, or a smaller panel`
         : "";
     binInfo.textContent = current
       ? `${instructionCount(current)} instructions · ${current.assets.length} image${current.assets.length === 1 ? "" : "s"} · ` +

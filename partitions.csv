@@ -8,7 +8,17 @@
 #
 #   protoshade   the .bin the editor produces. A data partition, so esp_partition_mmap()
 #                can map it into the address space and the packed images cost no RAM.
-#                2 MB holds a program with several 512x512 images in it.
+#                8 MB, which is a lot of frames: a baked 64x32 strip is 4 KB a frame, and a
+#                512x512 image is 512 KB. Nothing in the firmware knows this number - it
+#                looks the partition up by label and reads partition->size - so changing it
+#                here is the whole change. web/pack.ts has a copy for the editor's size
+#                warning, and test/examples.test.mjs reads this file to hold the two together.
+#
+#                The one thing that does NOT scale freely: loadFromFlash() maps the WHOLE
+#                partition in a single esp_partition_mmap() call, and the S3's flash-mmap
+#                window is shared with the app's own mapped code. If a head ever prints
+#                "mmap failed" on boot after growing this, that window is the reason and the
+#                partition is too big for that board - not the .bin.
 #   spiffs       the editor itself (npm run build:device -> data/), gzipped, about 133 KB.
 #                It has to be called "spiffs": Arduino's LittleFS.begin() looks for that
 #                label by default, and so do the filesystem uploader plugins. The subtype
@@ -22,12 +32,18 @@
 # Offsets must stay 4 KB aligned and app partitions 64 KB aligned. Sizes are hex bytes.
 # Partitions do not have to cover the whole chip, they just may not overlap or run past it.
 #
-# For an 8 MB board: factory 0x300000, protoshade at 0x310000 size 0x100000, spiffs at
-# 0x410000 size 0x100000. For 4 MB, drop spiffs entirely and use /upload.
+# GROWING protoshade moves spiffs, because protoshade sits in front of it. Moving spiffs
+# means the editor has to be uploaded to the head again (a filesystem at the old offset is
+# simply not there any more). protoshade's own offset is unchanged by the layout below, so
+# a .bin already in flash survives - as long as "Erase All Flash Before Sketch Upload" is
+# off, which it should be anyway.
+#
+# For an 8 MB board: factory 0x300000, protoshade at 0x310000 size 0x300000, spiffs at
+# 0x610000 size 0x100000. For 4 MB, drop spiffs entirely and use /upload.
 #
 # name,      type, subtype, offset,   size,     flags
 nvs,         data, nvs,     0x9000,   0x5000,
 phy_init,    data, phy,     0xE000,   0x1000,
 factory,     app,  factory, 0x10000,  0x400000,
-protoshade,  data, 0x40,    0x410000, 0x200000,
-spiffs,      data, spiffs,  0x610000, 0x100000,
+protoshade,  data, 0x40,    0x410000, 0x800000,
+spiffs,      data, spiffs,  0xC10000, 0x100000,

@@ -11,7 +11,7 @@
 // exercises, so the shape of the graph is what gets checked.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -24,13 +24,13 @@ const entry = join(work, "entry.ts");
 writeFileSync(
   entry,
   `export { compile } from ${JSON.stringify(join(root, "web/graph.ts"))};\n` +
-    `export { packedSize, instructionCount } from ${JSON.stringify(join(root, "web/pack.ts"))};\n` +
+    `export { packedSize, instructionCount, PARTITION_BYTES } from ${JSON.stringify(join(root, "web/pack.ts"))};\n` +
     `export { NODES, MAX_REGISTERS } from ${JSON.stringify(join(root, "web/nodes.ts"))};\n` +
     `export { EXAMPLES } from ${JSON.stringify(join(root, "web/examples.ts"))};\n`,
 );
 const bundle = join(work, "bundle.mjs");
 await esbuild.build({ entryPoints: [entry], outfile: bundle, bundle: true, format: "esm", logLevel: "warning" });
-const { compile, packedSize, instructionCount, NODES, MAX_REGISTERS, EXAMPLES } = await import(pathToFileURL(bundle));
+const { compile, packedSize, instructionCount, PARTITION_BYTES, NODES, MAX_REGISTERS, EXAMPLES } = await import(pathToFileURL(bundle));
 
 /** An example turned into the shape compile() reads: inputs are per-slot, links are by id. */
 function toGraph(ex) {
@@ -88,9 +88,37 @@ for (const ex of EXAMPLES) {
   assert.ok(result.ok, `${ex.name}: ${result.ok ? "" : result.reason}`);
   const n = instructionCount(result.program);
   assert.ok(n <= MAX_REGISTERS, `${ex.name}: ${n} instructions, over the ${MAX_REGISTERS} a head has registers for`);
-  // 2 MB is the head's protoshade partition (partitions.csv). An example that does not fit
-  // on the hardware it ships with is not an example.
-  assert.ok(packedSize(result.program) <= 2 * 1024 * 1024, `${ex.name}: too big for the partition`);
+  // An example that does not fit on the hardware it ships with is not an example.
+  assert.ok(packedSize(result.program) <= PARTITION_BYTES, `${ex.name}: too big for the partition`);
+}
+
+// --- the editor's idea of the partition is the partition -----------------------
+//
+// partitions.csv is the original - the firmware never hardcodes a size, it looks the
+// partition up by label - and web/pack.ts carries a copy so the editor can warn you before
+// you try to flash a .bin that will not fit. Two numbers, so read the real one and compare.
+{
+  const table = readFileSync(join(root, "partitions.csv"), "utf8");
+  const row = table
+    .split("\n")
+    .map((line) => line.split("#")[0].split(",").map((cell) => cell.trim()))
+    .find((cells) => cells[0] === "protoshade");
+  assert.ok(row, "partitions.csv still has a protoshade partition");
+  const [, , , offset, size] = row;
+  assert.equal(
+    Number(size),
+    PARTITION_BYTES,
+    `partitions.csv gives protoshade ${Number(size)} bytes, web/pack.ts says ${PARTITION_BYTES}`,
+  );
+  // Nothing may start inside it either, or the .bin and something else share flash.
+  for (const cells of table.split("\n").map((l) => l.split("#")[0].split(",").map((c) => c.trim()))) {
+    if (cells.length < 5 || !cells[3] || cells[0] === "protoshade" || cells[0] === "name") continue;
+    const at = Number(cells[3]);
+    assert.ok(
+      at + Number(cells[4]) <= Number(offset) || at >= Number(offset) + PARTITION_BYTES,
+      `partition ${cells[0]} overlaps protoshade`,
+    );
+  }
 }
 
 // The baked example has to actually bake: its plasma branch is gone from the program, and

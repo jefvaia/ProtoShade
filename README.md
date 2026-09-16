@@ -134,7 +134,15 @@ documented at the top of `ProtoShadeRuntime.h`; `test/test.cpp` builds one byte 
 the arbiter if the packer and the runtime ever disagree.
 
 It belongs in a **flash** partition, not RTC memory - RTC RAM is 8 KB and is lost on power
-loss. Everything a program declares is bounds-checked at `load()`, and `ExecContext::step_limit`
+loss. `partitions.csv` gives it **8 MB** of a 16 MB board, which is a lot of frames: a baked
+64x32 strip is 4 KB per frame. Growing it is a one-line change to that file and nothing else
+- the firmware never hardcodes a size, it finds the partition by label and reads
+`partition->size` - except that `protoshade` sits in front of `spiffs`, so making it bigger
+moves the editor's filesystem and the editor has to be uploaded to the head again. The one
+thing that does not scale freely is `esp_partition_mmap()`: `loadFromFlash()` maps the whole
+partition in a single call, and that window is shared with the app's own mapped code, so a
+head that starts printing `mmap failed` after a change here has a partition too big for that
+board. Everything a program declares is bounds-checked at `load()`, and `ExecContext::step_limit`
 caps work per pixel. Both matter because the `.bin` arrives from a web page: untrusted input,
 running on hardware strapped to someone's head.
 
@@ -277,7 +285,7 @@ It is a **partial** bake, not a pre-rendered face:
 What it freezes is the branch's *shape*: anything it depends on that is not the driver (a
 second sensor, another clock) is sampled once, at the value it had while baking. The cost is
 flash, and it adds up fast - `frames x width x height x 2` bytes - so the editor prints the
-`.bin` size and says so when it outgrows the head's 2 MB partition.
+`.bin` size and says so when it outgrows the head's flash partition (8 MB, see below).
 
 Bake is also the way out of a graph that will not fit: the register file is 64 instructions
 wide, and a branch that is too big to ship is usually still fine to *render*.
@@ -589,7 +597,9 @@ g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
   replaced while the rest of the graph stays live.
 - `test/examples.test.mjs` - every example in the header dropdown: that its node types and
   wires are real, that it compiles, and that it fits both the register file and the head's
-  2 MB partition. The examples are data, so this is the compiler pointed straight at them.
+  flash partition. The examples are data, so this is the compiler pointed straight at them.
+  It also reads `partitions.csv` and fails if the size the editor warns against has drifted
+  from the size the table actually hands the head, or if anything grew over the top of it.
 - `test/crosscheck.mjs` - **the important one.** Compiles 84 programs, renders every pixel
   with the TypeScript interpreter, packs the same Program to a `.bin`, renders that with the
   C++ VM, and compares. Nothing differs by more than 1/255, which is float-vs-double rounding
