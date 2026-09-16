@@ -179,6 +179,12 @@ constexpr uint8_t STATUS_LED_BRIGHTNESS = 24;
 // How often to print frame timings on serial. 0 is silent.
 constexpr uint32_t STATS_INTERVAL_MS = 2000;
 
+// Mirroring the canvas to the editor over USB (type p on the serial monitor, or press
+// "mirror head" in the editor). One frame is CANVAS_W * CANVAS_H * 3 bytes, so this is
+// throttled rather than sent every frame - the point is to watch the head, not to keep up
+// with it. 0 streams as fast as the port drains, which will slow the face down.
+constexpr uint32_t STREAM_INTERVAL_MS = 50;
+
 // ---------------------------------------------------------------------------
 // 6. Sensors
 // ---------------------------------------------------------------------------

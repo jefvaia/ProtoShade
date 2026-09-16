@@ -55,6 +55,8 @@ declare global {
     createNode(type: string, title?: string, options?: object): LGraphNode | null;
     registerNodeType(type: string, base: unknown): void;
     clearRegisteredTypes(): void;
+    /** Closes any open value/right-click menu. They are DOM elements, not canvas drawing. */
+    closeAllContextMenus(ref_window?: Window): void;
     [key: string]: unknown;
   };
 }

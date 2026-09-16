@@ -107,6 +107,33 @@ bool buttonHeld(uint32_t ms) {
   return true;
 }
 
+// Mirrors the canvas to whoever is on the other end of the USB cable. The editor picks the
+// frames out of the log stream and draws them, so you can watch what the head is actually
+// rendering while it is on your head.
+//
+// Blocking on purpose: Serial.write() returns when the host has taken the bytes, which is
+// the backpressure that keeps this from flooding a port nobody is reading. The throttle
+// above is what keeps it from being the thing that sets your frame rate.
+bool streaming = false;
+uint32_t streamed_at = 0;
+
+void streamFrame(const Pixel* canvas) {
+  static_assert(sizeof(Pixel) == 3, "the stream is tightly packed RGB");
+  if (!streaming) return;
+  if (STREAM_INTERVAL_MS != 0 && millis() - streamed_at < STREAM_INTERVAL_MS) return;
+  streamed_at = millis();
+
+  const uint8_t header[10] = {
+      'P', 'S', 'F', 'R',
+      uint8_t(CANVAS_W & 0xFF), uint8_t(CANVAS_W >> 8),
+      uint8_t(CANVAS_H & 0xFF), uint8_t(CANVAS_H >> 8),
+      0,  // format: packed RGB888
+      0,  // flags
+  };
+  Serial.write(header, sizeof(header));
+  Serial.write(reinterpret_cast<const uint8_t*>(canvas), size_t(CANVAS_W) * CANVAS_H * 3);
+}
+
 // Typing u on the serial monitor does the same thing, window or not. A button is one wire
 // and one pin number away from not working; this path has neither, so it is also the answer
 // for a head that has no button on it yet.
@@ -115,6 +142,10 @@ bool uploadRequestedOverSerial() {
   while (Serial.available() > 0) {
     const int c = Serial.read();
     if (c == 'u' || c == 'U') asked = true;
+    if (c == 'p' || c == 'P') {
+      streaming = !streaming;
+      Serial.printf("pixel stream %s\n", streaming ? "on" : "off");
+    }
   }
   return asked;
 }
@@ -208,6 +239,9 @@ void renderFace() {
   // Hands the frame to the push task and returns; it blocks only until the PREVIOUS push is
   // done, so rendering the next frame overlaps sending this one.
   pusher.submit(back);
+  // Before the swap: `back` is the frame that was just rendered. The push task is reading
+  // it too, and two readers of the same pixels get along fine.
+  streamFrame(back);
   swapCanvases();
 
   // micros() wraps every ~71 minutes; unsigned subtraction wraps with it and stays right.
@@ -288,7 +322,7 @@ void setup() {
 
   stats.since = millis();
   Serial.printf("face running at %ux%u. Press the button within %lu s for upload mode, or\n"
-                "type u here at any time.\n",
+                "type u here at any time, or p to mirror the canvas to the editor.\n",
                 CANVAS_W, CANVAS_H, (unsigned long)(UPLOAD_WINDOW_MS / 1000));
 }
 

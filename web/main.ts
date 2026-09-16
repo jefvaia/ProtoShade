@@ -8,6 +8,7 @@
 import { compile, Runner, type Program } from "./graph.js";
 import { instructionCount, pack, packedSize } from "./pack.js";
 import { RANGES, decodeInto, imageLabel, images, register, type Env, type Vec } from "./nodes.js";
+import { DeviceLink, supported as serialSupported, type SerialFrame } from "./serial.js";
 
 const el = <T extends HTMLElement>(id: string): T => {
   const node = document.getElementById(id);
@@ -24,6 +25,8 @@ const status = el<HTMLElement>("status");
 const previewInfo = el<HTMLElement>("preview-info");
 const hint = el<HTMLElement>("hint");
 const binInfo = el<HTMLElement>("bin-info");
+const mirrorInfo = el<HTMLElement>("mirror-info");
+const mirrorButton = el<HTMLButtonElement>("mirror");
 
 const lctx = led.getContext("2d");
 if (!lctx) throw new Error("2d context unavailable");
@@ -41,6 +44,18 @@ register();
 const graph = new LGraph();
 const editor = new LGraphCanvas(graphCanvas, graph);
 editor.show_info = false; // litegraph's own fps/node counter, we print our own
+
+// litegraph's value menus close when you pick something or click the canvas, but not when
+// you simply walk away from them. They are position:fixed DOM elements, so one left open
+// hangs over whatever is underneath - usually the preview, as a stack of stray words. Close
+// them as soon as the pointer is somewhere that is neither the menu nor the graph.
+const openMenus = document.getElementsByClassName("litecontextmenu");
+addEventListener("pointermove", (event) => {
+  if (openMenus.length === 0) return;
+  const target = event.target;
+  if (target instanceof Element && target.closest(".litecontextmenu, #graph-wrap")) return;
+  LiteGraph.closeAllContextMenus();
+});
 
 function fitEditor(): void {
   const box = graphCanvas.parentElement;
@@ -212,6 +227,75 @@ function sweep(range: string, t: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Mirroring the head over USB. When frames are arriving they are what the preview shows -
+// the point is to see what the hardware is doing, not what this machine would do.
+// ---------------------------------------------------------------------------
+
+const link = new DeviceLink();
+let deviceFrame: SerialFrame | null = null;
+let deviceAt = 0;
+let deviceFrames = 0;
+let deviceFps = 0;
+let deviceFpsAt = 0;
+
+function mirrorStatus(text: string): void {
+  mirrorInfo.textContent = text;
+}
+
+if (!serialSupported()) {
+  mirrorButton.disabled = true;
+  mirrorButton.title = "Web Serial needs Chrome or Edge on the desktop";
+  mirrorButton.classList.add("opacity-40");
+}
+
+mirrorButton.onclick = async () => {
+  if (link.connected) {
+    await link.send("p"); // tell it to stop sending before the port goes away
+    await link.disconnect();
+    deviceFrame = null;
+    mirrorButton.textContent = "mirror head";
+    mirrorStatus("");
+    return;
+  }
+  try {
+    await link.connect(
+      (frame) => {
+        deviceFrame = frame;
+        deviceAt = performance.now();
+        deviceFrames++;
+      },
+      (why) => {
+        deviceFrame = null;
+        mirrorButton.textContent = "mirror head";
+        mirrorStatus(why === "disconnected" ? "" : why);
+      },
+    );
+    mirrorButton.textContent = "stop mirroring";
+    mirrorStatus("connected, waiting for frames…");
+    await link.send("p"); // same command the serial monitor takes
+  } catch (err) {
+    // Includes the user simply closing the port picker, which is not worth shouting about.
+    mirrorStatus(String(err).replace(/^Error:\s*/, ""));
+  }
+};
+
+/** Draws a frame from the head, scaled to the preview canvas. */
+function drawDeviceFrame(frame: SerialFrame): void {
+  if (panel.width !== frame.w || panel.height !== frame.h) {
+    panel.width = frame.w;
+    panel.height = frame.h;
+  }
+  const img = pctx!.createImageData(frame.w, frame.h);
+  for (let i = 0, p = 0; i < frame.rgb.length; i += 3, p += 4) {
+    img.data[p] = frame.rgb[i];
+    img.data[p + 1] = frame.rgb[i + 1];
+    img.data[p + 2] = frame.rgb[i + 2];
+    img.data[p + 3] = 255;
+  }
+  pctx!.putImageData(img, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Preview loop
 // ---------------------------------------------------------------------------
 
@@ -228,13 +312,19 @@ function render(now: number): void {
 
   const result = compile(graph, images, W, H);
   current = result.ok ? result.program : null;
-  const runner = current ? new Runner(current) : null;
+  // A frame older than a second means the head stopped talking; fall back to rendering here
+  // rather than leaving a stale picture up that looks live.
+  const mirroring = deviceFrame !== null && now - deviceAt < 1000;
+  const runner = mirroring ? null : current ? new Runner(current) : null;
   const img = pctx!.createImageData(W, H);
   env.w = W;
   env.h = H;
   env.t = (now - t0) / 1000;
   env.sensors = sensorFeed(env.t);
 
+  if (mirroring) {
+    drawDeviceFrame(deviceFrame!);
+  } else
   for (let y = 0, p = 0; y < H; y++) {
     for (let x = 0; x < W; x++, p += 4) {
       colour[0] = colour[1] = colour[2] = 0;
@@ -256,23 +346,30 @@ function render(now: number): void {
   }
   env.frame++;
 
-  pctx!.putImageData(img, 0, 0);
+  if (!mirroring) {
+    if (panel.width !== W || panel.height !== H) {
+      panel.width = W;
+      panel.height = H;
+    }
+    pctx!.putImageData(img, 0, 0);
+  }
   lctx!.imageSmoothingEnabled = false;
   lctx!.drawImage(panel, 0, 0, led.width, led.height);
 
   // Dark seams between the LEDs. Only worth drawing once a cell is a few pixels wide.
-  const cell = led.width / W;
+  const cell = led.width / panel.width;
   if (cell >= 5) {
     lctx!.strokeStyle = "rgba(0,0,0,0.55)";
     lctx!.lineWidth = 1;
     lctx!.beginPath();
-    for (let x = 1; x < W; x++) {
+    for (let x = 1; x < panel.width; x++) {
       lctx!.moveTo(x * cell, 0);
       lctx!.lineTo(x * cell, led.height);
     }
-    for (let y = 1; y < H; y++) {
-      lctx!.moveTo(0, y * cell);
-      lctx!.lineTo(led.width, y * cell);
+    const rowCell = led.height / panel.height;
+    for (let y = 1; y < panel.height; y++) {
+      lctx!.moveTo(0, y * rowCell);
+      lctx!.lineTo(led.width, y * rowCell);
     }
     lctx!.stroke();
   }
@@ -283,6 +380,16 @@ function render(now: number): void {
     frames = 0;
     fpsAt = now;
     previewInfo.textContent = `${W}×${H} · ${W * H} led${W * H === 1 ? "" : "s"} · ${fps} fps`;
+    if (link.connected) {
+      deviceFps = Math.round((deviceFrames * 1000) / Math.max(1, now - deviceFpsAt));
+      deviceFrames = 0;
+      deviceFpsAt = now;
+      mirrorStatus(
+        mirroring && deviceFrame
+          ? `live from the head · ${deviceFrame.w}×${deviceFrame.h} · ${deviceFps} fps over USB`
+          : "connected, waiting for frames…",
+      );
+    }
     hint.textContent = result.ok ? "" : result.reason;
     binInfo.textContent = current
       ? `${instructionCount(current)} instructions · ${current.assets.length} image${current.assets.length === 1 ? "" : "s"} · ` +

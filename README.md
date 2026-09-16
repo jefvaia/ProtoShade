@@ -114,14 +114,20 @@ running on hardware strapped to someone's head.
 
 ## Build
 
-Three independent builds, all writing into `dist/`:
+Three independent builds, all writing into `dist/`. Linux, macOS and Windows alike - the
+only thing that ever needed Windows was `build.bat`, and it is a one-line wrapper now:
 
 ```
-build.bat              # em++: runs test/test.cpp, then emits dist/protoshade.js + .wasm
 npm install
 npm run build          # typecheck + tests + minified dist/index.html, main.js, styles.css
-npm run build:device   # the above, plus data/ - the editor, for the head's LittleFS
+npm run build:wasm     # em++: runs the runtime tests, then emits dist/protoshade.js + .wasm
+npm run build:device   # build, plus data/ - the editor, for the head's LittleFS
 ```
+
+Only `build:wasm` needs emscripten (`source emsdk_env.sh`, or `emsdk_env.bat`). Everything
+else - the editor, every test, the ESP32 sketch - builds without it. The C++ half is also
+checked by the tests below with a plain host compiler, so you do not need emscripten to
+change the runtime, only to reload the wasm module the page probes for.
 
 Serve `dist/` over HTTP (not `file://` - it is an ES module) and open `index.html`.
 `npm run dev` watches `web/`, rebuilds and serves on http://localhost:8000.
@@ -135,6 +141,7 @@ Plain HTML + Tailwind v4 + TypeScript, no framework:
 - `web/nodes.ts` — the node library and the instruction set they compile to
 - `web/graph.ts` — graph → Program, and the interpreter that runs one
 - `web/pack.ts` — Program → `.bin`
+- `web/serial.ts` — finds the head's frames in the USB stream (see below)
 - `web/vendor/` — third-party files, committed (no CDN: the ESP32 has no internet)
 
 ### The shader editor
@@ -208,7 +215,8 @@ face with nothing but a phone.
    exactly where filesystem uploaders look.
 2. Install the uploader, which Arduino IDE 2.x does not ship: grab the `.vsix` from
    [arduino-littlefs-upload](https://github.com/earlephilhower/arduino-littlefs-upload/releases),
-   drop it in `%USERPROFILE%\.arduinoIDE\plugins\` (create the folder), restart the IDE.
+   drop it in the IDE's plugins folder (create it) and restart: `%USERPROFILE%\.arduinoIDE\plugins\`
+   on Windows, `~/.arduinoIDE/plugins/` on Linux and macOS.
 3. Close the Serial Monitor - the uploader needs the port - then `Ctrl+Shift+P` ▸
    **Upload LittleFS to Pico/ESP8266/ESP32**.
 
@@ -299,6 +307,34 @@ you nothing:
 
 Both are per frame, averaged over the window.
 
+### Mirroring the head in the editor
+
+**mirror head** in the header connects to the board over USB and shows what the *hardware*
+is rendering, in place of the local preview. Two implementations can agree on every test and
+still differ on a real head - a panel wired the wrong way round, a sensor reading nothing, a
+frame rate that only collapses after ten minutes - and this is the view that shows it. No
+extra wiring: the cable is already there.
+
+Press it, pick the port, and the editor sends `p` - the same command the serial monitor
+takes. The head then writes each frame onto the port it already logs on:
+
+```
+"PSFR" | width u16 | height u16 | format u8 | flags u8 | width*height*3 bytes RGB
+```
+
+Logs and frames share the stream, so the parser resynchronises on the magic rather than
+assuming it starts clean, and a frame older than a second drops the preview back to
+rendering locally instead of leaving a stale picture up that looks live.
+
+Throttled to 20 fps by `STREAM_INTERVAL_MS` in `head_config.h` - a 128×32 frame is 12 KB and
+the point is to watch the head, not to keep up with it. `Serial.write()` blocking when the
+host stops reading is the backpressure that keeps a port nobody is listening to from
+stalling the face.
+
+Web Serial is Chrome or Edge on the desktop, over https or localhost; elsewhere the button
+is disabled and says why. **Only one program can hold the port** - close the Arduino Serial
+Monitor first, and disconnect here before flashing.
+
 ### The status LED
 
 The devkit's built-in RGB LED is the mode light, which is the only thing telling you
@@ -365,5 +401,10 @@ g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
   - it catches our own typos, collisions and signatures. It also compiles
   `ProtoShadeParallel.cpp`, which is `#if`-guarded to ESP32 and invisible to every other
   check here. Compiled as `gnu++11`, the older core's standard, because it is the stricter one.
+- `test/serial.test.mjs` — the frame parser, against text mixed into the stream, a magic
+  appearing inside a log line, an impossible header, a truncated frame, one byte at a time,
+  and **every possible split point** of a two-frame stream. A chunk boundary landing
+  mid-header happens once in a thousand reads on real hardware and is trivial to write down
+  here.
 - `test/render.cpp` — renders a `.bin` to raw RGB on stdout. Used by the cross-check, handy
   on its own when a shader looks wrong.

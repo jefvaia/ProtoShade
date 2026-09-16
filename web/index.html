@@ -32,6 +32,7 @@
     </select>
 
     <span class="flex-1"></span>
+    <button id="mirror" class="bg-neutral-800 hover:bg-neutral-700 rounded px-3 py-1">mirror head</button>
     <button id="download" class="bg-emerald-700 hover:bg-emerald-600 rounded px-3 py-1">download .bin</button>
     <button id="reset" class="bg-neutral-800 hover:bg-neutral-700 rounded px-3 py-1">reset graph</button>
     <span id="status" class="text-neutral-500 tabular-nums"></span>
@@ -50,6 +51,7 @@
       <canvas id="led" class="self-center max-w-full h-auto bg-black rounded ring-1 ring-neutral-700 [image-rendering:pixelated]"></canvas>
       <p id="preview-info" class="text-neutral-500 text-xs tabular-nums"></p>
       <p id="bin-info" class="text-neutral-500 text-xs tabular-nums"></p>
+      <p id="mirror-info" class="text-sky-400 text-xs tabular-nums"></p>
       <p id="hint" class="text-amber-500 text-xs leading-relaxed"></p>
       <p class="text-neutral-600 text-xs leading-relaxed mt-auto">
         Every value is RGBA. A single number is that number in R, G and B with alpha 1, and a
