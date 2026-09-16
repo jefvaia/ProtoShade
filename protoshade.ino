@@ -207,7 +207,10 @@ void reportConfig() {
     Serial.printf("panel %u: %ux%u reads canvas (%u,%u)-(%lu,%lu)%s\n", unsigned(i), p.width,
                   p.height, p.src_x, p.src_y, (unsigned long)x1, (unsigned long)y1,
                   inside ? "" : "   <-- OUTSIDE THE CANVAS, this panel renders black");
-    if (!inside) fault = true;
+    // Warned about, not latched. A panel mapped past the edge is a mistake in
+    // head_config.h, but the head is still rendering everything else exactly as asked -
+    // and a red light that cannot be cleared says "broken" about a head that works.
+    // The line above is the signal; it prints on every boot.
   }
 }
 
