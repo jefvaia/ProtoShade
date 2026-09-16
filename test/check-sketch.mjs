@@ -13,8 +13,7 @@
 // invisible to every other check in this repository.
 
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,11 +25,50 @@ if (spawnSync(cxx, ["--version"]).status !== 0) {
   process.exit(0);
 }
 
-const units = [
-  join(root, "test/sketch-check.cpp"),
-  join(root, "upload_mode.cpp"),
-  join(root, "src/ProtoShadeParallel.cpp"),
-];
+/**
+ * What the Arduino builder hands the compiler, not what is on disk.
+ *
+ * It runs ctags over the .ino and inserts a generated prototype for EVERY function
+ * immediately before the FIRST function definition in the file. That hoisting is the one
+ * transformation that can turn a sketch every other compiler here accepts into an error on
+ * somebody's board: a type a function returns, or takes, has to be declared above that
+ * point, because its prototype has been moved up there. "'Request' does not name a type",
+ * from a file where Request is plainly declared thirty lines above the function.
+ *
+ * This is an approximation of ctags, not ctags. It only ever ADDS prototypes, so the worst
+ * a missed function costs is that one function going unchecked.
+ */
+function arduinoPreprocess(source) {
+  const lines = source.split("\n");
+  // A definition at column zero: a return type, a name, arguments, and an opening brace.
+  // Keywords that can also start such a line are the things it must not match.
+  const definition =
+    /^([A-Za-z_][A-Za-z0-9_:<>,*&\s]*?[\s*&])([A-Za-z_][A-Za-z0-9_]*)\s*\(([^;{]*)\)\s*(const\s*)?\{\s*$/;
+  const notAFunction = /^(if|for|while|switch|else|do|struct|class|union|enum|namespace|extern|return|case)\b/;
+
+  const prototypes = [];
+  let first = -1;
+  lines.forEach((line, i) => {
+    const m = definition.exec(line);
+    if (!m || notAFunction.test(line)) return;
+    if (first < 0) first = i;
+    const [, type, name, args] = m;
+    // ctags leaves alone anything already declared - and so must this, or a hand-written
+    // forward declaration carrying a default argument would collide with the generated one.
+    if (new RegExp(`\\b${name}\\s*\\([^;{]*\\)\\s*(const\\s*)?;`).test(source)) return;
+    prototypes.push(`${type.trim()} ${name}(${args});`);
+  });
+  if (first < 0) return source;
+  lines.splice(first, 0, ...prototypes);
+  return lines.join("\n");
+}
+
+const sketch = join(root, "protoshade.ino");
+const work = mkdtempSync(join(tmpdir(), "protoshade-sketch-"));
+const hoisted = join(work, "sketch.cpp");
+writeFileSync(hoisted, arduinoPreprocess(readFileSync(sketch, "utf8")));
+
+const units = [hoisted, join(root, "upload_mode.cpp"), join(root, "src/ProtoShadeParallel.cpp")];
 
 let failed = false;
 for (const unit of units) {
@@ -44,6 +82,7 @@ for (const unit of units) {
       "-Wno-unused-parameter", // the stubs ignore theirs on purpose
       "-DARDUINO_ARCH_ESP32=1",
       `-I${join(root, "test/arduino-stubs")}`,
+      `-I${root}`, // the hoisted sketch is compiled outside the tree it includes from
       unit,
     ],
     { encoding: "utf8" },
@@ -58,7 +97,7 @@ for (const unit of units) {
 // what stands between a press and upload mode. test/button-check.cpp links the sketch
 // against a clock and a pin it owns and drives it.
 if (!failed) {
-  const binary = join(mkdtempSync(join(tmpdir(), "protoshade-sketch-")), "button-check");
+  const binary = join(work, "button-check");
   const build = spawnSync(
     cxx,
     [
@@ -90,4 +129,4 @@ if (/sendHeader\s*\(\s*"Content-Encoding"/.test(readFileSync(join(root, "upload_
 }
 
 if (failed) process.exit(1);
-console.log(`check-sketch: ok - ${units.length} translation units parse`);
+console.log(`check-sketch: ok - ${units.length} translation units parse, the sketch with its prototypes hoisted`);

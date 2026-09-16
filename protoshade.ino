@@ -47,6 +47,18 @@ float sensorValues[SENSOR_SLOTS];
 enum class Mode : uint8_t { Face, Upload };
 Mode mode = Mode::Face;
 
+// What the serial port was asked for, read by serialRequest() far below.
+//
+// It lives up HERE, above the first function in the file, because the Arduino builder runs
+// ctags over the .ino and inserts a generated prototype for every function immediately
+// before the first function definition. `Request serialRequest();` therefore appears near
+// the top of the file whatever we do, and a type it names has to already exist at that
+// point - declare this next to serialRequest() and the IDE says "'Request' does not name a
+// type" while every other compiler in this repository is perfectly happy. Same reason Mode
+// and LedState are up here. test/check-sketch.mjs does the same hoisting, so a type that
+// slips back down the file fails there instead of on somebody's board.
+enum class Request : uint8_t { None, UploadMode, Flash };
+
 // ---------------------------------------------------------------------------
 // Status LED
 // ---------------------------------------------------------------------------
@@ -181,9 +193,9 @@ void streamFrame(const Pixel* canvas) {
 
 // Typing u on the serial monitor does the same thing, window or not. A button is one wire
 // and one pin number away from not working; this path has neither, so it is also the answer
-// for a head that has no button on it yet.
-enum class Request : uint8_t { None, UploadMode, Flash };
-
+// for a head that has no button on it yet. (Request itself is declared at the top of the
+// file - see the comment there for why it cannot live next to the function that returns it.)
+//
 // 0x02 rather than a letter: this port is shared with a person typing at a serial monitor,
 // and every printable character is either a command already or one someone might send by
 // accident. Nothing else is read here - the rest of the handshake belongs to

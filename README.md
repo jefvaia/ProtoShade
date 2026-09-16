@@ -603,7 +603,12 @@ g++ -std=c++17 test/test.cpp src/ProtoShadeRuntime.cpp -o /tmp/t && /tmp/t
   looks fine in a comment and comes out upside down on a head.
 - `test/check-sketch.mjs` - parses the ESP32 sketch on a host compiler, against just enough
   of Arduino.h, WiFi, WebServer, LittleFS, esp_partition and FreeRTOS to compile
-  (`test/arduino-stubs/`). The sketch is otherwise only ever built by the Arduino IDE on
+  (`test/arduino-stubs/`). It first does to the `.ino` what the Arduino builder does: a
+  generated prototype for every function, all of them inserted before the *first* function
+  definition. That hoisting is the one transformation that can turn a sketch every compiler
+  here accepts into `'Request' does not name a type` in the IDE, so any type a function
+  signature names has to be declared above that point - which is why `Mode`, `LedState` and
+  `Request` all live at the top of the file rather than beside the code that uses them. The sketch is otherwise only ever built by the Arduino IDE on
   someone else's machine, so a name collision in it is found by whoever is trying to flash
   their head. Nothing here runs and it cannot catch a real API mismatch with the ESP32 core
   - it catches our own typos, collisions and signatures. It also compiles
