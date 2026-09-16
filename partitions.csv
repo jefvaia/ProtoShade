@@ -13,16 +13,21 @@
 #                It has to be called "spiffs": Arduino's LittleFS.begin() looks for that
 #                label by default, and so do the filesystem uploader plugins. The subtype
 #                is what decides the format, not the name.
+#                1 MB, not "the rest of the chip", because mklittlefs builds an image the
+#                size of the partition and esptool then writes all of it: a 10 MB spiffs
+#                means a 10 MB serial transfer every time you touch the editor, for 133 KB
+#                of payload. The flash past it is left unallocated - it costs nothing and
+#                is there when something needs it.
 #
-# Offsets must stay 4 KB aligned and app partitions 64 KB aligned. Sizes are hex bytes, and
-# the last one has to end exactly at the flash size - 0x1000000 here.
+# Offsets must stay 4 KB aligned and app partitions 64 KB aligned. Sizes are hex bytes.
+# Partitions do not have to cover the whole chip, they just may not overlap or run past it.
 #
-# For an 8 MB board, halve it: factory 0x300000, protoshade at 0x310000 size 0x100000,
-# spiffs at 0x410000 size 0x3F0000. For 4 MB, drop spiffs entirely and use /upload.
+# For an 8 MB board: factory 0x300000, protoshade at 0x310000 size 0x100000, spiffs at
+# 0x410000 size 0x100000. For 4 MB, drop spiffs entirely and use /upload.
 #
 # name,      type, subtype, offset,   size,     flags
 nvs,         data, nvs,     0x9000,   0x5000,
 phy_init,    data, phy,     0xE000,   0x1000,
 factory,     app,  factory, 0x10000,  0x400000,
 protoshade,  data, 0x40,    0x410000, 0x200000,
-spiffs,      data, spiffs,  0x610000, 0x9F0000,
+spiffs,      data, spiffs,  0x610000, 0x100000,
