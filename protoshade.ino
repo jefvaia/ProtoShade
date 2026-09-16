@@ -141,14 +141,43 @@ struct Stats {
 
 float fps = 0.0f;  // last measured, also what reportStats prints
 
+// Everything that decides what you see, printed once at boot. A panel mapped outside the
+// canvas is silently black and a canvas far bigger than you meant is silently slow; both
+// look like "the head is broken" and neither says so on its own.
+void reportConfig() {
+  const uint32_t pixels = uint32_t(CANVAS_W) * CANVAS_H;
+  Serial.printf("canvas %ux%u = %lu pixels\n", CANVAS_W, CANVAS_H, (unsigned long)pixels);
+  Serial.printf("runtime %ux%u, program: ", runtime.width(), runtime.height());
+  if (runtime.hasProgram()) {
+    Serial.printf("%u instructions, %u images, %u sensor slots\n", runtime.instructionCount(),
+                  runtime.assetCount(), runtime.sensorCount());
+  } else {
+    Serial.printf("none (status %d) - showing the built-in test pattern\n", int(runtime.status()));
+  }
+
+  for (size_t i = 0; i < PANEL_COUNT; i++) {
+    const Panel& p = PANELS[i];
+    const uint32_t x1 = uint32_t(p.src_x) + p.sourceWidth();
+    const uint32_t y1 = uint32_t(p.src_y) + p.sourceHeight();
+    const bool inside = x1 <= CANVAS_W && y1 <= CANVAS_H;
+    Serial.printf("panel %u: %ux%u reads canvas (%u,%u)-(%lu,%lu)%s\n", unsigned(i), p.width,
+                  p.height, p.src_x, p.src_y, (unsigned long)x1, (unsigned long)y1,
+                  inside ? "" : "   <-- OUTSIDE THE CANVAS, this panel renders black");
+    if (!inside) fault = true;
+  }
+}
+
 void reportStats() {
   const uint32_t now = millis();
   const uint32_t elapsed = now - stats.since;
   if (STATS_INTERVAL_MS == 0 || elapsed < STATS_INTERVAL_MS || stats.frames == 0) return;
 
   fps = float(stats.frames) * 1000.0f / float(elapsed);
-  Serial.printf("stats: %.1f fps  render %.2f ms  panels %.2f ms\n", double(fps),
-                double(stats.render_us) / 1000.0 / stats.frames,
+  const double render_us = double(stats.render_us) / stats.frames;
+  // Per pixel as well as per frame: a slow frame is either a heavy shader or too many
+  // pixels, and the two numbers together say which without any guessing.
+  Serial.printf("stats: %.1f fps  render %.2f ms (%.3f us/px)  panels %.2f ms\n", double(fps),
+                render_us / 1000.0, render_us / double(uint32_t(CANVAS_W) * CANVAS_H),
                 double(stats.wait_us) / 1000.0 / stats.frames);
   stats = Stats{};
   stats.since = now;
@@ -246,6 +275,8 @@ void setup() {
 
   // Nothing needs the radio to render a face, and it costs power and core 0 time.
   WiFi.mode(WIFI_OFF);
+
+  reportConfig();
 
   if (!renderer.begin()) fail("renderer.begin() failed - out of memory?");
   if (!pusher.begin(PANELS, PANEL_COUNT, CANVAS_W, CANVAS_H, panelScratch)) {
