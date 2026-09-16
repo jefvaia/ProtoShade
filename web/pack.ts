@@ -10,7 +10,17 @@ import type { Program } from "./graph.js";
 
 export const HEADER_SIZE = 48;
 export const ASSET_ENTRY_SIZE = 16;
-export const FORMAT_VERSION = 3;
+export const FORMAT_VERSION = 5;
+
+/**
+ * The head's `protoshade` flash partition - how big a `.bin` may be. A copy of the size in
+ * partitions.csv, which is the original; the firmware never reads this number, it looks the
+ * partition up by label. test/examples.test.mjs parses that file and fails if the two drift.
+ *
+ * It is here rather than in the editor's page wiring because it is a fact about the
+ * container, and baking is one dropdown away from producing a file that does not fit.
+ */
+export const PARTITION_BYTES = 8 * 1024 * 1024;
 
 export function pack(p: Program): Uint8Array {
   const constBytes = p.consts.length * 4;
@@ -50,6 +60,8 @@ export function pack(p: Program): Uint8Array {
     view.setUint16(e + 8, a.w, true);
     view.setUint16(e + 10, a.h, true);
     out[e + 12] = a.format;
+    // Frames stacked top to bottom; the runtime reads one frame as h / frames rows.
+    view.setUint16(e + 13, Math.max(1, a.frames), true);
     out.set(a.data, at);
     at += a.data.length;
   });

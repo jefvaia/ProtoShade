@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>  // std::abs(int); libc++ does not hand it over via <cmath>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "../src/ProtoShadeDisplay.h"
@@ -36,6 +37,7 @@ struct AssetSpec {
   uint16_t w, h;
   AssetFormat format;
   std::vector<uint8_t> data;
+  uint16_t frames = 1;  // h / frames rows per frame; 1 is a still
 };
 
 // Builds a container the way the web app does: pool a constant, emit an instruction, ship.
@@ -104,6 +106,7 @@ struct Builder {
       put16(v, e + 8, assets[i].w);
       put16(v, e + 10, assets[i].h);
       v[e + 12] = uint8_t(assets[i].format);
+      put16(v, e + 13, assets[i].frames);
       std::memcpy(v.data() + at, assets[i].data.data(), assets[i].data.size());
       at += uint32_t(assets[i].data.size());
     }
@@ -238,6 +241,14 @@ void testCodeValidation() {
     Builder p;
     const uint8_t m = p.emit(Op::Math, p.scalar(1), p.scalar(1), 0, 0, kMathOpCount);
     p.emit(Op::Output, m, p.scalar(1));
+    auto b = p.blob();
+    assert(!rt.load(b.data(), b.size()) && rt.status() == Status::BadProgram);
+  }
+  // Blend mode index that does not exist.
+  {
+    Builder p;
+    const uint8_t o = p.emit(Op::Over, p.scalar(1), p.scalar(1), p.scalar(0), 0, kBlendCount);
+    p.emit(Op::Output, o, p.scalar(1));
     auto b = p.blob();
     assert(!rt.load(b.data(), b.size()) && rt.status() == Status::BadProgram);
   }
@@ -487,8 +498,301 @@ void testTexture() {
   assert(near(renderOne(r.blob()).r, 128));
 }
 
+// A strip of frames, indexed by a phase. The point of the op is that a phase between two
+// frames picks ONE OF THEM - it does not invent an image nobody drew - unless crossfade is
+// asked for explicitly.
+void testAnimation() {
+  // Four frames, one row each: red, green, blue, white.
+  std::vector<uint8_t> rows;
+  for (uint16_t v : {0xF800, 0x07E0, 0x001F, 0xFFFF}) {
+    rows.push_back(uint8_t(v & 0xFF));
+    rows.push_back(uint8_t(v >> 8));
+  }
+  const AssetSpec strip{1, 4, AssetFormat::RGB565, rows, 4};
+
+  // flags: clamp wrap, plus whatever the case is testing. A 1x1 panel samples the middle of
+  // whichever frame the phase picks.
+  auto frameAt = [&](float phase, uint8_t flags) {
+    Builder p;
+    p.addAsset(strip);
+    const uint8_t uv = p.emit(Op::UV);
+    p.emit(Op::Output, p.emit(Op::Anim, uv, p.scalar(phase), 0, 0, 0, uint8_t(1 | flags)), p.scalar(1));
+    return renderOne(p.blob(), 0, 0, 0, 1, 1);
+  };
+
+  // Hold: 0..1 spans the strip and stops at both ends. This is the blend-shape reading.
+  assert(frameAt(0.0f, 0).r == 255 && frameAt(0.0f, 0).g == 0);       // frame 0, red
+  assert(frameAt(1.0f, 0).r == 255 && frameAt(1.0f, 0).b == 255);     // frame 3, white
+  assert(frameAt(2.0f, 0).b == 255);                                  // past the end, held
+  const Pixel middle = frameAt(0.4f, 0);  // 0.4 * 3 = 1.2 -> frame 1
+  assert(middle.g == 255 && middle.r == 0 && middle.b == 0);          // green, NOT a blend
+
+  // Loop: the phase counts whole cycles and wraps. This is the animation reading.
+  assert(frameAt(0.3f, 32).g == 255);   // 0.3 * 4 = 1.2 -> frame 1
+  assert(frameAt(1.3f, 32).g == 255);   // a cycle later, the same frame
+  assert(frameAt(0.9f, 32).b == 255 && frameAt(0.9f, 32).r == 255);  // 3.6 -> frame 3
+
+  // Crossfade is the one way to get an image that is not in the strip: halfway between
+  // frame 1 and frame 2 is half green, half blue.
+  const Pixel blend = frameAt(0.5f, 16);  // 0.5 * 3 = 1.5
+  assert(near(blend.g, 128) && near(blend.b, 128) && blend.r == 0);
+
+  // More frames than rows would leave a frame with no pixels in it.
+  Builder bad;
+  bad.addAsset({1, 4, AssetFormat::RGB565, rows, 5});
+  const uint8_t buv = bad.emit(Op::UV);
+  bad.emit(Op::Output, bad.emit(Op::Anim, buv, bad.scalar(0), 0, 0, 0, 1), bad.scalar(1));
+  auto bad_blob = bad.blob();
+  ProtoShadeRuntime rt;
+  assert(!rt.load(bad_blob.data(), bad_blob.size()) && rt.status() == Status::BadLayout);
+}
+
+// The one loop in the VM. Its trip count comes from a constant so the cost of a pixel stays
+// knowable at load, which is what the step budget is built on.
+void testParticles() {
+  const AssetSpec dot{1, 1, AssetFormat::RGBA8888, {255, 255, 255, 255}};
+
+  // The five-quad parameter block, in the order prepareParticles() reads it. Defaults here
+  // are a single motionless particle, so a case only has to say what it is testing.
+  struct Params {
+    float count = 1, life = 1, fade = 0, seed = 0;
+    float direction = 0, spread = 0, speed = 0, speed_spread = 0;
+    float accel = 0, gx = 0, gy = 0;
+    float size = 1, size_spread = 0, size_rate = 0, size_accel = 0;
+    float rotation = 0, rot_spread = 0, rot_rate = 0, rot_accel = 0;
+  };
+  auto block = [](Builder& p, const Params& v) {
+    const uint8_t at = p.konst(v.count, v.life, v.fade, v.seed);
+    p.konst(v.direction, v.spread, v.speed, v.speed_spread);
+    p.konst(v.accel, v.gx, v.gy, 0.0f);
+    p.konst(v.size, v.size_spread, v.size_rate, v.size_accel);
+    p.konst(v.rotation, v.rot_spread, v.rot_rate, v.rot_accel);
+    return at;  // the block is contiguous, and the VM walks forward from here
+  };
+
+  auto build = [&](const Params& v, bool clock_is_const = true, uint16_t asset = 0) {
+    Builder p;
+    p.addAsset(dot);
+    const uint8_t pos = p.emit(Op::Centered);
+    // A per-pixel clock: legal as an operand, refused for Particles, because the particle
+    // state is worked out once per frame and a pixel coordinate would make that a lie.
+    const uint8_t clock = clock_is_const ? p.scalar(0) : p.emit(Op::Swizzle, pos, 0, 0, 0, 0);
+    p.emit(Op::Output, p.emit(Op::Particles, pos, clock, block(p, v), 0, uint8_t(asset), 0),
+           p.scalar(1));
+    return p.blob();
+  };
+
+  // One still particle, a sprite as wide as the space: the middle pixel is covered.
+  assert(renderOne(build({}), 0, 0, 0, 1, 1).r == 255);
+  // No particles is transparent, which the output flattens to black.
+  assert(renderOne(build({0}), 0, 0, 0, 1, 1).r == 0);
+  // Faded out at the end of its life, and scaled to nothing, are both invisible.
+  {
+    Params gone;
+    gone.fade = 1;
+    assert(renderOne(build(gone), 0, 0, 0, 1, 1).r < 255);
+    Params tiny;
+    tiny.size = 0;
+    assert(renderOne(build(tiny), 0, 0, 0, 1, 1).r == 0);
+  }
+  // Direction is a compass bearing: 0 sends them up the panel, 180 sends them down, 90 to
+  // the right. How FAR a particle has gone depends on its age, which is random - so the
+  // check is the same swarm under two settings, which share every random and differ only in
+  // where they went.
+  {
+    auto centre = [&](const Params& v, uint16_t w, uint16_t h) {
+      ProtoShadeRuntime rt(w, h);
+      auto blob = build(v);
+      assert(rt.load(blob.data(), blob.size()));
+      ExecContext ctx;
+      std::vector<Pixel> px(size_t(w) * h);
+      rt.renderFrame(ctx, rt.beginFrame(0), px.data());
+      float sum = 0, wx = 0, wy = 0;
+      for (uint16_t y = 0; y < h; y++) {
+        for (uint16_t x = 0; x < w; x++) {
+          const float lit = float(px[size_t(y) * w + x].r);
+          sum += lit;
+          wx += lit * float(x);
+          wy += lit * float(y);
+        }
+      }
+      assert(sum > 0);  // something was actually drawn
+      return std::pair<float, float>{wx / sum, wy / sum};
+    };
+
+    // A square panel, so Centered runs -1..1 on both axes and a displacement means the same
+    // thing either way.
+    Params v;
+    v.count = 12;
+    v.seed = 11;
+    v.life = 1;
+    v.size = 0.5f;
+    v.speed = 0.5f;
+    v.direction = 0;
+    const auto up = centre(v, 9, 9);
+    v.direction = 180;
+    const auto down = centre(v, 9, 9);
+    assert(up.second < down.second);  // up the panel is a smaller row number
+
+    v.direction = 90;
+    const auto east = centre(v, 9, 9);
+    v.direction = 270;
+    const auto west = centre(v, 9, 9);
+    assert(west.first < east.first);  // 90 degrees is to the right
+
+    // Gravity is a vector, and pushes every particle the same way whatever its direction.
+    v.direction = 0;
+    v.speed = 0;
+    v.gx = 1.5f;
+    const auto right = centre(v, 9, 9);
+    v.gx = -1.5f;
+    const auto left = centre(v, 9, 9);
+    assert(left.first < right.first);
+  }
+  // Rotation turns the sprite rather than moving it: a 1x1 sprite stays put either way, so
+  // what this pins down is that a wild angle is still a finite number and renders.
+  {
+    Params spun;
+    spun.rotation = 1.0e12f;  // nonsense from a web page
+    spun.rot_rate = 720;
+    assert(renderOne(build(spun), 0, 0, 0, 1, 1).r == 255);
+  }
+
+  // A parameter block that is not constants at all.
+  {
+    Builder p;
+    p.addAsset(dot);
+    const uint8_t pos = p.emit(Op::Centered);
+    const uint8_t reg = p.emit(Op::Time, p.scalar(0));
+    p.emit(Op::Output, p.emit(Op::Particles, pos, p.scalar(0), reg, 0, 0, 0), p.scalar(1));
+    auto blob = p.blob();
+    ProtoShadeRuntime rt;
+    assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
+  }
+  // A block that starts inside the pool but runs off the end of it.
+  {
+    Builder p;
+    p.addAsset(dot);
+    const uint8_t pos = p.emit(Op::Centered);
+    const uint8_t at = p.konst(1, 1, 0, 0);  // one quad where five are needed
+    p.emit(Op::Output, p.emit(Op::Particles, pos, p.scalar(0), at, 0, 0, 0), p.scalar(1));
+    auto blob = p.blob();
+    ProtoShadeRuntime rt;
+    assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
+  }
+  // A clock that changes from pixel to pixel.
+  {
+    auto blob = build({}, false);
+    ProtoShadeRuntime rt;
+    assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
+  }
+  // An asset index that was never packed.
+  {
+    auto blob = build({}, true, 7);
+    ProtoShadeRuntime rt;
+    assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
+  }
+  // The particle table is the PROGRAM's, not the instruction's: two emitters that together
+  // want more than kMaxParticles are refused, because there is nowhere to put the state.
+  {
+    Builder p;
+    p.addAsset(dot);
+    const uint8_t pos = p.emit(Op::Centered);
+    Params many;
+    many.count = format::kMaxParticles;
+    const uint8_t a = p.emit(Op::Particles, pos, p.scalar(0), block(p, many), 0, 0, 0);
+    const uint8_t b = p.emit(Op::Particles, pos, p.scalar(0), block(p, many), 0, 0, 0);
+    p.emit(Op::Output, p.emit(Op::Over, p.scalar(1), a, b, 0, 0), p.scalar(1));
+    auto blob = p.blob();
+    ProtoShadeRuntime rt;
+    assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
+  }
+  // A silly count is clamped to kMaxParticles, so the per-pixel cost stays bounded however
+  // the .bin was built - and the program still runs.
+  {
+    Params silly;
+    silly.count = 1e9f;
+    auto blob = build(silly);
+    ProtoShadeRuntime rt(1, 1);
+    assert(rt.load(blob.data(), blob.size()));
+    ExecContext ctx;
+    Pixel px{};
+    rt.renderRows(ctx, rt.beginFrame(0), 0, 1, &px);
+    assert(ctx.steps_used <= format::kMaxParticles * 16 && !ctx.budget_exceeded);
+  }
+}
+
+// Frame-uniform instructions - time, sensors, constants, anything derived from them - are
+// hoisted out of the per-pixel loop. A shader driving a sine from time alone was paying for
+// that sine on every pixel.
+void testUniformHoisting() {
+  // Nothing here depends on the pixel: the whole program is uniform and a pixel costs zero.
+  {
+    ProtoShadeRuntime rt(4, 4);
+    auto blob = flatColour(1, 0.5f, 0).blob();
+    assert(rt.load(blob.data(), blob.size()));
+    assert(rt.instructionCount() == 1);
+    assert(rt.uniformInstructions() == 1 && rt.pixelInstructions() == 0);
+    // Still renders the right colour: the value the uniform pass left in the register is
+    // what every pixel reads.
+    ExecContext ctx;
+    const Frame f = rt.beginFrame(0);
+    std::vector<Pixel> frame(16);
+    rt.renderFrame(ctx, f, frame.data());
+    for (const Pixel& p : frame) assert(p.r == 255 && near(p.g, 128) && p.b == 0);
+  }
+
+  // Time in, coordinates in: the time half hoists, the coordinate half does not.
+  {
+    Builder p;
+    const uint8_t t = p.emit(Op::Time, p.scalar(1));
+    const uint8_t wave = p.emit(Op::Math, t, p.scalar(0), 0, 0, 11);   // sine(time)
+    const uint8_t uv = p.emit(Op::UV);
+    const uint8_t mixed = p.emit(Op::Math, uv, wave, 0, 0, 0);         // uv + sine(time)
+    p.emit(Op::Output, mixed, p.scalar(1));
+
+    ProtoShadeRuntime rt(4, 4);
+    auto blob = p.blob();
+    assert(rt.load(blob.data(), blob.size()));
+    assert(rt.instructionCount() == 5);
+    // Time and the sine run once per frame; UV, the add and the output run per pixel.
+    assert(rt.uniformInstructions() == 2);
+    assert(rt.pixelInstructions() == 3);
+
+    // And the answer is unchanged: renderRows (which hoists) must agree with sample()
+    // (which does not), pixel for pixel.
+    ExecContext row_ctx, one_ctx;
+    const Frame f = rt.beginFrame(1500);
+    std::vector<Pixel> rows(16);
+    rt.renderFrame(row_ctx, f, rows.data());
+    for (uint16_t y = 0; y < 4; y++) {
+      for (uint16_t x = 0; x < 4; x++) {
+        const Pixel direct = rt.sample(one_ctx, f, x, y);
+        const Pixel& hoisted = rows[y * 4 + x];
+        assert(direct.r == hoisted.r && direct.g == hoisted.g && direct.b == hoisted.b);
+      }
+    }
+  }
+
+  // Writing a register twice would make hoisting unsound, so it is refused at load.
+  {
+    Builder p;
+    p.emit(Op::UV);          // writes r0
+    p.emit(Op::UV);          // writes r1...
+    p.code[9] = 0;           // ...patched to write r0 as well
+    p.emit(Op::Output, 0, p.scalar(1));
+    ProtoShadeRuntime rt;
+    auto blob = p.blob();
+    assert(!rt.load(blob.data(), blob.size()) && rt.status() == Status::BadProgram);
+  }
+}
+
 void testStepBudget() {
-  auto blob = flatColour(1, 1, 1).blob();
+  // A program that actually costs something per pixel: a constant colour is entirely
+  // uniform now, so its pixels are free and no budget can be blown by them.
+  Builder heavy;
+  heavy.emit(Op::Output, heavy.emit(Op::UV), heavy.scalar(1));
+  auto blob = heavy.blob();
   ProtoShadeRuntime rt(4, 4);
   assert(rt.load(blob.data(), blob.size()));
 
@@ -498,8 +802,10 @@ void testStepBudget() {
   assert(ctx.budget_exceeded && p.r == 0 && p.g == 0 && p.b == 0);
 
   ExecContext ok;
-  assert(rt.sample(ok, rt.beginFrame(0), 0, 0).r == 255 && !ok.budget_exceeded);
-  assert(ok.steps_used == rt.instructionCount());
+  assert(!ok.budget_exceeded);
+  rt.sample(ok, rt.beginFrame(0), 0, 0);
+  // steps_used is what a PIXEL costs, which is the varying half of the program.
+  assert(ok.steps_used == rt.pixelInstructions() && !ok.budget_exceeded);
 }
 
 // The whole point of the two-core split: halves rendered separately must equal one pass.
@@ -697,6 +1003,9 @@ int main() {
   testCombineMixOverHsv();
   testTimeAndSensors();
   testTexture();
+  testAnimation();
+  testParticles();
+  testUniformHoisting();
   testStepBudget();
   testRowSplitMatchesWholeFrame();
   testPanelMapping();

@@ -39,6 +39,8 @@ declare global {
     ): { name: string; value: unknown };
     /** Sets the property AND any widget bound to it. Prefer it over properties[name] = v. */
     setProperty(name: string, value: unknown): void;
+    /** Called by setProperty and by a widget the property is bound to. */
+    onPropertyChanged?: (name: string, value: unknown) => void;
     connect(slot: number | string, target: LGraphNode, targetSlot: number | string): boolean;
   }
 
@@ -55,6 +57,8 @@ declare global {
     createNode(type: string, title?: string, options?: object): LGraphNode | null;
     registerNodeType(type: string, base: unknown): void;
     clearRegisteredTypes(): void;
+    /** Closes any open value/right-click menu. They are DOM elements, not canvas drawing. */
+    closeAllContextMenus(ref_window?: Window): void;
     [key: string]: unknown;
   };
 }
