@@ -29,6 +29,13 @@ const verts = g.pos.length / 3;
 assert.equal(verts, 2 * 2 * (segments + 1), "two sides, two rows each");
 assert.equal(g.idx.length, 2 * segments * 6);
 assert.ok(Math.max(...g.idx) < verts, "every index points at a vertex that exists");
+// arc decides how tall the panel is drawn, so a texel is square only when it really is the
+// length of the strip. Walk the top row of one side and measure it off the mesh itself.
+let measured = 0;
+for (let i = 2; i <= segments * 2; i += 2) {
+  measured += Math.hypot(g.pos[i * 3] - g.pos[(i - 2) * 3], g.pos[i * 3 + 2] - g.pos[(i - 2) * 3 + 2]);
+}
+assert.ok(Math.abs(measured - g.arc) < 1e-5, `arc says ${g.arc}, the strip measures ${measured}`); // float32 mesh
 assert.ok(g.arc > 1, `one side should be more than a unit long, got ${g.arc}`);
 
 // Every texel of the canvas is on the head exactly once: u runs 0..0.5 on one side and

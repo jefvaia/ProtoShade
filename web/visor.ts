@@ -44,6 +44,8 @@ export function visorGeometry(segments = SEGMENTS): VisorGeometry {
 
   for (const side of [1, -1]) {
     const base = pos.length / 3;
+    let prevX = 0;
+    let prevZ = 0;
     for (let i = 0; i <= segments; i++) {
       const a = i / segments;
       const k = 1 - a;
@@ -53,11 +55,12 @@ export function visorGeometry(segments = SEGMENTS): VisorGeometry {
       const dx = 2 * (k * (BEND[0] - NOSE[0]) + a * (BACK[0] - BEND[0]));
       const dz = 2 * (k * (BEND[1] - NOSE[1]) + a * (BACK[1] - BEND[1]));
       const len = Math.hypot(dx, dz) || 1;
-      if (side === 1 && i > 0) {
-        const px = pos[pos.length - 6];
-        const pz = pos[pos.length - 4];
-        arc += Math.hypot(x - px, z - pz);
-      }
+      // Measured off the curve, not off `pos`: what goes in there is shifted by the nose gap
+      // and mirrored, and an arc measured from the shifted points is not the strip's length -
+      // which is the number that decides how tall a texel is.
+      if (side === 1 && i > 0) arc += Math.hypot(x - prevX, z - prevZ);
+      prevX = x;
+      prevZ = z;
       for (const y of [0.5, -0.5]) {
         pos.push(side * (x + NOSE_GAP), y, z);
         nrm.push((side * -dz) / len, 0, dx / len);
