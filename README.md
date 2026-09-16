@@ -26,3 +26,7 @@ Plain HTML + Tailwind v4 + TypeScript, no framework:
 
 `npm run build` minifies all three outputs; `npm run build:dev` skips minification
 and emits a JS sourcemap. Types are checked with `npm run typecheck`.
+
+`npm run dev` watches `web/`, rebuilds on every change and serves `dist/` on
+http://localhost:8000 (`-- --port 3000` to change it). The page reloads itself
+after each rebuild. Run `build.bat` once first, otherwise `protoshade.js` 404s.
