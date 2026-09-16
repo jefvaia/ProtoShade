@@ -3,6 +3,46 @@
 `src/ProtoShadeRuntime.{h,cpp}` is the portable core (no Arduino.h, no emscripten).
 It runs on the ESP32-S3 as an Arduino library and in the browser via wasm.
 
+## Runtime
+
+The core takes a `.bin` container, renders at a chosen resolution, and samples pixels.
+No shader VM yet — `sample()` returns a built-in test pattern until one lands.
+
+```cpp
+protoshade::ProtoShadeRuntime rt;
+rt.load(blob, len);              // validates the whole container, does NOT copy it
+rt.setResolution(64, 32);
+
+protoshade::ExecContext ctx;     // one per thread, never shared
+const auto frame = rt.beginFrame(millis());
+rt.renderRows(ctx, frame, 0, 16, buffer);   // rows [0,16) -> this is a core's unit of work
+```
+
+Threading lives outside the core: wasm has no FreeRTOS, so the core cannot spawn tasks.
+It exposes `renderRows()` and the platform splits the frame. `sample()` is `const` and
+keeps no shared mutable state, so two cores can run it at once — per-frame values come in
+as an immutable `Frame`, per-thread scratch as a caller-owned `ExecContext`.
+
+`src/ProtoShadeParallel.{h,cpp}` is the ESP32 half of that: two tasks pinned to core 0 and
+core 1, each rendering half the frame. It is the only non-portable file, `#if`-guarded so
+every other target skips it.
+
+### The .bin container
+
+One file holds everything the device needs — program code plus assets (PNGs converted to
+raw RGB565 by the web app; the ESP32 never decodes PNG). Layout is documented at the top of
+`ProtoShadeRuntime.h`; `test/test.cpp` builds one byte by byte and is the arbiter if the
+packer and the runtime ever disagree.
+
+It belongs in a **flash** partition, not RTC memory — RTC RAM is 8 KB and is lost on power
+loss. `esp_partition_mmap()` maps it into the address space, which is why `load()` borrows
+the bytes instead of copying them: the assets then cost no RAM. The blob must outlive the
+runtime, so never overwrite the partition you are rendering from.
+
+Everything a program declares is bounds-checked at `load()`, and `ExecContext::step_limit`
+caps work per pixel. Both matter because the `.bin` arrives from a web page: untrusted
+input, running on hardware strapped to someone's head.
+
 ## Build
 
 Two independent builds, both writing into `dist/`:
