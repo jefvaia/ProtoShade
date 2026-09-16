@@ -48,6 +48,17 @@ constexpr const char* AP_PASSWORD = "protogen";  // 8 characters minimum, or the
 // The one below needs no hardware and no libraries: it prints a frame counter and the
 // average colour, which is enough to tell whether the head is rendering what you think.
 // Replace it with the real thing - two sketches are below it.
+//
+// Pins that are already taken on an ESP32-S3-WROOM-1, before you plan a HUB75 harness:
+//
+//   GPIO 26-32   the module's own SPI flash. Never usable.
+//   GPIO 33-37   octal PSRAM, so gone on the R8 parts (N16R8 included) and free on the
+//                ones without it. This is the trap: schematics for N16R2 boards use them.
+//   GPIO 19, 20  native USB D-/D+, so gone while "USB CDC On Boot" is how you talk to it.
+//   GPIO 0       the BOOT button - this sketch uses it to enter upload mode.
+//   GPIO 3, 45, 46  strapping pins. Fine as inputs, awkward as outputs at boot.
+//
+// That leaves 1-2, 4-18, 21, 38-44, 47, 48: enough for HUB75 (13 pins) and sensors.
 
 class SerialDisplay : public Display {
 public:
