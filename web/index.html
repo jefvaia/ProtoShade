@@ -1,23 +1,19 @@
 <!doctype html>
-<title>protoshade</title>
-<body style="background:#111">
-<canvas id="c" width="8" height="8" style="width:320px;image-rendering:pixelated"></canvas>
-<script type="module">
-import createModule from '../dist/protoshade.js';
-
-const m = await createModule();
-const face = new m.Protoshade(8, 8);
-const ctx = document.getElementById('c').getContext('2d');
-const img = ctx.createImageData(8, 8);
-
-function frame(t) {
-  for (let y = 0; y < 8; y++)
-    for (let x = 0; x < 8; x++) {
-      const v = face.pixel(x, y, Math.floor(t));
-      img.data.set([0, v, v, 255], (y * 8 + x) * 4);
-    }
-  ctx.putImageData(img, 0, 0);
-  requestAnimationFrame(frame);
-}
-requestAnimationFrame(frame);
-</script>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ProtoShade</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body class="min-h-screen bg-neutral-900 text-neutral-100 flex flex-col items-center justify-center gap-6 font-mono">
+  <h1 class="text-2xl tracking-widest uppercase">ProtoShade</h1>
+  <canvas id="c" width="8" height="8" class="w-80 h-80 [image-rendering:pixelated] rounded ring-1 ring-neutral-700"></canvas>
+  <p class="text-sm text-neutral-400">ProtoShade-Runtime, compiled to wasm.</p>
+  <!-- Classic script, not bundled: litegraph's IIFEs end in })(this) to reach the global
+       object, and inside an ES module top-level this is undefined. Module scripts are
+       deferred, so main.js always runs after this one. -->
+  <script src="./vendor/litegraph.min.js"></script>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+{
+  "name": "protoshade-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Website for the ProtoShade-Runtime wasm build: plain HTML + Tailwind + TypeScript.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && node scripts/build-web.mjs",
+    "build:dev": "node scripts/build-web.mjs --no-minify",
+    "dev": "node scripts/build-web.mjs --watch"
+  },
+  "license": "ISC",
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.3.3",
+    "esbuild": "^0.28.2",
+    "html-minifier-terser": "^7.2.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2"
+  }
+}

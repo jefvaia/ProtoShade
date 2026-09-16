@@ -1,5 +1,8 @@
-# Build output (build.bat)
+# Build output (build.bat, scripts/build-web.mjs)
 dist/
+
+# npm
+node_modules/
 
 # Stray archives
 *.zip
