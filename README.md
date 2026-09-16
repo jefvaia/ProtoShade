@@ -50,7 +50,7 @@ Two independent builds, both writing into `dist/`:
 ```
 build.bat              # em++: runs test/test.cpp, then emits dist/protoshade.js + .wasm
 npm install
-npm run build          # tsc typecheck + minified dist/index.html, main.js, styles.css
+npm run build          # typecheck + npm test + minified dist/index.html, main.js, styles.css
 ```
 
 Serve `dist/` over HTTP (not `file://` — it is an ES module) and open `index.html`.
@@ -60,10 +60,39 @@ Serve `dist/` over HTTP (not `file://` — it is an ES module) and open `index.h
 Plain HTML + Tailwind v4 + TypeScript, no framework:
 
 - `web/index.html` — markup, Tailwind utility classes
-- `web/main.ts` — canvas loop, imports the wasm module
+- `web/main.ts` — page wiring: editor, resolution, preview loop
+- `web/nodes.ts` — the node library (definitions + litegraph registration)
+- `web/graph.ts` — compiles a node graph into a per-pixel function
 - `web/styles.css` — `@import "tailwindcss"` + `@source` scan list
 - `web/protoshade.d.ts` — hand-written types for the emscripten glue
 - `web/vendor/` — third-party files, committed (no CDN: the ESP32 has no internet)
+
+### The shader editor
+
+A Blender-style node graph (litegraph) on the left, an LED-matrix preview on the right.
+Set the panel resolution in the header — free text, clamped to 1..512 per side, which is
+the container's `kMaxDimension`. Right-click the canvas to add a node.
+
+Every value is **RGBA**: a plain number broadcasts to `[n, n, n, 1]` (opaque), and a node
+that wants a single number reads R. One type means no coercion rules to remember, and
+alpha survives all the way from an uploaded PNG to the `Alpha Over` node. `LED Output`
+flattens alpha against black — the panel has nothing behind it.
+
+Nodes: `Coordinates` (UV / centered / pixel), `Time`, `Value`, `Color`, `Math` (20
+component-wise ops), `Mix`, `Alpha Over`, `Separate`/`Combine RGBA`, `HSV`, `Image`
+(uploads a PNG/JPG, downscaled to 512px, sampled nearest or linear, repeat or clamp) and
+`LED Output`. An unconnected input falls back to the node's own widget.
+
+The graph autosaves to `localStorage` (uploads included, as data URLs) and reloads with
+the page. "reset graph" puts the starter graph back.
+
+Today the preview evaluates the graph **in TypeScript** — the runtime has no shader VM
+yet, so the wasm module is only probed for presence ("device runtime: loaded / not
+built"). When the VM lands, the page packs a `.bin` and this evaluator becomes the
+reference the wasm output is checked against, so keep the two honest:
+`npm test` runs `test/graph-eval.test.mjs`, which compiles graph literals and asserts the
+maths, the alpha compositing, the guarded ops (divide by zero, negative sqrt) and that a
+cycle neither hangs nor crashes. `npm run build` runs it.
 
 ### Adding a vendor file
 

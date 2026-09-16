@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "npm run typecheck && node scripts/build-web.mjs",
+    "test": "node test/graph-eval.test.mjs",
+    "build": "npm run typecheck && npm test && node scripts/build-web.mjs",
     "build:dev": "node scripts/build-web.mjs --no-minify",
     "dev": "node scripts/build-web.mjs --watch"
   },
