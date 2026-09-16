@@ -133,7 +133,10 @@ is just the `frames == 1` case. Layout is
 documented at the top of `ProtoShadeRuntime.h`; `test/test.cpp` builds one byte by byte and is
 the arbiter if the packer and the runtime ever disagree.
 
-It is written to flash **header last**. The first sector is held in RAM until every other
+It is written to flash **header last**, and erased a block ahead of the write head rather
+than all at once - erasing a 3.6 MB span in one call leaves the head unable to answer for
+about ten seconds, and the host is sitting on a ten-second timeout waiting for the ack that
+paces the transfer, so a big `.bin` died at its first chunk and blamed the cable. The first sector is held in RAM until every other
 byte has landed, so a transfer that dies halfway - or a head unplugged mid-upload - leaves a
 partition that does not parse as a program at all, rather than one that loads and renders the
 erased flash behind it. Erased flash is `0xFF`, and `0xFF` in an RGBA image is opaque white,
@@ -308,7 +311,15 @@ you scale the UV to place a sprite:
 With `linear` filtering, `clip` fades the alpha at the boundary but keeps the edge colour,
 so a sprite feathers out instead of picking up a dark fringe.
 
-The graph autosaves to `localStorage` (uploads included) and reloads with the page.
+The graph autosaves to `localStorage` (uploads included) and reloads with the page - until
+the art in it is bigger than the browser's storage quota, which a few megabytes of frames
+will be. The editor says so rather than failing quietly, and stops re-serialising megabytes
+of JSON once a second after the first refusal.
+
+It also says when an image is far bigger than the panel. A 320x240 frame on a 64x32 panel is
+thirty-seven pixels stored for every pixel the head can light: nothing renders wrong, it just
+costs megabytes of flash and minutes of transfer for something that is thrown away at sample
+time. Re-import at the panel's own size.
 
 ### The visor view
 

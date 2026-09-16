@@ -41,11 +41,13 @@ std::vector<uint8_t> flash;
 esp_partition_t the_partition{kPartitionSize};
 size_t erased_bytes = 0;
 size_t written_bytes = 0;
+size_t largest_erase = 0;
 
 void resetFlash(uint8_t fill = 0x00) {
   flash.assign(kPartitionSize, fill);
   erased_bytes = 0;
   written_bytes = 0;
+  largest_erase = 0;
 }
 
 }  // namespace
@@ -76,6 +78,7 @@ esp_err_t esp_partition_erase_range(const esp_partition_t*, size_t offset, size_
   assert(offset + size <= flash.size());
   std::memset(flash.data() + offset, 0xFF, size);
   erased_bytes += size;
+  if (size > largest_erase) largest_erase = size;
   return ESP_OK;
 }
 
@@ -228,6 +231,9 @@ void testSerialUpload() {
   const size_t padded = ((bin.size() + kSector - 1) / kSector) * kSector;
   for (size_t i = bin.size(); i < padded; i++) assert(flash[i] == 0xFF);
   assert(erased_bytes >= padded && "the region written was not all erased first");
+  // No single erase may be long enough to starve the host's ack timeout. Erasing the whole
+  // span in one call is what made a multi-megabyte upload die at its first chunk.
+  assert(largest_erase <= 64 * 1024 && "one erase call covered more than a block");
 
   // And the runtime renders the same picture out of flash as it does out of RAM. This is
   // the one that would have caught a torn asset: a wrong texel is a wrong pixel, and
@@ -310,10 +316,27 @@ void testBadHeaderKeepsTheOldProgram() {
   }
 }
 
+// A program small enough to be one sector never writes a second one, so nothing but the
+// commit erases anything. Get that wrong and the header is written over unerased flash,
+// where a NOR write only clears bits and the result is neither the old file nor the new one.
+void testSingleSectorUpload() {
+  const std::vector<uint8_t> bin = animationProgram(4, 4, 2);
+  assert(bin.size() < kSector);
+  resetFlash(0x5A);
+
+  ProtoShadeRuntime rt(4, 4);
+  const std::vector<uint8_t> wire = serialTransfer(bin);
+  queue(wire);
+  assert(upload::receiveOverSerial(rt) && "a one-sector program was refused");
+  for (size_t i = 0; i < bin.size(); i++) assert(flash[i] == bin[i]);
+  assert(rt.hasProgram());
+}
+
 }  // namespace
 
 int main() {
   testSerialUpload();
+  testSingleSectorUpload();
   testTruncatedUpload();
   testBadHeaderKeepsTheOldProgram();
   std::puts("upload-check: ok");

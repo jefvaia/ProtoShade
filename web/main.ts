@@ -132,16 +132,27 @@ examplePicker.onchange = () => {
 
 const SAVE_KEY = "protoshade.graph";
 let lastSaved = "";
+/** The last autosave hit the browser's storage quota. Worth saying out loud: the README
+    promises the graph comes back with the page, and with megabytes of art it does not. */
+let saveFailed = false;
 
 function save(): void {
+  let json = "";
   try {
-    const json = JSON.stringify(graph.serialize());
+    json = JSON.stringify(graph.serialize());
     if (json === lastSaved) return;
     localStorage.setItem(SAVE_KEY, json);
-    lastSaved = json;
+    saveFailed = false;
   } catch {
-    /* private mode, or the graph outgrew the quota - keep editing regardless */
+    // Private mode, or the graph outgrew the quota - keep editing regardless. A graph with
+    // a few megabytes of art in it is past what localStorage will take, and the browser
+    // says so by throwing.
+    saveFailed = json !== "";
   }
+  // Tried, either way. Without this a graph too big to store is re-serialised and re-thrown
+  // every second for the rest of the session, and megabytes of JSON on the main thread once
+  // a second is enough to starve a USB transfer of the acks that pace it.
+  lastSaved = json;
 }
 
 /** Re-decode every image a restored graph carries. */
@@ -456,11 +467,26 @@ function render(now: number): void {
     const size = current ? packedSize(current) : 0;
     // Baking buys instructions with flash, so both numbers have to be on screen at once -
     // and it still has to fit the head's partition (partitions.csv).
+    //
+    // Art far bigger than the panel is the other way a .bin gets out of hand, and a quieter
+    // one: a 320x240 frame on a 64x32 panel is thirty-seven pixels stored for every pixel
+    // the head can light. Nothing renders wrong, it just costs megabytes of flash and
+    // minutes of transfer for something the panel cannot show. Four times the panel is the
+    // threshold, so a sprite that is meant to be bigger than its target says nothing.
+    const bloated = current?.assets.find(
+      (a) => a.w * Math.floor(a.h / Math.max(1, a.frames)) > 4 * W * H,
+    );
     hint.textContent = !result.ok
       ? result.reason
       : size > PARTITION_BYTES
         ? `${(size / 1048576).toFixed(2)} MB will not fit the head's ${PARTITION_BYTES / 1048576} MB partition - fewer baked frames, or a smaller panel`
-        : "";
+        : bloated
+          ? `an image is ${bloated.w}x${Math.floor(bloated.h / Math.max(1, bloated.frames))} for a ${W}x${H} panel - ` +
+            `${Math.round((bloated.w * Math.floor(bloated.h / Math.max(1, bloated.frames))) / (W * H))}x the pixels the head can show. ` +
+            `Re-import it at ${W}x${H} and the .bin gets that much smaller`
+          : saveFailed
+            ? "too big to autosave - the graph will not come back when you reload the page"
+            : "";
     binInfo.textContent = current
       ? `${instructionCount(current)} instructions · ${current.assets.length} image${current.assets.length === 1 ? "" : "s"} · ` +
         `${(size / 1024).toFixed(1)} KB .bin` +

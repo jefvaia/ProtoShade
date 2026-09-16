@@ -42,6 +42,7 @@ struct Upload {
   uint8_t first[4096];
   size_t inSector;
   uint32_t written;
+  uint32_t erased;    // how far the erase has got, ahead of `written`
   uint32_t declared;  // total_length out of the header, known once 48 bytes have arrived
   bool failed;
   const char* error;
@@ -51,6 +52,7 @@ struct Upload {
   void reset() {
     inSector = 0;
     written = 0;
+    erased = 0;
     declared = 0;
     failed = false;
     error = "";
@@ -106,6 +108,32 @@ bool loadProgram() {
   return true;
 }
 
+// Erases ahead of the write head, a block at a time.
+//
+// Erasing the program's whole span in one call was simpler and, on a big .bin, fatal: the
+// head stops answering for as long as it takes, and the host is sitting on a ten-second
+// timeout waiting for the ack that paces the transfer. Three and a half megabytes is on the
+// order of ten seconds of erase, so the transfer died at the first chunk of a big file and
+// blamed the cable. A block at a time is the same total work spread over the upload, and no
+// single call takes longer than one erase of one block.
+//
+// 64 KB because that is the block the flash erases natively; going sector by sector would be
+// correct and several times slower.
+constexpr uint32_t kEraseBlock = 64 * 1024;
+
+bool eraseThrough(uint32_t upto) {
+  while (state.erased < upto) {
+    uint32_t take = kEraseBlock;
+    if (state.erased + take > partition->size) take = partition->size - state.erased;
+    if (take == 0 || esp_partition_erase_range(partition, state.erased, take) != ESP_OK) {
+      state.fail("flash erase failed");
+      return false;
+    }
+    state.erased += take;
+  }
+  return true;
+}
+
 // Writes one 4096-byte sector. Flash wants whole sectors, and an upload arrives in chunks of
 // whatever size the browser felt like, so everything goes through this.
 bool flushSector() {
@@ -122,6 +150,7 @@ bool flushSector() {
     return true;
   }
 
+  if (!eraseThrough(state.written + uint32_t(sizeof(state.sector)))) return false;
   const esp_err_t err = esp_partition_write(partition, state.written, state.sector, sizeof(state.sector));
   if (err != ESP_OK) {
     state.failed = true;
@@ -148,6 +177,7 @@ bool commit() {
     state.fail("the transfer stopped halfway");
     return false;
   }
+  if (!eraseThrough(uint32_t(sizeof(state.first)))) return false;
   if (esp_partition_write(partition, 0, state.first, sizeof(state.first)) != ESP_OK) {
     state.fail("flash write failed");
     return false;
@@ -253,14 +283,10 @@ bool feed(const uint8_t* data, size_t len) {
         return false;
       }
       state.declared = declared;
-
-      // Erase only what this program needs, rounded up to whole sectors. Erasing a
-      // megabyte we are not going to use would cost a second for nothing.
-      const uint32_t span = (declared + 4095) & ~uint32_t(4095);
-      if (esp_partition_erase_range(partition, 0, span) != ESP_OK) {
-        state.fail("flash erase failed");
-        return false;
-      }
+      // Nothing is erased here: eraseThrough() does it a block ahead of the write head, so
+      // the head never goes quiet for longer than one block. Until the first sector is
+      // written the old program is still intact, which is what makes a rejected header
+      // harmless.
     }
 
     if (state.inSector == sizeof(state.sector) && !flushSector()) return false;
