@@ -60,10 +60,27 @@ bool buttonHeld(uint32_t ms) {
   if (!buttonDown()) return false;
   const uint32_t started = millis();
   while (millis() - started < ms) {
-    if (!buttonDown()) return false;
+    if (!buttonDown()) {
+      // Worth saying out loud: "I pressed it and nothing happened" and "the pin never went
+      // low" are different problems, and this is the line that tells them apart.
+      Serial.println("button: saw a press but it was released too early - hold it a moment");
+      return false;
+    }
     delay(5);
   }
   return true;
+}
+
+// Typing u on the serial monitor does the same thing, window or not. A button is one wire
+// and one pin number away from not working; this path has neither, so it is also the answer
+// for a head that has no button on it yet.
+bool uploadRequestedOverSerial() {
+  bool asked = false;
+  while (Serial.available() > 0) {
+    const int c = Serial.read();
+    if (c == 'u' || c == 'U') asked = true;
+  }
+  return asked;
 }
 
 void swapCanvases() {
@@ -99,7 +116,7 @@ void renderFace() {
 // ---------------------------------------------------------------------------
 
 void enterUploadMode() {
-  Serial.println("button pressed - switching to upload mode");
+  Serial.println("switching to upload mode: the face stops, WiFi comes up");
   mode = Mode::Upload;
 
   // Stop rendering before the flash partition can be erased under us, and give the two
@@ -129,6 +146,12 @@ void setup() {
   delay(200);
 
   pinMode(BUTTON_PIN, BUTTON_ACTIVE_LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
+  delay(10);  // let the pull settle before reading it
+  // Reads PRESSED with nothing touched means the pin or the polarity is wrong, and that is
+  // worth knowing at boot rather than after a minute of pressing a button that does nothing.
+  Serial.printf("button: GPIO %d reads %s at boot%s\n", BUTTON_PIN,
+                buttonDown() ? "PRESSED" : "released",
+                buttonDown() ? "  <-- wrong pin, or BUTTON_ACTIVE_LOW is inverted" : "");
 
   for (size_t i = 0; i < PANEL_COUNT; i++) {
     if (PANELS[i].display && !PANELS[i].display->begin()) {
@@ -147,7 +170,8 @@ void setup() {
     Serial.println("pusher.begin() failed - out of memory?");
   }
 
-  Serial.printf("face running at %ux%u. Press the button within %lu s for upload mode.\n",
+  Serial.printf("face running at %ux%u. Press the button within %lu s for upload mode, or\n"
+                "type u here at any time.\n",
                 CANVAS_W, CANVAS_H, (unsigned long)(UPLOAD_WINDOW_MS / 1000));
 }
 
@@ -159,10 +183,22 @@ void loop() {
     return;
   }
 
-  // The window is measured from boot. Past it, the button does nothing at all.
-  if (millis() < UPLOAD_WINDOW_MS && buttonHeld(50)) {
+  if (uploadRequestedOverSerial()) {
     enterUploadMode();
     return;
+  }
+
+  // The window is measured from boot. Past it the button does nothing at all, which is the
+  // point - but say so once, or a press at 61 seconds looks like a broken button.
+  static bool window_closed = false;
+  if (millis() < UPLOAD_WINDOW_MS) {
+    if (buttonHeld(50)) {
+      enterUploadMode();
+      return;
+    }
+  } else if (!window_closed) {
+    window_closed = true;
+    Serial.println("upload window closed - power-cycle for the button, or type u here");
   }
 
   renderFace();

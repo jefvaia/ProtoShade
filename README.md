@@ -231,11 +231,24 @@ render into a;      // a is free: submit(b) did not return until its push finish
 
 ### Upload mode
 
-**To get into it: press the button within 60 seconds of power-on** - `BUTTON_PIN` in
-`head_config.h`, GPIO 0 (the BOOT button) by default. Hold it for a moment; a contact bounce
-is ignored on purpose. Serial says `button pressed - switching to upload mode`, then prints
-the address. Press it *after* the board has booted - holding BOOT while resetting puts the
-chip in its ROM download mode instead, which has nothing to do with this.
+**Two ways in.** Press the button within 60 seconds of power-on - `BUTTON_PIN` in
+`head_config.h`, GPIO 0 (the BOOT button) by default - holding it for a moment, since a
+contact bounce is ignored on purpose. Press it *after* the board has booted: holding BOOT
+while resetting puts the chip in its ROM download mode, which is a different thing.
+
+Or **type `u` in the serial monitor**, any time, window or not. No button, no wiring, no
+window to miss. Use this one when the button is not behaving.
+
+The serial log says which of those is failing:
+
+```
+button: GPIO 0 reads released at boot          <- pin and polarity are right
+button: GPIO 0 reads PRESSED at boot  <-- ...  <- wrong pin, or inverted polarity
+button: saw a press but it was released too early - hold it a moment
+upload window closed - power-cycle for the button, or type u here
+switching to upload mode: the face stops, WiFi comes up
+upload mode: join ProtoShade, open http://192.168.4.1/
+```
 
 Miss the window and the button stops doing anything until the next power cycle. That is the
 point: your face cannot fall into an access point because something knocked the button.
