@@ -10,7 +10,7 @@ import type { Program } from "./graph.js";
 
 export const HEADER_SIZE = 48;
 export const ASSET_ENTRY_SIZE = 16;
-export const FORMAT_VERSION = 2;
+export const FORMAT_VERSION = 3;
 
 export function pack(p: Program): Uint8Array {
   const constBytes = p.consts.length * 4;

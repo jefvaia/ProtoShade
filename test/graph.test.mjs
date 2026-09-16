@@ -173,6 +173,23 @@ const near = (got, want, what) => {
   // Out of range u wraps back onto the left texel instead of reading out of bounds.
   near(shade(g, images, { u: -0.75 }).colour, [0, 1, 0, 1], "u wraps");
   near(shade(g, new Map(), { u: 0.25 }).colour, [0, 0, 0, 1], "no upload renders transparent, not a crash");
+
+  // wrap modes, sampled past the right edge of the image.
+  const wrapped = (wrap, u) =>
+    shade(graph([[1, "texture/image", { wrap, filter: "nearest" }, null], out(2, 10)], { 10: [1, 0] }), images, { u })
+      .colour;
+  near(wrapped("repeat", 1.25), [0, 1, 0, 1], "repeat tiles back to the left texel");
+  near(wrapped("clamp", 1.25), [0, 0, 0, 1], "clamp stretches the edge texel - here a clear one");
+  near(wrapped("clip", 1.25), [0, 0, 0, 1], "clip is transparent outside the image");
+  // The difference between clamp and clip shows up on an opaque edge: clamp keeps painting
+  // it, clip stops. This is the smearing you see placing a sprite with scaled UV.
+  const opaque = new Map([[1, { w: 2, h: 1, data: Uint8ClampedArray.from([255, 0, 0, 255, 0, 0, 255, 255]) }]]);
+  const edge = (wrap, u) =>
+    shade(graph([[1, "texture/image", { wrap, filter: "nearest" }, null], out(2, 10)], { 10: [1, 0] }), opaque, { u })
+      .colour;
+  near(edge("clamp", 1.6), [0, 0, 1, 1], "clamp smears the last texel outwards");
+  near(edge("clip", 1.6), [0, 0, 0, 1], "clip shows nothing out there");
+  near(edge("clip", 0.75), [0, 0, 1, 1], "and still draws the image itself");
 }
 
 // --- sensors -----------------------------------------------------------------

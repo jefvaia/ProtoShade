@@ -137,6 +137,18 @@ Nodes: `Coordinates` (UV / centered / pixel), `Time`, `Sensor`, `Value`, `Color`
 component-wise ops), `Mix`, `Alpha Over`, `Separate`/`Combine RGBA`, `HSV`, `Image` and
 `LED Output`. An unconnected input falls back to the node's own widget.
 
+The `Image` node's **wrap** decides what happens outside the image, which matters the moment
+you scale the UV to place a sprite:
+
+- `clip` (default) — nothing outside 0..1. The sprite appears once and stops.
+- `clamp` — the edge texel stretches outwards. Scale the UV by 2.3 and the last column and
+  row of the image smear across the rest of the panel, which is where those streaks come
+  from. Useful for a deliberate gradient off the edge, wrong for a sprite.
+- `repeat` — tiles.
+
+With `linear` filtering, `clip` fades the alpha at the boundary but keeps the edge colour,
+so a sprite feathers out instead of picking up a dark fringe.
+
 The graph autosaves to `localStorage` (uploads included) and reloads with the page.
 
 ## The head

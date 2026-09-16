@@ -191,7 +191,7 @@ check(
 // --- images: both packed formats, both filters, both wrap modes ---------------
 for (const opaque of [true, false]) {
   for (const filter of ["nearest", "linear"]) {
-    for (const wrap of ["repeat", "clamp"]) {
+    for (const wrap of ["repeat", "clamp", "clip"]) {
       const images = new Map([[1, testImage(5, 3, opaque)]]);
       check(
         `image:${opaque ? "rgb565" : "rgba"}:${filter}:${wrap}`,

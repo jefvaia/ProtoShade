@@ -414,20 +414,23 @@ function hsv(r: Float32Array, d: number, h: number, s: number, v: number, a: num
 function texel(a: PackedAsset, xi: number, yi: number, wrap: number, out: Vec): void {
   const fold = (t: number, n: number): number => (wrap !== 0 ? Math.min(Math.max(t, 0), n - 1) : ((t % n) + n) % n);
   const i = fold(yi, a.h) * a.w + fold(xi, a.w);
+  // clip keeps the edge COLOUR but drops the alpha, so a linear fetch at the boundary fades
+  // out instead of fading to black and leaving a dark fringe round the sprite.
+  const clipped = wrap === 2 && (xi < 0 || yi < 0 || xi >= a.w || yi >= a.h);
   if (a.format === ASSET.RGBA8888) {
     out[0] = a.data[i * 4] / 255;
     out[1] = a.data[i * 4 + 1] / 255;
     out[2] = a.data[i * 4 + 2] / 255;
-    out[3] = a.data[i * 4 + 3] / 255;
+    out[3] = clipped ? 0 : a.data[i * 4 + 3] / 255;
   } else if (a.format === ASSET.A8) {
     out[0] = out[1] = out[2] = 1;
-    out[3] = a.data[i] / 255;
+    out[3] = clipped ? 0 : a.data[i] / 255;
   } else {
     const v = a.data[i * 2] | (a.data[i * 2 + 1] << 8);
     out[0] = ((v >> 11) & 31) / 31;
     out[1] = ((v >> 5) & 63) / 63;
     out[2] = (v & 31) / 31;
-    out[3] = 1;
+    out[3] = clipped ? 0 : 1;
   }
 }
 
@@ -441,8 +444,8 @@ function texture(r: Float32Array, d: number, a: PackedAsset | undefined, u: numb
     r[d] = r[d + 1] = r[d + 2] = r[d + 3] = 0;
     return;
   }
-  const wrap = flags & 1;
-  if ((flags & 2) === 0) {
+  const wrap = flags & 3;
+  if ((flags & 4) === 0) {
     texel(a, Math.floor(u * a.w), Math.floor(v * a.h), wrap, t0);
   } else {
     const x = u * a.w - 0.5;
@@ -460,7 +463,7 @@ function texture(r: Float32Array, d: number, a: PackedAsset | undefined, u: numb
       t0[c] = top + (t2[c] + (t3[c] - t2[c]) * fx - top) * fy;
     }
   }
-  if ((flags & 4) !== 0) {
+  if ((flags & 8) !== 0) {
     broadcast(r, d, t0[3]);
     return;
   }

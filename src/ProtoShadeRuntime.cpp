@@ -128,10 +128,12 @@ uint8_t operandCount(uint8_t op) {
   }
 }
 
-int32_t foldCoord(int32_t t, int32_t n, bool clamp) {
-  if (clamp) return t < 0 ? 0 : (t >= n ? n - 1 : t);
-  const int32_t m = t % n;
-  return m < 0 ? m + n : m;
+int32_t foldCoord(int32_t t, int32_t n, Wrap wrap) {
+  if (wrap == Wrap::Repeat) {
+    const int32_t m = t % n;
+    return m < 0 ? m + n : m;
+  }
+  return t < 0 ? 0 : (t >= n ? n - 1 : t);
 }
 
 }  // namespace
@@ -271,7 +273,7 @@ bool ProtoShadeRuntime::validateCode() {
       status_ = Status::BadProgram;
       return false;
     }
-    if (op == uint8_t(Op::Tex) && aux >= asset_count_) {
+    if (op == uint8_t(Op::Tex) && (aux >= asset_count_ || (aux2 & 3) >= uint8_t(Wrap::kCount))) {
       status_ = Status::BadProgram;
       return false;
     }
@@ -324,25 +326,29 @@ bool ProtoShadeRuntime::asset(uint16_t index, Asset& out) const {
   return true;
 }
 
-void ProtoShadeRuntime::texel(uint16_t index, int32_t x, int32_t y, bool clamp, float* rgba) const {
+void ProtoShadeRuntime::texel(uint16_t index, int32_t x, int32_t y, Wrap wrap, float* rgba) const {
   const AssetRef& a = assets_[index];
   const uint8_t* data = a.data;
-  const size_t at = size_t(foldCoord(y, a.h, clamp)) * size_t(a.w) + size_t(foldCoord(x, a.w, clamp));
+  const size_t at = size_t(foldCoord(y, a.h, wrap)) * size_t(a.w) + size_t(foldCoord(x, a.w, wrap));
+  // Clip keeps the edge COLOUR but drops the alpha, so a linear fetch at the boundary fades
+  // out instead of fading to black and leaving a dark fringe round the sprite.
+  const bool clipped = wrap == Wrap::Clip && (x < 0 || y < 0 || x >= a.w || y >= a.h);
 
   switch (a.format) {
     case AssetFormat::RGBA8888:
       for (int c = 0; c < 4; c++) rgba[c] = data[at * 4 + c] / 255.0f;
+      if (clipped) rgba[3] = 0.0f;
       break;
     case AssetFormat::A8:
       rgba[0] = rgba[1] = rgba[2] = 1.0f;
-      rgba[3] = data[at] / 255.0f;
+      rgba[3] = clipped ? 0.0f : data[at] / 255.0f;
       break;
     default: {
       const uint16_t v = rd16(data + at * 2);
       rgba[0] = float((v >> 11) & 31) / 31.0f;
       rgba[1] = float((v >> 5) & 63) / 63.0f;
       rgba[2] = float(v & 31) / 31.0f;
-      rgba[3] = 1.0f;
+      rgba[3] = clipped ? 0.0f : 1.0f;
       break;
     }
   }
@@ -455,12 +461,12 @@ Pixel ProtoShadeRuntime::sample(ExecContext& ctx, const Frame& frame, uint16_t x
         hsvToRgb(dst, a[0], src(in, 1)[0], src(in, 2)[0], src(in, 3)[0]);
         break;
       case Op::Tex: {
-        const bool clamp = (aux2 & 1) != 0;
+        const Wrap wrap = Wrap(aux2 & 3);
         const float aw = float(assets_[aux].w);
         const float ah = float(assets_[aux].h);
         float rgba[4];
-        if (!(aux2 & 2)) {
-          texel(aux, int32_t(std::floor(a[0] * aw)), int32_t(std::floor(a[1] * ah)), clamp, rgba);
+        if (!(aux2 & 4)) {
+          texel(aux, int32_t(std::floor(a[0] * aw)), int32_t(std::floor(a[1] * ah)), wrap, rgba);
         } else {
           const float fx = a[0] * aw - 0.5f;
           const float fy = a[1] * ah - 0.5f;
@@ -469,17 +475,17 @@ Pixel ProtoShadeRuntime::sample(ExecContext& ctx, const Frame& frame, uint16_t x
           const float tx = fx - float(x0);
           const float ty = fy - float(y0);
           float p00[4], p10[4], p01[4], p11[4];
-          texel(aux, x0, y0, clamp, p00);
-          texel(aux, x0 + 1, y0, clamp, p10);
-          texel(aux, x0, y0 + 1, clamp, p01);
-          texel(aux, x0 + 1, y0 + 1, clamp, p11);
+          texel(aux, x0, y0, wrap, p00);
+          texel(aux, x0 + 1, y0, wrap, p10);
+          texel(aux, x0, y0 + 1, wrap, p01);
+          texel(aux, x0 + 1, y0 + 1, wrap, p11);
           for (int c = 0; c < 4; c++) {
             const float top = p00[c] + (p10[c] - p00[c]) * tx;
             const float bottom = p01[c] + (p11[c] - p01[c]) * tx;
             rgba[c] = top + (bottom - top) * ty;
           }
         }
-        if (aux2 & 4) {
+        if (aux2 & 8) {
           broadcast(dst, rgba[3]);
         } else {
           for (int c = 0; c < 4; c++) dst[c] = rgba[c];

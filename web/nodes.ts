@@ -32,7 +32,7 @@ export const OP = {
   SWIZZLE: 8, // aux = component 0..3, broadcast; src0 = vector
   COMBINE: 9, // src0..3 contribute their component 0
   HSV: 10, // src0..3 = hue, sat, val, alpha
-  TEX: 11, // aux = asset, aux2 = wrap | filter << 1 | alpha-out << 2; src0 = uv
+  TEX: 11, // aux = asset, aux2 = wrap | filter << 2 | alpha-out << 3; src0 = uv
   OUTPUT: 12, // src0 = colour, src1 = brightness. Always the last instruction.
 } as const;
 export type OpCode = (typeof OP)[keyof typeof OP];
@@ -74,6 +74,14 @@ export const MATH_OPS = [
   "clamp",
   "smoothstep",
 ] as const;
+
+/**
+ * What happens outside the image. Order is part of the format.
+ *  repeat  tiles
+ *  clamp   the edge texel stretches outwards - the smear you get placing a sprite
+ *  clip    nothing: transparent outside 0..1, so a sprite appears once and stops
+ */
+export const WRAPS = ["repeat", "clamp", "clip"] as const;
 
 /** What a sensor reports. Order is part of the format. */
 export const RANGES = ["0..1", "-1..1", "0..inf", "-inf..inf", "0..360"] as const;
@@ -157,7 +165,7 @@ export interface NodeDef {
 const num = (v: unknown): number => (typeof v === "number" ? v : Number(v) || 0);
 const pick = (list: readonly string[], v: unknown): number => Math.max(0, list.indexOf(String(v) as never));
 const slotOf = (p: Props): number => Math.max(0, Math.round(num(p.index)));
-const texFlags = (p: Props): number => (p.wrap === "clamp" ? 1 : 0) | (p.filter === "linear" ? 2 : 0);
+const texFlags = (p: Props): number => pick(WRAPS, p.wrap) | (p.filter === "linear" ? 4 : 0);
 
 export const OUTPUT_TYPE = "output/led";
 
@@ -312,11 +320,11 @@ export const NODES: Record<string, NodeDef> = {
     asset: true,
     outs: [
       { op: OP.TEX, aux2: texFlags },
-      { op: OP.TEX, aux2: (p) => texFlags(p) | 4 },
+      { op: OP.TEX, aux2: (p) => texFlags(p) | 8 },
     ],
     props: {
       file: { type: "image", value: "" },
-      wrap: { type: "combo", value: "repeat", options: { values: ["repeat", "clamp"] } },
+      wrap: { type: "combo", value: "clip", options: { values: WRAPS } },
       filter: { type: "combo", value: "nearest", options: { values: ["nearest", "linear"] } },
     },
   },

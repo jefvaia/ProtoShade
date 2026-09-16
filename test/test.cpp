@@ -423,6 +423,54 @@ void testTexture() {
   assert(left.r == 255 && left.b == 0);
   assert(right.b == 255 && right.r == 0);
 
+  // clip: outside 0..1 the image is transparent, so a sprite placed with scaled UV appears
+  // once instead of smearing its edge texel across the rest of the panel.
+  //
+  // Only the horizontal axis is scaled here. Multiplying the whole UV scales v as well,
+  // which on a one-row panel walks straight off the bottom of the image - which is itself
+  // half of why a scaled sprite looks wrong.
+  auto scaledU = [&](Builder& p, uint8_t times) {
+    const uint8_t uv = p.emit(Op::UV);
+    const uint8_t u = p.emit(Op::Swizzle, uv, 0, 0, 0, 0);          // broadcast u
+    const uint8_t sx = p.emit(Op::Math, u, p.scalar(float(times)), 0, 0, 2);
+    return p.emit(Op::Combine, sx, p.scalar(0.25f), p.scalar(0), p.scalar(1));
+  };
+
+  Builder clip;
+  clip.addAsset(a);
+  clip.emit(Op::Output, clip.emit(Op::Tex, scaledU(clip, 4), 0, 0, 0, 0, uint8_t(Wrap::Clip)),
+            clip.scalar(1));
+  auto clip_blob = clip.blob();
+  assert(renderOne(clip_blob, 0, 0, 0, 8, 1).r == 255);  // u*4 = 0.25 -> inside, red
+  const Pixel outside = renderOne(clip_blob, 6, 0, 0, 8, 1);
+  assert(outside.r == 0 && outside.g == 0 && outside.b == 0);  // u*4 = 3.25 -> nothing
+
+  // clamp instead smears that same edge texel across everything to the right, which is the
+  // whole difference between the two.
+  Builder clamped;
+  clamped.addAsset(a);
+  clamped.emit(Op::Output,
+               clamped.emit(Op::Tex, scaledU(clamped, 4), 0, 0, 0, 0, uint8_t(Wrap::Clamp)),
+               clamped.scalar(1));
+  assert(renderOne(clamped.blob(), 6, 0, 0, 8, 1).b == 255);  // the last texel, stretched
+
+  // repeat tiles it instead.
+  Builder repeated;
+  repeated.addAsset(a);
+  repeated.emit(Op::Output,
+                repeated.emit(Op::Tex, scaledU(repeated, 4), 0, 0, 0, 0, uint8_t(Wrap::Repeat)),
+                repeated.scalar(1));
+  assert(renderOne(repeated.blob(), 4, 0, 0, 8, 1).r == 255);  // u*4 = 2.25 -> back to red
+
+  // An out-of-range wrap mode is refused at load, not run.
+  Builder bad;
+  bad.addAsset(a);
+  const uint8_t buv = bad.emit(Op::UV);
+  bad.emit(Op::Output, bad.emit(Op::Tex, buv, 0, 0, 0, 0, uint8_t(Wrap::kCount)), bad.scalar(1));
+  auto bad_blob = bad.blob();
+  ProtoShadeRuntime rt;
+  assert(!rt.load(bad_blob.data(), bad_blob.size()) && rt.status() == Status::BadProgram);
+
   // RGBA8888 keeps its alpha, and the output flattens it against black.
   AssetSpec rgba{1, 1, AssetFormat::RGBA8888, {255, 255, 255, 128}};
   Builder q;
@@ -435,7 +483,7 @@ void testTexture() {
   Builder r;
   r.addAsset(rgba);
   const uint8_t ruv = r.emit(Op::UV);
-  r.emit(Op::Output, r.emit(Op::Tex, ruv, 0, 0, 0, 0, 4), r.scalar(1));
+  r.emit(Op::Output, r.emit(Op::Tex, ruv, 0, 0, 0, 0, 8), r.scalar(1));
   assert(near(renderOne(r.blob()).r, 128));
 }
 

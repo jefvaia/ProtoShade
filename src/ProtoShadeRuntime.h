@@ -64,7 +64,7 @@ struct Frame {
 
 namespace format {
 constexpr uint8_t kMagic[4] = {'P', 'S', 'H', 'D'};
-constexpr uint16_t kVersion = 2;       // bump on every layout change; old firmware then refuses new bins
+constexpr uint16_t kVersion = 3;       // bump on every layout change; old firmware then refuses new bins
 constexpr size_t kHeaderSize = 48;
 constexpr size_t kAssetEntrySize = 16;
 constexpr size_t kInstrSize = 8;
@@ -92,13 +92,21 @@ enum class Op : uint8_t {
   Swizzle,    // aux = component 0..3, broadcast; src0 = vector
   Combine,    // src0..3 contribute their component 0
   Hsv,        // src0..3 = hue, sat, val, alpha
-  Tex,        // aux = asset, aux2 = wrap | filter << 1 | alpha-out << 2; src0 = uv
+  Tex,        // aux = asset, aux2 = wrap | filter << 2 | alpha-out << 3; src0 = uv
   Output,     // src0 = colour, src1 = brightness. Always the last instruction.
   kCount,
 };
 
 constexpr uint8_t kMathOpCount = 21;  // web/nodes.ts MATH_OPS
 constexpr uint8_t kRangeCount = 5;    // web/nodes.ts RANGES
+
+// What a Tex instruction does outside the image (aux2 bits 0-1). web/nodes.ts WRAPS.
+enum class Wrap : uint8_t {
+  Repeat = 0,  // tiles
+  Clamp = 1,   // the edge texel stretches outwards
+  Clip = 2,    // transparent outside 0..1, so a sprite appears once and stops
+  kCount,
+};
 
 // Per-thread scratch. One per rendering thread - never share one across cores.
 //
@@ -203,7 +211,7 @@ private:
   Pixel testPattern(const Frame& frame, uint16_t x, uint16_t y) const;
   bool validateCode();
   // Reads one asset texel into rgba (0..1). Bounds are already validated at load().
-  void texel(uint16_t asset, int32_t x, int32_t y, bool clamp, float* rgba) const;
+  void texel(uint16_t asset, int32_t x, int32_t y, Wrap wrap, float* rgba) const;
 
   // Asset header, copied out of the blob at load. Four fields the sampler needs per texel,
   // in RAM, instead of re-parsing a 16-byte table entry out of mapped flash every time.
