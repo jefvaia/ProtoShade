@@ -11,6 +11,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>  // std::abs(int); libc++ does not hand it over via <cmath>
 #include <cstring>
 #include <vector>
 

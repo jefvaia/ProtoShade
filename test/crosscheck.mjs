@@ -24,7 +24,7 @@ const work = mkdtempSync(join(tmpdir(), "protoshade-"));
 
 const cxx = process.env.CXX || "g++";
 if (spawnSync(cxx, ["--version"]).status !== 0) {
-  console.log(`crosscheck: skipped, no ${cxx} on this machine`);
+  console.log(`crosscheck: skipped, no ${cxx} on this machine (set CXX to a C++ compiler to run it)`);
   process.exit(0);
 }
 
