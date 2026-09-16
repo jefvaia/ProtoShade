@@ -33,6 +33,9 @@ assert.ok(g.arc > 1, `one side should be more than a unit long, got ${g.arc}`);
 
 // Every texel of the canvas is on the head exactly once: u runs 0..0.5 on one side and
 // 0.5..1 on the other, v the full height, and 0.5 - the nose - is where they touch.
+const gap = Math.min(...[...Array(verts)].map((_, i) => Math.abs(g.pos[i * 3])));
+assert.ok(gap > 0.02, `the panels should clear the nose, got ${gap}`);
+
 const zs = [...Array(verts)].map((_, i) => g.pos[i * 3 + 2]);
 const frontmost = Math.max(...zs);
 
@@ -46,11 +49,13 @@ assert.equal(Math.max(...vs), 1);
 for (let i = 0; i < verts; i++) {
   const [x, y, z] = [g.pos[i * 3], g.pos[i * 3 + 1], g.pos[i * 3 + 2]];
   const u = g.uv[i * 2];
-  // The middle of the canvas sits on the centre line, at the front: that is the nose.
+  // The middle of the canvas is the inner edge of each panel: at the front, and clear of the
+  // centre line by the nose gap, because the two matrices do not touch on a real head.
   if (Math.abs(u - 0.5) < 1e-6) {
-    assert.ok(x === 0, "the two sides share the nose column"); // -0 on the mirrored side
-    assert.equal(z, frontmost, "the nose is the frontmost point");
+    assert.equal(Math.abs(x), gap);
+    assert.equal(z, frontmost, "the inner edge is the frontmost point");
   }
+  assert.ok(Math.abs(x) >= gap - 1e-6, "nothing crosses into the nose gap");
   // Which half of the canvas a vertex shows decides which side of the face it is on.
   if (u < 0.5) assert.ok(x <= 0);
   if (u > 0.5) assert.ok(x >= 0);

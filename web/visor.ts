@@ -14,6 +14,12 @@ const NOSE: readonly [number, number] = [0, 0.9];
 const BEND: readonly [number, number] = [0.45, 0.55];
 const BACK: readonly [number, number] = [1.05, -0.45];
 const SEGMENTS = 40;
+/**
+ * Half the gap at the nose. The two matrices do not touch on a real head - there is a nose
+ * piece between them - so each side starts this far off the centre line. It costs no texels:
+ * both panels still show their whole half of the canvas, the space is simply not a panel.
+ */
+const NOSE_GAP = 0.09;
 
 export interface VisorGeometry {
   /** xyz, y is ±0.5 and gets scaled by the texture aspect at draw time. */
@@ -53,7 +59,7 @@ export function visorGeometry(segments = SEGMENTS): VisorGeometry {
         arc += Math.hypot(x - px, z - pz);
       }
       for (const y of [0.5, -0.5]) {
-        pos.push(side * x, y, z);
+        pos.push(side * (x + NOSE_GAP), y, z);
         nrm.push((side * -dz) / len, 0, dx / len);
         uv.push(0.5 + side * 0.5 * a, 0.5 - y); // u=0.5 is the nose, v=0 the top row
       }

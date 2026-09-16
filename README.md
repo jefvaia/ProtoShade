@@ -176,19 +176,20 @@ The graph autosaves to `localStorage` (uploads included) and reloads with the pa
 ### The visor view
 
 Under the flat preview is the same frame wrapped onto a head: **the left half of the canvas
-is one side of the face, the right half the other, and they meet at the nose**, so the middle
-columns of your graph are the bridge and not a seam you can ignore. Drag to turn it, scroll
-to zoom.
+is one side of the face, the right half the other**, with the nose gap between them - two
+panels either side of a nose piece, the way they sit on a real head. The middle columns of
+your graph are the pixels nearest the bridge, so a shader that ignores the gap reads as one
+picture cut in half. Drag to turn it, scroll to zoom.
 
 It draws whatever the preview canvas holds, which means it follows the interpreter and a
 mirrored head over USB alike without knowing which one it is looking at - connect **mirror
 head** and you are turning the real frames around.
 
 Plain WebGL, no library: two mirrored strips swept along one quadratic curve (top view: nose
-tip, out, then back along the side), and a vertex shader that does yaw, pitch and distance
+tip, out, then back along the side, offset off the centre line by the nose gap), and a vertex shader that does yaw, pitch and distance
 itself rather than carrying a matrix stack. `test/visor.test.mjs` checks the mesh - that each
-half of the canvas lands on its own side, that the halves meet at the frontmost point, and
-that the normals point out of the head. A browser without WebGL just hides the canvas; the
+half of the canvas lands on its own side, that the two panels clear the centre line by the
+nose gap, and that the normals point out of the head. A browser without WebGL just hides the canvas; the
 flat preview is still the authoritative one.
 
 ## The head
