@@ -30,6 +30,28 @@ constexpr uint8_t kOperandMask = 0x7F;
 
 float clamp01(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); }
 
+// Channel value -> 0..1, as a table rather than a divide.
+//
+// The S3's FPU has no divide instruction - it is a reciprocal plus Newton steps - and these
+// were the last divides left in a texel fetch: a bilinear RGBA fetch did sixteen of them.
+// Multiplying by 1/255 instead would be a different number for 126 of the 256 bytes, so it
+// is a table: each entry is the SAME divide, folded by the compiler with the same rounding,
+// which keeps every texel bit-identical to before and test/crosscheck.mjs exact.
+//
+// Spelt with macros because the runtime still has to build under -std=gnu++11 for the older
+// ESP32 core, where a constexpr constructor may not contain a loop. Constant expressions
+// throughout, so these are .rodata - flash on the device, not RAM.
+#define PSH_UNIT4(d, n) (n) / float(d), (n + 1) / float(d), (n + 2) / float(d), (n + 3) / float(d)
+#define PSH_UNIT16(d, n) PSH_UNIT4(d, n), PSH_UNIT4(d, n + 4), PSH_UNIT4(d, n + 8), PSH_UNIT4(d, n + 12)
+#define PSH_UNIT64(d, n) PSH_UNIT16(d, n), PSH_UNIT16(d, n + 16), PSH_UNIT16(d, n + 32), PSH_UNIT16(d, n + 48)
+const float kOf31[32] = {PSH_UNIT16(31, 0), PSH_UNIT16(31, 16)};
+const float kOf63[64] = {PSH_UNIT64(63, 0)};
+const float kOf255[256] = {PSH_UNIT64(255, 0), PSH_UNIT64(255, 64), PSH_UNIT64(255, 128),
+                           PSH_UNIT64(255, 192)};
+#undef PSH_UNIT64
+#undef PSH_UNIT16
+#undef PSH_UNIT4
+
 // Component-wise maths. Index order is the format - keep it in step with MATH_OPS in
 // web/nodes.ts, and let test/crosscheck.mjs catch you when it drifts.
 float mathOp(uint8_t op, float a, float b) {
@@ -221,7 +243,10 @@ void overInto(float* dst, const float* fg, float fa) {
     dst[0] = dst[1] = dst[2] = dst[3] = 0.0f;
     return;
   }
-  for (int c = 0; c < 3; c++) dst[c] = (fg[c] * af + dst[c] * ab * (1.0f - af)) / alpha;
+  // One reciprocal, three multiplies. Mirrored in web/graph.ts: the reciprocal is taken
+  // there too, in the same order, so the two implementations round the same way.
+  const float inv_alpha = 1.0f / alpha;
+  for (int c = 0; c < 3; c++) dst[c] = (fg[c] * af + dst[c] * ab * (1.0f - af)) * inv_alpha;
   dst[3] = alpha;
 }
 
@@ -493,6 +518,7 @@ bool ProtoShadeRuntime::setResolution(uint16_t width, uint16_t height) {
   h_ = height;
   inv_w_ = 1.0f / float(width);
   inv_h_ = 1.0f / float(height);
+  aspect_ = float(width) / float(height);
   return true;
 }
 
@@ -613,18 +639,18 @@ void ProtoShadeRuntime::texel(uint16_t index, int32_t x, int32_t y, int32_t base
 
   switch (a.format) {
     case AssetFormat::RGBA8888:
-      for (int c = 0; c < 4; c++) rgba[c] = data[at * 4 + c] / 255.0f;
+      for (int c = 0; c < 4; c++) rgba[c] = kOf255[data[at * 4 + c]];
       if (clipped) rgba[3] = 0.0f;
       break;
     case AssetFormat::A8:
       rgba[0] = rgba[1] = rgba[2] = 1.0f;
-      rgba[3] = clipped ? 0.0f : data[at] / 255.0f;
+      rgba[3] = clipped ? 0.0f : kOf255[data[at]];
       break;
     default: {
       const uint16_t v = rd16(data + at * 2);
-      rgba[0] = float((v >> 11) & 31) / 31.0f;
-      rgba[1] = float((v >> 5) & 63) / 63.0f;
-      rgba[2] = float(v & 31) / 31.0f;
+      rgba[0] = kOf31[(v >> 11) & 31];
+      rgba[1] = kOf63[(v >> 5) & 63];
+      rgba[2] = kOf31[v & 31];
       rgba[3] = clipped ? 0.0f : 1.0f;
       break;
     }
@@ -697,7 +723,7 @@ void ProtoShadeRuntime::exec(ExecContext& ctx, const Frame& frame, uint16_t x, u
         break;
       case Op::Centered:
         // Aspect-corrected, so a circle on a 64x32 panel stays round.
-        dst[0] = (u * 2.0f - 1.0f) * (float(w_) / float(h_ ? h_ : 1));
+        dst[0] = (u * 2.0f - 1.0f) * aspect_;
         dst[1] = v * 2.0f - 1.0f;
         dst[2] = 0.0f;
         dst[3] = 1.0f;
@@ -750,9 +776,10 @@ void ProtoShadeRuntime::exec(ExecContext& ctx, const Frame& frame, uint16_t x, u
           // with, so it stays its own colour. That is what the (1 - ab) term does, and it
           // is why "add" on two sprites brightens the overlap instead of turning the whole
           // foreground into a silhouette of itself.
+          const float inv_alpha = 1.0f / alpha;
           for (int c = 0; c < 3; c++) {
             const float blended = (1.0f - ab) * fg[c] + ab * blendOp(aux, bg[c], fg[c]);
-            dst[c] = (blended * af + bg[c] * ab * (1.0f - af)) / alpha;
+            dst[c] = (blended * af + bg[c] * ab * (1.0f - af)) * inv_alpha;
           }
           dst[3] = alpha;
         }
@@ -824,17 +851,30 @@ void ProtoShadeRuntime::exec(ExecContext& ctx, const Frame& frame, uint16_t x, u
         const uint8_t n = particleCount(in);
         const Particle* ps = ctx.particles + particle_base_[idx];
         dst[0] = dst[1] = dst[2] = dst[3] = 0.0f;
+        // A pixel is inside a sprite or it is not, and most pixels are not: a swarm covers
+        // a few texels each on a panel of thousands. Everything past the test below - the
+        // texel fetches and the composite - was work whose answer was already "nothing".
+        // One texel of slack on each side, because a bilinear fetch just outside 0..1 still
+        // reaches the edge texel, and dropping that would eat the sprite's outline.
+        const float mu = 1.0f / float(assets_[aux].w);
+        const float mv = 1.0f / float(assets_[aux].rows);
         for (uint8_t i = 0; i < n; i++) {
           const Particle& p = ps[i];
           if (!(p.alpha > 0.0f)) continue;  // faded out, or scaled to nothing
           const float dx = a[0] - p.x;
           const float dy = a[1] - p.y;
+          // Sprite-local coordinates, which the fetch needs anyway.
+          const float su = (dx * p.cos_r + dy * p.sin_r) * p.inv_scale + 0.5f;
+          const float sv = (dy * p.cos_r - dx * p.sin_r) * p.inv_scale + 0.5f;
+          // Written as a rejection so a NaN coordinate falls out here rather than reaching
+          // the sampler. Clip wrap would return alpha 0 for every one of these and the
+          // composite below would then leave dst untouched, so skipping is not an
+          // approximation - it is the same pixel, reached without the fetch.
+          if (!(su > -mu && su < 1.0f + mu && sv > -mv && sv < 1.0f + mv)) continue;
           float rgba[4];
           // Clip: outside its own sprite a particle is transparent, never a tiled or
           // smeared copy - the one wrap mode that makes sense here, so it is not a knob.
-          sampleFrame(aux, p.frame, (dx * p.cos_r + dy * p.sin_r) * p.inv_scale + 0.5f,
-                      (dy * p.cos_r - dx * p.sin_r) * p.inv_scale + 0.5f,
-                      uint8_t((aux2 & 4) | uint8_t(Wrap::Clip)), rgba);
+          sampleFrame(aux, p.frame, su, sv, uint8_t((aux2 & 4) | uint8_t(Wrap::Clip)), rgba);
           overInto(dst, rgba, p.alpha);
         }
         break;

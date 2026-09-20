@@ -233,6 +233,10 @@ struct Stats {
   uint32_t frames = 0;
   uint32_t render_us = 0;  // inside renderer.render(), both cores
   uint32_t wait_us = 0;    // blocked in submit(), i.e. waiting for the previous push
+  // Each half on its own. The split is a fixed 50/50, but core 0 also carries loop(), the
+  // serial port and the push task, so the two are not the same job. A frame costs whatever
+  // the slower half costs, and the gap between these two is what an uneven split would buy.
+  uint32_t half_us[2] = {0, 0};
   uint32_t since = 0;
 } stats;
 
@@ -279,9 +283,12 @@ void reportStats() {
   const double render_us = double(stats.render_us) / stats.frames;
   // Per pixel as well as per frame: a slow frame is either a heavy shader or too many
   // pixels, and the two numbers together say which without any guessing.
-  Serial.printf("stats: %.1f fps  render %.2f ms (%.3f us/px)  panels %.2f ms\n", double(fps),
-                render_us / 1000.0, render_us / double(uint32_t(CANVAS_W) * CANVAS_H),
-                double(stats.wait_us) / 1000.0 / stats.frames);
+  Serial.printf(
+      "stats: %.1f fps  render %.2f ms (%.3f us/px)  halves %.2f / %.2f ms  panels %.2f ms\n",
+      double(fps), render_us / 1000.0, render_us / double(uint32_t(CANVAS_W) * CANVAS_H),
+      double(stats.half_us[0]) / 1000.0 / stats.frames,
+      double(stats.half_us[1]) / 1000.0 / stats.frames,
+      double(stats.wait_us) / 1000.0 / stats.frames);
   stats = Stats{};
   stats.since = now;
 }
@@ -332,6 +339,8 @@ void renderFace() {
 
   // micros() wraps every ~71 minutes; unsigned subtraction wraps with it and stays right.
   stats.render_us += rendered - started;
+  stats.half_us[0] += renderer.halfMicros(0);
+  stats.half_us[1] += renderer.halfMicros(1);
   stats.wait_us += micros() - rendered;
   stats.frames++;
   reportStats();

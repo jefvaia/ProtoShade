@@ -635,9 +635,10 @@ export class Runner {
             // the part of the foreground hanging off the background there is no second
             // colour to combine with, so it keeps its own.
             const blend = BLEND[aux % BLEND.length];
+            const inv = 1 / a;
             for (let c = 0; c < 3; c++) {
               const blended = (1 - ab) * F[j + c] + ab * blend(B[k + c], F[j + c]);
-              regs[d + c] = (blended * af + B[k + c] * ab * (1 - af)) / a;
+              regs[d + c] = (blended * af + B[k + c] * ab * (1 - af)) * inv;
             }
             regs[d + 3] = a;
           }
@@ -675,16 +676,27 @@ export class Runner {
           // once per frame, and a rotated sprite would otherwise cost four sines a pixel.
           const list = this.readyParticles(i, n, of(code[b + 3])[at(code[b + 3])], block, Math.max(1, asset.frames));
           const f = Math.fround;
+          // A pixel is inside a sprite or it is not, and most pixels are not. Everything
+          // past the test below was work whose answer was already "nothing" - clip wrap
+          // returns alpha 0 out there and the composite then leaves the register alone -
+          // so skipping it is the same pixel, reached without the fetch. One texel of
+          // slack each side, because a bilinear fetch just outside 0..1 still reaches the
+          // edge texel. Kept in step with the same skip in src/ProtoShadeRuntime.cpp.
+          const mu = f(1 / asset.w);
+          const mv = f(1 / ((asset.h / Math.max(1, asset.frames)) | 0));
           for (let k = 0; k < n; k++) {
             const p = list[k];
             if (!(p.alpha > 0)) continue; // faded out, or scaled to nothing
             const dx = f(a0[i0] - p.x);
             const dy = f(a0[i0 + 1] - p.y);
+            const su = f(f(f(f(dx * p.cosR) + f(dy * p.sinR)) * p.invScale) + 0.5);
+            const sv = f(f(f(f(dy * p.cosR) - f(dx * p.sinR)) * p.invScale) + 0.5);
+            if (!(su > -mu && su < 1 + mu && sv > -mv && sv < 1 + mv)) continue;
             sampleFrame(
               asset,
               p.frame,
-              f(f(f(f(dx * p.cosR) + f(dy * p.sinR)) * p.invScale) + 0.5),
-              f(f(f(f(dy * p.cosR) - f(dx * p.sinR)) * p.invScale) + 0.5),
+              su,
+              sv,
               (aux2 & 4) | 2, // clip: a particle is its sprite and nothing else
               t4,
             );
@@ -993,6 +1005,9 @@ function overInto(r: Float32Array, d: number, fg: Vec, fa: number): void {
     r[d] = r[d + 1] = r[d + 2] = r[d + 3] = 0;
     return;
   }
-  for (let c = 0; c < 3; c++) r[d + c] = (fg[c] * af + r[d + c] * ab * (1 - af)) / alpha;
+  // One reciprocal, three multiplies - the same order as overInto() in
+  // src/ProtoShadeRuntime.cpp, so the two still round alike.
+  const inv = 1 / alpha;
+  for (let c = 0; c < 3; c++) r[d + c] = (fg[c] * af + r[d + c] * ab * (1 - af)) * inv;
   r[d + 3] = alpha;
 }
