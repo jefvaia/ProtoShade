@@ -21,7 +21,7 @@ using namespace protoshade;
 // rectangles out of it. Canvas area no panel reads is rendered and thrown away - that
 // costs time but nothing else, so size this to the face, not to the biggest panel.
 
-constexpr uint16_t CANVAS_W = 64;
+constexpr uint16_t CANVAS_W = 128;  // two 64x32 panels side by side
 constexpr uint16_t CANVAS_H = 32;
 
 // ---------------------------------------------------------------------------
@@ -86,29 +86,73 @@ private:
 };
 
 // --- HUB75 over I2S DMA ----------------------------------------------------
-// Library: ESP32-HUB75-MatrixPanel-I2S-DMA (mrfaptastic). One instance per chain.
+// Library: "ESP32 HUB75 LED MATRIX PANEL DMA Display" by mrfaptastic, from the Library
+// Manager (say yes to Adafruit GFX when it asks).
 //
-// #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
-//
-// class Hub75Display : public Display {
-// public:
-//   Hub75Display(uint16_t w, uint16_t h, const HUB75_I2S_CFG::i2s_pins& pins) {
-//     HUB75_I2S_CFG cfg(w, h, 1, pins);
-//     cfg.double_buff = true;          // so push() never tears against the DMA output
-//     matrix_ = new MatrixPanel_I2S_DMA(cfg);
-//   }
-//   bool begin() override { return matrix_->begin(); }
-//   void push(const Pixel* rgb, uint16_t width, uint16_t height) override {
-//     for (uint16_t y = 0; y < height; y++)
-//       for (uint16_t x = 0; x < width; x++) {
-//         const Pixel& p = rgb[size_t(y) * width + x];
-//         matrix_->drawPixelRGB888(x, y, p.r, p.g, p.b);
-//       }
-//     matrix_->flipDMABuffer();
-//   }
-// private:
-//   MatrixPanel_I2S_DMA* matrix_ = nullptr;
-// };
+// Both panels hang off ONE ribbon chain: ESP32 -> panel 1 IN, panel 1 OUT -> panel 2 IN.
+// To the library that is one 128x32 matrix, so there is one Hub75Chain and each panel is a
+// window into it at its own x offset. Keeping them as two Displays is what lets the map
+// below mirror or rotate each panel on its own.
+
+#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+
+// Pins for an ESP32-S3-WROOM-1 N16R8, clear of flash, PSRAM, USB and strapping pins.
+// Order is the library's: r1 g1 b1 r2 g2 b2 a b c d e lat oe clk. E is -1: a 64x32
+// panel is 1/16 scan and has no E line.
+const HUB75_I2S_CFG::i2s_pins HUB75_PINS = {4, 5, 6, 7, 15, 16, 18, 8, 17, 12, -1, 10, 11, 9};
+
+// 0..255. Caps the current before it reaches the power bank: two panels at full white and
+// full brightness is ~8 A, well past what it can hold. Raise it once the visor is on and
+// you have measured the draw.
+constexpr uint8_t PANEL_BRIGHTNESS = 64;
+
+class Hub75Chain {
+public:
+  Hub75Chain(uint16_t panel_w, uint16_t panel_h, uint16_t panels) {
+    HUB75_I2S_CFG cfg(panel_w, panel_h, panels, HUB75_PINS);
+    cfg.double_buff = true;  // so a push never tears against the DMA output
+    // Both found on the bench with these panels on loose jumper wires:
+    cfg.clkphase = false;    // pixels in a moving line landed one column late without it
+    cfg.latch_blanking = 2;  // faint afterglow where a line had just been
+    matrix_ = new MatrixPanel_I2S_DMA(cfg);
+  }
+  // Every panel calls this; only the first actually starts the chain.
+  bool begin() {
+    if (!started_) {
+      started_ = matrix_->begin();
+      if (started_) matrix_->setBrightness8(PANEL_BRIGHTNESS);
+    }
+    return started_;
+  }
+  MatrixPanel_I2S_DMA& matrix() { return *matrix_; }
+
+private:
+  MatrixPanel_I2S_DMA* matrix_ = nullptr;
+  bool started_ = false;
+};
+
+class Hub75Panel : public Display {
+public:
+  // flips: set on the panel pushed LAST (the last one in PANELS), so the whole chain
+  // swaps buffers once, with both panels drawn.
+  Hub75Panel(Hub75Chain& chain, uint16_t x_offset, bool flips)
+      : chain_(chain), x_(x_offset), flips_(flips) {}
+  bool begin() override { return chain_.begin(); }
+  void push(const Pixel* rgb, uint16_t width, uint16_t height) override {
+    MatrixPanel_I2S_DMA& m = chain_.matrix();
+    for (uint16_t y = 0; y < height; y++)
+      for (uint16_t x = 0; x < width; x++) {
+        const Pixel& p = rgb[size_t(y) * width + x];
+        m.drawPixelRGB888(int16_t(x_ + x), int16_t(y), p.r, p.g, p.b);
+      }
+    if (flips_) m.flipDMABuffer();
+  }
+
+private:
+  Hub75Chain& chain_;
+  uint16_t x_;
+  bool flips_;
+};
 
 // --- WS2812 / addressable strip -------------------------------------------
 // Library: FastLED or Adafruit_NeoPixel. Remember these are usually wired in a serpentine,
@@ -125,8 +169,10 @@ private:
 //   }
 // };
 
-SerialDisplay leftEye("left ");
-SerialDisplay rightEye("right");
+Hub75Chain chain(64, 32, 2);
+// If the two sides come out swapped, swap these two x offsets (0 and 64).
+Hub75Panel leftEye(chain, 0, false);
+Hub75Panel rightEye(chain, 64, true);
 
 // ---------------------------------------------------------------------------
 // 4. The map: which piece of canvas each panel shows
@@ -199,9 +245,9 @@ constexpr uint32_t STREAM_INTERVAL_MS = 50;
 
 constexpr uint8_t SENSOR_SLOTS = 8;
 
-// Slot 0: boop sensor on GPIO 4, as 0..1.
+// Slot 0: boop sensor, as 0..1. GPIO 4 is R1 now; the planned VCNL4040 goes on I2C
+// (SDA 1, SCL 2) instead.
 float readBoop() {
-  // return analogRead(4) / 4095.0f;
   return 0.5f + 0.5f * sinf(millis() / 800.0f);  // placeholder so something moves
 }
 
