@@ -191,6 +191,10 @@ Plain HTML + Tailwind v4 + TypeScript, no framework:
 - `web/nodes.ts` - the node library and the instruction set they compile to
 - `web/graph.ts` - graph -> Program, and the interpreter that runs one
 - `web/pack.ts` - Program -> `.bin`
+- `web/unpack.ts` - `.bin` -> a graph, behind the "import .bin" button. A program carries
+  one instruction per used node output, so it reads back as nodes and wires; what it cannot
+  carry is where the boxes sat, so the layout is computed. `test/unpack.test.mjs` sends every
+  example through a `.bin` and back and compares the rendered pixels
 - `web/serial.ts` - finds the head's frames in the USB stream (see below)
 - `web/visor.ts` - the 3D view of the panels (WebGL, no library)
 - `web/vendor/` - third-party files, committed (no CDN: the ESP32 has no internet)

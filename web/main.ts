@@ -9,6 +9,7 @@ import { compile, Runner, type Program } from "./graph.js";
 import { PARTITION_BYTES, instructionCount, pack, packedSize } from "./pack.js";
 import { RANGES, decodeInto, imageLabel, images, register, type Env, type Vec } from "./nodes.js";
 import { EXAMPLES, apply } from "./examples.js";
+import { unpack } from "./unpack.js";
 import { DeviceLink, supported as serialSupported, type SerialFrame } from "./serial.js";
 import { Visor } from "./visor.js";
 
@@ -122,6 +123,25 @@ async function loadExample(index: number): Promise<void> {
 examplePicker.onchange = () => {
   void loadExample(Number(examplePicker.value));
   examplePicker.value = "";
+};
+
+// Importing a .bin. The file is a compiled program, not a graph, so what comes back is the
+// program read as nodes - the same picture, laid out by the importer rather than by hand.
+// See the top of unpack.ts for what that does and does not preserve.
+const importInput = el<HTMLInputElement>("import");
+importInput.onchange = async () => {
+  const file = importInput.files?.[0];
+  importInput.value = ""; // so picking the same file twice fires again
+  if (!file) return;
+  try {
+    const imported = unpack(new Uint8Array(await file.arrayBuffer()));
+    await apply(graph, imported.example);
+    setResolution(imported.width, imported.height);
+    exampleInfo.textContent = `${file.name}: ${imported.example.desc.replace(/^imported from a \.bin: /, "")}`;
+    save();
+  } catch (err) {
+    exampleInfo.textContent = `cannot import ${file.name}: ${String(err).replace(/^Error:\s*/, "")}`;
+  }
 };
 
 // ---------------------------------------------------------------------------
