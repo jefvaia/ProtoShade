@@ -455,6 +455,16 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  // millis() is already running when setup() is entered: everything the ESP-IDF does on the
+  // way here is on the clock, and the light is red for all of it. PSRAM is the usual reason
+  // that number is large - probing for a chip the board does not have, or probing octal on a
+  // board wired quad, costs seconds before a line of this sketch runs. Nothing here allocates
+  // out of PSRAM, so if this says it found none and the boot is still slow, turn PSRAM off in
+  // Tools rather than hunting through setup().
+  const uint32_t boot_ms = millis();
+  Serial.printf("boot: %lu ms before setup(), PSRAM %s\n", (unsigned long)boot_ms,
+                psramFound() ? "found" : "none (fine - nothing here wants it)");
+
   // Red until setup finishes: if it hangs or crashes on the way, the light says so instead
   // of staying dark and looking like a dead board.
   setLed(LedState::Error, "starting up");
@@ -497,7 +507,7 @@ void setup() {
   Serial.printf("face running at %ux%u, setup took %lu ms. Press the button within %lu s for\n"
                 "upload mode, or type u here at any time, p to mirror the canvas, or flash it\n"
                 "straight over USB from the editor.\n",
-                CANVAS_W, CANVAS_H, (unsigned long)millis(),
+                CANVAS_W, CANVAS_H, (unsigned long)(millis() - boot_ms),
                 (unsigned long)(UPLOAD_WINDOW_MS / 1000));
 }
 

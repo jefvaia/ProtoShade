@@ -55,6 +55,8 @@ public:
 inline String operator+(const String&, const String&) { return String(); }
 inline String operator+(const char*, const String&) { return String(); }
 
+inline bool psramFound() { return false; }
+
 class SerialStub {
 public:
   void begin(unsigned long) {}

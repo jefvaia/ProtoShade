@@ -1,3 +1,13 @@
+// The Arduino builder compiles every sketch -Os and offers no way to say otherwise for one
+// file, which is a poor trade for an interpreter: -O2 renders this VM about 1.5x faster than
+// -Os, measured on the host, and the gap on the S3 is wider because more of what -Os folds
+// back into calls is soft-float. The guard is so a build that already asked for something -
+// the host tests use -O2, and -O3 is worth a look on the pixel loop - is not quietly pulled
+// back down to O2 by this line.
+#if defined(__OPTIMIZE_SIZE__) && !defined(__clang__)
+#pragma GCC optimize("O2")
+#endif
+
 #include "ProtoShadeRuntime.h"
 
 #include <cmath>

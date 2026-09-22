@@ -372,10 +372,41 @@ Then in **Tools**:
 | Flash Size | what your board actually has. `partitions.csv` is laid out for **16MB**; its header comment has the 8 MB and 4 MB variants |
 | Partition Scheme | **Custom** - it uses the `partitions.csv` sitting next to the `.ino`. None of the built-in schemes has a `protoshade` partition, so with one of those the head boots, says so on serial, and sits on its test pattern |
 | Erase All Flash Before Sketch Upload | **Disabled** - enabling it wipes the face program every time you upload the sketch |
-| PSRAM | whatever your board has; the framebuffers are small and stay in internal SRAM |
+| USB CDC On Boot | **Enabled** - `Serial` is then the native USB port, which is what mirroring and flashing over USB talk to. Disabled, `Serial` is the UART on GPIO 43/44 and the editor finds nobody home |
+| PSRAM | **Disabled**, unless something you added wants it. Nothing here does - the canvases are static arrays in internal SRAM - and it is not free: see below |
+| Core Debug Level | **None**. Anything higher puts the IDF's own logging in the frame |
+| Events Run On | **Core 0**. Core 1 runs the Arduino loop and one half of every frame already |
 
 If your board is 4 or 8 MB, edit the offsets in `partitions.csv` to match - the comment at
 the top of that file has both variants and says which two partitions matter and why.
+
+#### A slow boot, or a slow face
+
+The sketch prints both numbers, and they mean different things:
+
+```
+boot: 312 ms before setup(), PSRAM none (fine - nothing here wants it)
+face running at 128x32, setup took 84 ms. ...
+first frame at 447 ms (render 2210 us) - the light stops being red here
+```
+
+The status LED is red from power to the first frame, so a head that sits red for ten seconds
+spent them in one of those three places. **Before `setup()`** is the ESP-IDF's own start-up,
+and the thing that reliably eats seconds there is **PSRAM**: probing for a chip the board does
+not have, or probing octal on a board wired quad, retries before it gives up. Turn PSRAM off -
+nothing in this sketch allocates from it, and on a part that does have octal PSRAM it also
+takes GPIO 33-37 away from your panel harness.
+
+For the face itself, the one that matters is **`-Os`**. The Arduino builder compiles every
+sketch that way and offers no per-file override, which is a poor trade for an interpreter:
+`-O2` renders the VM about **1.5x faster**, measured on the host. `ProtoShadeRuntime.cpp` and
+`ProtoShadeDisplay.cpp` therefore ask for `-O2` themselves, with a `#pragma` that only fires
+when the file was compiled `-Os` - so a host build that already asked for `-O2` or `-O3` is
+left alone.
+
+After that it is arithmetic: `CANVAS_W x CANVAS_H` pixels times the per-pixel instruction
+count, every frame. A 128x32 face is twice the work of a 64x32 one, and the editor's status
+line tells you how many of a program's instructions run per pixel rather than once a frame.
 
 ### Putting the editor on the head (optional)
 
