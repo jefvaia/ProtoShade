@@ -117,7 +117,20 @@ private:
 // Pins for an ESP32-S3-WROOM-1 N16R8, clear of flash, PSRAM, USB and strapping pins.
 // Order is the library's: r1 g1 b1 r2 g2 b2 a b c d e lat oe clk. E is -1: a 64x32
 // panel is 1/16 scan and has no E line.
-const HUB75_I2S_CFG::i2s_pins HUB75_PINS = {4, 5, 6, 7, 15, 16, 18, 8, 17, 12, -1, 10, 11, 9};
+//
+// GREEN AND BLUE ARE SWAPPED HERE relative to the GPIO numbers, because the harness on this
+// head has them crossed: g1 is on 6 and b1 on 5, g2 on 16 and b2 on 15. The symptom was
+// "the HSV node's hue is inverted - 0.8 comes out as 0.2", which is the same thing said
+// another way. Mirroring the hue wheel about red IS swapping green and blue, so red stays
+// red and cyan stays cyan and only the colours in between are wrong, which makes it look
+// like a maths bug in the shader. It is not: test/test.cpp asserts hue 0.8 renders
+// (204, 0, 255) out of the VM, and nothing between that pixel and drawPixelRGB888() touches
+// a channel.
+//
+// If you rewire the ribbon to match the silkscreen, swap these two pairs back. To check
+// which way round a head is: a plain RGB node at pure green. If the panel lights blue, the
+// lines are crossed.
+const HUB75_I2S_CFG::i2s_pins HUB75_PINS = {4, 6, 5, 7, 16, 15, 18, 8, 17, 12, -1, 10, 11, 9};
 
 // 0..255. Caps the current before it reaches the power bank: two panels at full white and
 // full brightness is ~8 A, well past what it can hold. Raise it once the visor is on and

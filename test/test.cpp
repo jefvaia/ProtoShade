@@ -392,6 +392,18 @@ void testCombineMixOverHsv() {
           h2.scalar(1));
   const Pixel wrapped = renderOne(h2.blob());
   assert(wrapped.r == green.r && wrapped.g == green.g && wrapped.b == green.b);
+
+  // Hue 0.8 is purple: full blue, some red, no green at all. Named because "the hue is
+  // inverted, 0.8 comes out as 0.2" is what a head says when its panel's G and B lines are
+  // crossed - mirroring the hue wheel about red IS swapping green and blue, so red still
+  // looks right, cyan still looks right, and only the colours in between give it away. The
+  // wiring is what to look at (head_config.h, HUB75_PINS); this line is what says the
+  // canvas was never the problem.
+  Builder h3;
+  h3.emit(Op::Output, h3.emit(Op::Hsv, h3.scalar(0.8f), h3.scalar(1), h3.scalar(1), h3.scalar(1)),
+          h3.scalar(1));
+  const Pixel purple = renderOne(h3.blob());
+  assert(purple.b == 255 && purple.g == 0 && near(purple.r, 204));
 }
 
 void testTimeAndSensors() {
