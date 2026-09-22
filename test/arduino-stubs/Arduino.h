@@ -65,6 +65,7 @@ public:
   void println(const String&) {}
   void print(const char*) {}
   void setTimeout(unsigned long) {}
+  size_t setRxBufferSize(size_t n) { return n; }
   size_t write(const uint8_t*, size_t) { return 0; }
   size_t write(uint8_t) { return 0; }
 

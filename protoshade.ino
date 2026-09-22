@@ -273,6 +273,9 @@ void streamFrame(const Pixel* canvas) {
 // upload::receiveOverSerial(), and is still sitting in the receive buffer for it.
 constexpr uint8_t kFlashRequest = 0x02;
 
+// Room for a whole flash chunk and then some. See setup() for why this is not optional.
+constexpr size_t kSerialRxBuffer = 4096;
+
 Request serialRequest() {
   Request asked = Request::None;
   while (Serial.available() > 0) {
@@ -485,6 +488,21 @@ bool flashOverSerial() {
 
   const bool ok = upload::receiveOverSerial(runtime);
 
+  // Whatever is left of a transfer that went wrong is still sitting in the receive buffer,
+  // and the next thing to read that buffer is serialRequest() - which would find `p`s, `u`s
+  // and 0x02s in the middle of somebody's face data and act on them. One failed flash would
+  // then turn into a head that starts mirroring, drops into upload mode, or begins a second
+  // phantom transfer, and the next attempt fails differently than the first.
+  if (!ok) {
+    // Until the port has been quiet for a moment, not just until it is empty right now: the
+    // host stops sending when it sees the error line, but what it had already put on the
+    // wire is still on its way.
+    uint32_t quiet_since = millis();
+    while (millis() - quiet_since < 50) {
+      if (Serial.read() >= 0) quiet_since = millis();
+    }
+  }
+
   streaming = was_streaming;
 
   // The transfer is not a frame, and averaging it into the frame time would report a face
@@ -513,6 +531,17 @@ void showUploadIndicator() {
 // ---------------------------------------------------------------------------
 
 void setup() {
+  // Before begin(), which is when the driver allocates it.
+  //
+  // This is not a tuning knob, it is the flash protocol's one hardware requirement. The
+  // editor sends a .bin in chunks of kSerialChunk and waits for an ack before sending the
+  // next, so exactly one chunk is ever in flight - but the USB receive interrupt DROPS
+  // whatever does not fit in this buffer, and the default is smaller than a chunk. A file
+  // that fits in one chunk therefore flashes fine and anything bigger loses bytes in the
+  // middle, which comes back as "the transfer stopped halfway" on a file that is perfectly
+  // good. One chunk plus room for the header makes the overflow impossible rather than
+  // unlikely; test/check-sketch.mjs holds this number against both ends of the protocol.
+  Serial.setRxBufferSize(kSerialRxBuffer);
   Serial.begin(115200);
   delay(200);
 

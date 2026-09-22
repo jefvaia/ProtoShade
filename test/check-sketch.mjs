@@ -124,6 +124,43 @@ for (const [name, sources] of [
   }
 }
 
+// The flash protocol's one hardware requirement, which no compiler can see: the sketch's USB
+// receive buffer has to hold a whole chunk.
+//
+// The editor sends a .bin one chunk at a time and waits for an ack, so exactly one chunk is
+// ever in flight - but the ESP32's USB receive interrupt throws away whatever does not fit
+// in that buffer, and its default is smaller than a chunk. Get this wrong and a .bin that
+// fits in one chunk flashes perfectly while anything larger loses bytes somewhere in the
+// middle, and the head blames the transfer for a file that was never damaged. Three numbers
+// in three files, and only their relationship is the rule.
+{
+  const number = (file, re, what) => {
+    const m = re.exec(readFileSync(join(root, file), "utf8"));
+    if (!m) {
+      failed = true;
+      console.error(`check-sketch: cannot find ${what} in ${file}`);
+      return null;
+    }
+    return Number(m[1]);
+  };
+  const rx = number("protoshade.ino", /kSerialRxBuffer\s*=\s*(\d+)/, "the serial receive buffer");
+  const device = number("upload_mode.cpp", /kSerialChunk\s*=\s*(\d+)/, "the device chunk size");
+  const web = number("web/serial.ts", /FLASH_CHUNK\s*=\s*(\d+)/, "the editor chunk size");
+  if (rx !== null && device !== null && web !== null) {
+    if (web > device) {
+      failed = true;
+      console.error(`check-sketch: the editor sends ${web} byte chunks, the head reads ${device}`);
+    }
+    if (rx < device) {
+      failed = true;
+      console.error(
+        `check-sketch: the receive buffer is ${rx} bytes and a chunk is ${device} - the USB` +
+          " interrupt drops the difference, and every .bin bigger than one chunk arrives broken",
+      );
+    }
+  }
+}
+
 // The stubs parse, they do not behave, so this one rule has to be read rather than compiled.
 // WebServer::streamFile() sends Content-Encoding: gzip itself for a .gz file, and
 // sendHeader() appends instead of replacing: a second one makes the browser read
