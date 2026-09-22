@@ -1,3 +1,9 @@
+// -O2 for the same reason ProtoShadeRuntime.cpp asks for it: the Arduino builder compiles
+// every sketch -Os, and this file walks every pixel of every frame on its way to a panel.
+#if defined(__OPTIMIZE_SIZE__) && !defined(__clang__)
+#pragma GCC optimize("O2")
+#endif
+
 #include "ProtoShadeDisplay.h"
 
 namespace protoshade {

@@ -67,8 +67,9 @@ function graph(nodes, links) {
 
 const out = (id, link) => [id, "output/led", { brightness: 1 }, link];
 
-/** An image whose pixels vary in all four channels, so a wrong swizzle cannot hide. */
-function testImage(w, h, opaque) {
+/** An image whose pixels vary in all four channels, so a wrong swizzle cannot hide.
+    With frames > 1 it is a strip: h rows in total, h / frames of them per frame. */
+function testImage(w, h, opaque, frames = 1) {
   const data = new Uint8ClampedArray(w * h * 4);
   for (let i = 0; i < w * h; i++) {
     data[i * 4] = (i * 37) % 256;
@@ -76,7 +77,7 @@ function testImage(w, h, opaque) {
     data[i * 4 + 2] = (i * 13) % 256;
     data[i * 4 + 3] = opaque ? 255 : (i * 57) % 256;
   }
-  return { w, h, data };
+  return { w, h, frames, data };
 }
 
 const W = 17; // odd and not a power of two, so nothing divides evenly by accident
@@ -188,6 +189,26 @@ check(
   ),
 );
 
+// --- every blend mode, on two half-transparent colours -----------------------
+for (const mode of ["normal", "multiply", "screen", "add", "lighten", "darken", "difference"]) {
+  check(
+    `blend:${mode}`,
+    graph(
+      [
+        [1, "input/coordinates", {}],
+        [2, "vector/separate", {}, 10],
+        // Two colours whose coverage varies across the panel, so the overlap is partial
+        // everywhere and the (1 - ab) term actually matters.
+        [3, "vector/combine", { r: 0, g: 0, b: 0, a: 1 }, null, 20, null, 21],
+        [4, "const/color", { r: 0.2, g: 0.75, b: 1, a: 0.6 }],
+        [5, "color/over", { mode, fac: 0.8 }, null, 30, 40],
+        out(6, 50),
+      ],
+      { 10: [1, 0], 20: [2, 0], 21: [2, 1], 30: [3, 0], 40: [4, 0], 50: [5, 0] },
+    ),
+  );
+}
+
 // --- images: both packed formats, both filters, both wrap modes ---------------
 for (const opaque of [true, false]) {
   for (const filter of ["nearest", "linear"]) {
@@ -218,6 +239,194 @@ check(
   new Map([[1, testImage(4, 4, false)]]),
 );
 check("image:missing", graph([[1, "texture/image", {}, null], out(2, 10)], { 10: [1, 0] }));
+
+// --- animation: both readings of the phase, both filters, with and without crossfade -----
+//
+// The phase is wired to Time, so `ms` is what picks the frame - and at 1234 ms with speed 1
+// that is not frame 0, which is the point: a wrong frame index here is a wrong picture.
+for (const loop of [true, false]) {
+  for (const crossfade of [true, false]) {
+    for (const filter of ["nearest", "linear"]) {
+      check(
+        `anim:${loop ? "loop" : "hold"}:${crossfade ? "crossfade" : "snap"}:${filter}`,
+        graph(
+          [
+            [1, "texture/animation", { frames: 4, loop, crossfade, speed: 0.37, wrap: "clamp", filter }, null, 10],
+            [2, "input/time", { speed: 0.21 }],
+            out(3, 20),
+          ],
+          { 10: [2, 0], 20: [1, 0] },
+        ),
+        new Map([[1, testImage(5, 8, false, 4)]]),
+      );
+    }
+  }
+}
+
+// A strip driven by a sensor instead: the blend-shape wiring, where the reading picks which
+// of the frames that exist gets shown.
+check(
+  "anim:blend-shape",
+  graph(
+    [
+      [1, "texture/animation", { frames: 4, loop: false, crossfade: false, wrap: "clip", filter: "nearest" }, null, 10],
+      [2, "input/sensor", { range: "0..1", index: 0, test: 0.6 }],
+      out(3, 20),
+    ],
+    { 10: [2, 1], 20: [1, 0] },
+  ),
+  new Map([[1, testImage(5, 8, true, 4)]]),
+  0,
+  [0.72],
+);
+check(
+  "anim:alpha-out",
+  graph([[1, "texture/animation", { frames: 2, loop: true, speed: 3, wrap: "repeat" }, null, null], out(2, 10)], {
+    10: [1, 1],
+  }),
+  new Map([[1, testImage(4, 6, false, 2)]]),
+);
+
+// --- particles: the loop inside one instruction ------------------------------
+//
+// Every particle's position is +, - and * on floats. The preview does that arithmetic in
+// Math.fround steps precisely so these cases can demand the same texel as the device, and
+// not "near enough" - under nearest filtering a last-bit difference is a wrong sprite pixel.
+const emitter = (over) => ({
+  count: 12,
+  life: 1.7,
+  fade: 0.8,
+  seed: 7,
+  direction: 25,
+  spread: 140,
+  speed: 0.8,
+  speedSpread: 0.3,
+  accel: -0.2,
+  gravityX: 0.15,
+  gravityY: 0.45,
+  size: 0.4,
+  sizeSpread: 0.12,
+  sizeRate: -0.05,
+  sizeAccel: 0.02,
+  rotation: 30,
+  rotSpread: 200,
+  rotRate: 90,
+  rotAccel: -15,
+  filter: "nearest",
+  ...over,
+});
+
+for (const filter of ["nearest", "linear"]) {
+  check(
+    `particles:${filter}`,
+    graph(
+      [
+        [1, "texture/particles", emitter({ filter }), null, 10],
+        [2, "input/time", { speed: 1 }],
+        out(3, 20),
+      ],
+      { 10: [2, 0], 20: [1, 0] },
+    ),
+    // Not square: a sprite that is 6x4 rotated by a wrong angle cannot pass for itself.
+    new Map([[1, testImage(6, 4, false)]]),
+  );
+}
+// Every knob at once, on a swarm that has had time to accelerate, shrink and spin - the case
+// that fails if any one of the nineteen parameters is read out of order on either side.
+check(
+  "particles:all-knobs",
+  graph([[1, "texture/particles", emitter({ count: 20, filter: "linear" }), null, null], out(2, 10)], { 10: [1, 0] }),
+  new Map([[1, testImage(5, 7, false)]]),
+  4321,
+);
+// Sprites cut from a strip: a particle picks a frame from its own hash, so one upload gives
+// a swarm of different shapes.
+check(
+  "particles:from-strip",
+  graph(
+    [
+      [1, "texture/particles", emitter({ count: 20, spread: 360, life: 3, fade: 0, seed: 2, rotRate: 0 }), null, null],
+      out(2, 10),
+    ],
+    { 10: [1, 0] },
+  ),
+  new Map([[1, testImage(4, 12, false, 3)]]),
+  900,
+);
+// Two emitters in one program share the device's particle table, and a sensor may drive the
+// clock - it is uniform across the frame, which is all the device asks of it.
+check(
+  "particles:two-emitters",
+  graph(
+    [
+      [1, "texture/particles", emitter({ count: 30, seed: 3 }), null, 10],
+      [2, "input/sensor", { range: "0..1", index: 0, test: 0.4 }],
+      [3, "texture/particles", emitter({ count: 40, seed: 9, direction: 180 }), null, 11],
+      [4, "color/over", { mode: "add", fac: 1 }, null, 20, 30],
+      out(5, 40),
+    ],
+    { 10: [2, 0], 11: [2, 0], 20: [1, 0], 30: [3, 0], 40: [4, 0] },
+  ),
+  new Map([
+    [1, testImage(5, 5, false)],
+    [3, testImage(3, 6, true)],
+  ]),
+  0,
+  [2.5],
+);
+check("particles:empty", graph([[1, "texture/particles", emitter({ count: 0 }), null, null], out(2, 10)], { 10: [1, 0] }));
+
+// The slack on "is this pixel inside the sprite at all". Both VMs skip a particle before
+// fetching when the pixel falls outside its sprite, and both leave one texel of margin,
+// because a linear fetch a hair outside 0..1 still reaches the edge texel. Too tight and a
+// sprite loses its outline - on a 2x2 image the outline is most of the sprite. Big, slow,
+// overlapping sprites, so plenty of them also hang off the edge of the panel.
+for (const filter of ["nearest", "linear"]) {
+  check(
+    `particles:edges:${filter}`,
+    graph(
+      [
+        [
+          1,
+          "texture/particles",
+          emitter({ count: 24, filter, size: 0.9, sizeSpread: 0.5, spread: 360, speed: 0.3, fade: 0, life: 4, seed: 11 }),
+          null,
+          null,
+        ],
+        out(2, 10),
+      ],
+      { 10: [1, 0] },
+    ),
+    new Map([[1, testImage(2, 2, false)]]),
+    2600,
+  );
+}
+
+// --- bake: the branch is rendered here, the strip is what the head runs -------
+//
+// What is checked is what always mattered: the .bin the bake produces renders the same in
+// both VMs. That the strip resembles the graph it came from is bake's own business, and
+// test/graph.test.mjs holds it to that.
+for (const driver of ["time", "sensor"]) {
+  check(
+    `bake:${driver}`,
+    graph(
+      [
+        [1, "input/coordinates", {}],
+        [2, "vector/separate", {}, 10],
+        [3, "input/time", { speed: 0.3 }],
+        [4, "math/math", { op: "add", a: 0, b: 1 }, 20, 30],
+        [5, "color/hsv", { hue: 0, sat: 1, val: 1, alpha: 1 }, 40, null, null, null],
+        [6, "bake/bake", { driver, frames: 8, seconds: 2, slot: 0, range: "0..1", crossfade: false }, 50],
+        out(7, 60),
+      ],
+      { 10: [1, 0], 20: [2, 0], 30: [3, 0], 40: [4, 0], 50: [5, 0], 60: [6, 0] },
+    ),
+    new Map(),
+    1234,
+    [0.4],
+  );
+}
 
 // --- sensors: every range, raw and unit, with and without a live feed ---------
 for (let r = 0; r < 5; r++) {

@@ -6,8 +6,12 @@
 // what the panel will do, minus the panel.
 
 import { compile, Runner, type Program } from "./graph.js";
-import { instructionCount, pack, packedSize } from "./pack.js";
+import { PARTITION_BYTES, instructionCount, pack, packedSize } from "./pack.js";
 import { RANGES, decodeInto, imageLabel, images, register, type Env, type Vec } from "./nodes.js";
+import { EXAMPLES, apply } from "./examples.js";
+import { unpack } from "./unpack.js";
+import { DeviceLink, supported as serialSupported, type SerialFrame } from "./serial.js";
+import { Visor } from "./visor.js";
 
 const el = <T extends HTMLElement>(id: string): T => {
   const node = document.getElementById(id);
@@ -20,10 +24,20 @@ const led = el<HTMLCanvasElement>("led");
 const resW = el<HTMLInputElement>("res-w");
 const resH = el<HTMLInputElement>("res-h");
 const preset = el<HTMLSelectElement>("res-preset");
+const examplePicker = el<HTMLSelectElement>("example");
+const exampleInfo = el<HTMLElement>("example-info");
 const status = el<HTMLElement>("status");
 const previewInfo = el<HTMLElement>("preview-info");
 const hint = el<HTMLElement>("hint");
 const binInfo = el<HTMLElement>("bin-info");
+const mirrorInfo = el<HTMLElement>("mirror-info");
+const mirrorButton = el<HTMLButtonElement>("mirror");
+const flashButton = el<HTMLButtonElement>("flash");
+
+// The 3D view of the panels. It reads the same canvas the flat preview draws, so it follows
+// the interpreter and the mirrored head without caring which one produced the frame.
+const visor = Visor.create(el<HTMLCanvasElement>("visor"));
+if (!visor) el("visor").classList.add("hidden");
 
 const lctx = led.getContext("2d");
 if (!lctx) throw new Error("2d context unavailable");
@@ -42,6 +56,42 @@ const graph = new LGraph();
 const editor = new LGraphCanvas(graphCanvas, graph);
 editor.show_info = false; // litegraph's own fps/node counter, we print our own
 
+// litegraph's value menus close when you pick something or click the canvas, but not when
+// you simply walk away from them. They are position:fixed DOM elements, so one left open
+// hangs over whatever is underneath - usually the preview, as a stack of stray words. Close
+// them as soon as the pointer is somewhere that is neither the menu nor the graph.
+const openMenus = document.getElementsByClassName("litecontextmenu");
+addEventListener("pointermove", (event) => {
+  if (openMenus.length === 0) return;
+  const target = event.target;
+  if (target instanceof Element && target.closest(".litecontextmenu, #graph-wrap")) return;
+  LiteGraph.closeAllContextMenus();
+});
+
+// Double-clicking a number widget opens litegraph's value prompt: a DOM element over the
+// canvas, not something the canvas draws. It closes on Enter, on Escape, or on the pointer
+// leaving it again - but NOT once you have typed in it, and its input re-focuses itself on
+// blur. Type a digit, click away, and it is stuck on screen for good, which is worse on the
+// Image, Animation and Particles nodes because those are the ones with widgets worth typing
+// into. Dismiss it the way every other dialog on the web does: a click outside closes it.
+const openDialogs = document.getElementsByClassName("graphdialog");
+addEventListener(
+  "pointerdown",
+  (event) => {
+    if (openDialogs.length === 0) return;
+    const target = event.target;
+    if (target instanceof Element && target.closest(".graphdialog")) return;
+    // close(), not remove(): litegraph keeps a reference to the open prompt and restores
+    // body scrolling for the search box, and only its own close() undoes either.
+    for (const dialog of [...openDialogs]) {
+      const box = dialog as HTMLElement & { close?: () => void };
+      if (typeof box.close === "function") box.close();
+      else box.remove();
+    }
+  },
+  true, // capture: get there before litegraph opens the next one on the same click
+);
+
 function fitEditor(): void {
   const box = graphCanvas.parentElement;
   if (!box) return;
@@ -51,34 +101,48 @@ function fitEditor(): void {
 }
 addEventListener("resize", fitEditor);
 
-/** The graph the page opens with: a hue ramp scrolling across the panel. */
-function defaultGraph(): void {
-  graph.clear();
-  const add = (type: string, x: number, y: number): LGraphNode => {
-    const node = LiteGraph.createNode(type);
-    if (!node) throw new Error(`node type ${type} is not registered`);
-    node.pos = [x, y];
-    graph.add(node);
-    return node;
-  };
-  const coords = add("input/coordinates", 20, 110);
-  const split = add("vector/separate", 200, 110);
-  const time = add("input/time", 20, 290);
-  const math = add("math/math", 400, 150);
-  const hsv = add("color/hsv", 600, 130);
-  const out = add("output/led", 810, 130);
+// ---------------------------------------------------------------------------
+// Examples. The page opens on the first one; the dropdown loads any of them, art and all.
+// ---------------------------------------------------------------------------
 
-  // setProperty, not properties[x]: it also updates the widget bound to that property,
-  // and a widget showing something the shader is not doing is worse than no widget.
-  time.setProperty("speed", 0.2);
-  math.setProperty("op", "add");
-
-  coords.connect(0, split, 0);
-  split.connect(0, math, 0);
-  time.connect(0, math, 1);
-  math.connect(0, hsv, 0);
-  hsv.connect(0, out, 0);
+for (const [i, ex] of EXAMPLES.entries()) {
+  const option = document.createElement("option");
+  option.value = String(i);
+  option.textContent = ex.name;
+  examplePicker.append(option);
 }
+
+async function loadExample(index: number): Promise<void> {
+  const ex = EXAMPLES[index];
+  if (!ex) return;
+  await apply(graph, ex);
+  exampleInfo.textContent = ex.desc;
+  save();
+}
+
+examplePicker.onchange = () => {
+  void loadExample(Number(examplePicker.value));
+  examplePicker.value = "";
+};
+
+// Importing a .bin. The file is a compiled program, not a graph, so what comes back is the
+// program read as nodes - the same picture, laid out by the importer rather than by hand.
+// See the top of unpack.ts for what that does and does not preserve.
+const importInput = el<HTMLInputElement>("import");
+importInput.onchange = async () => {
+  const file = importInput.files?.[0];
+  importInput.value = ""; // so picking the same file twice fires again
+  if (!file) return;
+  try {
+    const imported = unpack(new Uint8Array(await file.arrayBuffer()));
+    await apply(graph, imported.example);
+    setResolution(imported.width, imported.height);
+    exampleInfo.textContent = `${file.name}: ${imported.example.desc.replace(/^imported from a \.bin: /, "")}`;
+    save();
+  } catch (err) {
+    exampleInfo.textContent = `cannot import ${file.name}: ${String(err).replace(/^Error:\s*/, "")}`;
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Persistence. Uploaded images ride along as data URLs inside node.properties, so a
@@ -88,16 +152,27 @@ function defaultGraph(): void {
 
 const SAVE_KEY = "protoshade.graph";
 let lastSaved = "";
+/** The last autosave hit the browser's storage quota. Worth saying out loud: the README
+    promises the graph comes back with the page, and with megabytes of art it does not. */
+let saveFailed = false;
 
 function save(): void {
+  let json = "";
   try {
-    const json = JSON.stringify(graph.serialize());
+    json = JSON.stringify(graph.serialize());
     if (json === lastSaved) return;
     localStorage.setItem(SAVE_KEY, json);
-    lastSaved = json;
+    saveFailed = false;
   } catch {
-    /* private mode, or the graph outgrew the quota - keep editing regardless */
+    // Private mode, or the graph outgrew the quota - keep editing regardless. A graph with
+    // a few megabytes of art in it is past what localStorage will take, and the browser
+    // says so by throwing.
+    saveFailed = json !== "";
   }
+  // Tried, either way. Without this a graph too big to store is re-serialised and re-thrown
+  // every second for the rest of the session, and megabytes of JSON on the main thread once
+  // a second is enough to starve a USB transfer of the acks that pace it.
+  lastSaved = json;
 }
 
 /** Re-decode every image a restored graph carries. */
@@ -108,7 +183,8 @@ async function restoreImages(): Promise<void> {
       const src = node.properties.file;
       if (typeof src !== "string" || !src) return;
       try {
-        await decodeInto(node.id, src);
+        // The saved data URL is already the assembled strip; `frames` is how to cut it up.
+        await decodeInto(node.id, src, Math.max(1, Math.round(Number(node.properties.frames) || 1)));
         const widget = node.widgets?.[0];
         if (widget) widget.name = imageLabel(node.id);
       } catch {
@@ -131,10 +207,10 @@ function load(): void {
       void restoreImages();
       return;
     } catch {
-      /* corrupt or from an older layout - fall through to the default graph */
+      /* corrupt or from an older layout - fall through to the first example */
     }
   }
-  defaultGraph();
+  void loadExample(0);
 }
 
 load();
@@ -143,9 +219,7 @@ setInterval(save, 1000);
 addEventListener("beforeunload", save);
 
 el<HTMLButtonElement>("reset").onclick = () => {
-  images.clear();
-  defaultGraph();
-  save();
+  void loadExample(0);
 };
 
 // ---------------------------------------------------------------------------
@@ -212,6 +286,109 @@ function sweep(range: string, t: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Mirroring the head over USB. When frames are arriving they are what the preview shows -
+// the point is to see what the hardware is doing, not what this machine would do.
+// ---------------------------------------------------------------------------
+
+const link = new DeviceLink();
+let deviceFrame: SerialFrame | null = null;
+let deviceAt = 0;
+let deviceFrames = 0;
+let deviceFps = 0;
+let deviceFpsAt = 0;
+
+function mirrorStatus(text: string): void {
+  mirrorInfo.textContent = text;
+}
+
+if (!serialSupported()) {
+  for (const button of [mirrorButton, flashButton]) {
+    button.disabled = true;
+    button.title = "Web Serial needs Chrome or Edge on the desktop";
+    button.classList.add("opacity-40");
+  }
+}
+
+/** Opens the port, if it is not open already. Mirroring and flashing share the one cable. */
+async function openLink(): Promise<void> {
+  if (link.connected) return;
+  await link.connect(
+    (frame) => {
+      deviceFrame = frame;
+      deviceAt = performance.now();
+      deviceFrames++;
+    },
+    (why) => {
+      deviceFrame = null;
+      mirrorButton.textContent = "mirror head";
+      mirrorStatus(why === "disconnected" ? "" : why);
+    },
+  );
+}
+
+mirrorButton.onclick = async () => {
+  if (link.connected) {
+    await link.send("p"); // tell it to stop sending before the port goes away
+    await link.disconnect();
+    deviceFrame = null;
+    mirrorButton.textContent = "mirror head";
+    mirrorStatus("");
+    return;
+  }
+  try {
+    await openLink();
+    mirrorButton.textContent = "stop mirroring";
+    mirrorStatus("connected, waiting for frames...");
+    await link.send("p"); // same command the serial monitor takes
+  } catch (err) {
+    // Includes the user simply closing the port picker, which is not worth shouting about.
+    mirrorStatus(String(err).replace(/^Error:\s*/, ""));
+  }
+};
+
+// Flashing over the cable, in place of joining the head's access point - which is the only
+// way in on a computer with no WiFi. The head pauses the face, writes the .bin into its
+// flash partition and starts running it; the whole trip is a second or two.
+flashButton.onclick = async () => {
+  if (!current) {
+    mirrorStatus("nothing to flash - the graph does not compile");
+    return;
+  }
+  const bin = pack(current);
+  flashButton.disabled = true;
+  const label = flashButton.textContent;
+  try {
+    await openLink();
+    flashButton.textContent = "flashing...";
+    const summary = await link.flash(bin, (sent, total) => {
+      flashButton.textContent = `flashing ${Math.round((100 * sent) / total)}%`;
+    });
+    mirrorStatus(`flashed over USB: ${summary}`);
+  } catch (err) {
+    mirrorStatus(String(err).replace(/^Error:\s*/, ""));
+  } finally {
+    flashButton.textContent = label;
+    flashButton.disabled = false;
+  }
+};
+
+/** Draws a frame from the head, scaled to the preview canvas. */
+function drawDeviceFrame(frame: SerialFrame): void {
+  if (panel.width !== frame.w || panel.height !== frame.h) {
+    panel.width = frame.w;
+    panel.height = frame.h;
+  }
+  const img = pctx!.createImageData(frame.w, frame.h);
+  for (let i = 0, p = 0; i < frame.rgb.length; i += 3, p += 4) {
+    img.data[p] = frame.rgb[i];
+    img.data[p + 1] = frame.rgb[i + 1];
+    img.data[p + 2] = frame.rgb[i + 2];
+    img.data[p + 3] = 255;
+  }
+  pctx!.putImageData(img, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Preview loop
 // ---------------------------------------------------------------------------
 
@@ -228,13 +405,19 @@ function render(now: number): void {
 
   const result = compile(graph, images, W, H);
   current = result.ok ? result.program : null;
-  const runner = current ? new Runner(current) : null;
+  // A frame older than a second means the head stopped talking; fall back to rendering here
+  // rather than leaving a stale picture up that looks live.
+  const mirroring = deviceFrame !== null && now - deviceAt < 1000;
+  const runner = mirroring ? null : current ? new Runner(current) : null;
   const img = pctx!.createImageData(W, H);
   env.w = W;
   env.h = H;
   env.t = (now - t0) / 1000;
   env.sensors = sensorFeed(env.t);
 
+  if (mirroring) {
+    drawDeviceFrame(deviceFrame!);
+  } else
   for (let y = 0, p = 0; y < H; y++) {
     for (let x = 0; x < W; x++, p += 4) {
       colour[0] = colour[1] = colour[2] = 0;
@@ -256,23 +439,31 @@ function render(now: number): void {
   }
   env.frame++;
 
-  pctx!.putImageData(img, 0, 0);
+  if (!mirroring) {
+    if (panel.width !== W || panel.height !== H) {
+      panel.width = W;
+      panel.height = H;
+    }
+    pctx!.putImageData(img, 0, 0);
+  }
+  visor?.draw(panel);
   lctx!.imageSmoothingEnabled = false;
   lctx!.drawImage(panel, 0, 0, led.width, led.height);
 
   // Dark seams between the LEDs. Only worth drawing once a cell is a few pixels wide.
-  const cell = led.width / W;
+  const cell = led.width / panel.width;
   if (cell >= 5) {
     lctx!.strokeStyle = "rgba(0,0,0,0.55)";
     lctx!.lineWidth = 1;
     lctx!.beginPath();
-    for (let x = 1; x < W; x++) {
+    for (let x = 1; x < panel.width; x++) {
       lctx!.moveTo(x * cell, 0);
       lctx!.lineTo(x * cell, led.height);
     }
-    for (let y = 1; y < H; y++) {
-      lctx!.moveTo(0, y * cell);
-      lctx!.lineTo(led.width, y * cell);
+    const rowCell = led.height / panel.height;
+    for (let y = 1; y < panel.height; y++) {
+      lctx!.moveTo(0, y * rowCell);
+      lctx!.lineTo(led.width, y * rowCell);
     }
     lctx!.stroke();
   }
@@ -283,10 +474,42 @@ function render(now: number): void {
     frames = 0;
     fpsAt = now;
     previewInfo.textContent = `${W}×${H} · ${W * H} led${W * H === 1 ? "" : "s"} · ${fps} fps`;
-    hint.textContent = result.ok ? "" : result.reason;
+    if (link.connected) {
+      deviceFps = Math.round((deviceFrames * 1000) / Math.max(1, now - deviceFpsAt));
+      deviceFrames = 0;
+      deviceFpsAt = now;
+      mirrorStatus(
+        mirroring && deviceFrame
+          ? `live from the head · ${deviceFrame.w}×${deviceFrame.h} · ${deviceFps} fps over USB`
+          : "connected, waiting for frames...",
+      );
+    }
+    const size = current ? packedSize(current) : 0;
+    // Baking buys instructions with flash, so both numbers have to be on screen at once -
+    // and it still has to fit the head's partition (partitions.csv).
+    //
+    // Art far bigger than the panel is the other way a .bin gets out of hand, and a quieter
+    // one: a 320x240 frame on a 64x32 panel is thirty-seven pixels stored for every pixel
+    // the head can light. Nothing renders wrong, it just costs megabytes of flash and
+    // minutes of transfer for something the panel cannot show. Four times the panel is the
+    // threshold, so a sprite that is meant to be bigger than its target says nothing.
+    const bloated = current?.assets.find(
+      (a) => a.w * Math.floor(a.h / Math.max(1, a.frames)) > 4 * W * H,
+    );
+    hint.textContent = !result.ok
+      ? result.reason
+      : size > PARTITION_BYTES
+        ? `${(size / 1048576).toFixed(2)} MB will not fit the head's ${PARTITION_BYTES / 1048576} MB partition - fewer baked frames, or a smaller panel`
+        : bloated
+          ? `an image is ${bloated.w}x${Math.floor(bloated.h / Math.max(1, bloated.frames))} for a ${W}x${H} panel - ` +
+            `${Math.round((bloated.w * Math.floor(bloated.h / Math.max(1, bloated.frames))) / (W * H))}x the pixels the head can show. ` +
+            `Re-import it at ${W}x${H} and the .bin gets that much smaller`
+          : saveFailed
+            ? "too big to autosave - the graph will not come back when you reload the page"
+            : "";
     binInfo.textContent = current
       ? `${instructionCount(current)} instructions · ${current.assets.length} image${current.assets.length === 1 ? "" : "s"} · ` +
-        `${(packedSize(current) / 1024).toFixed(1)} KB .bin` +
+        `${(size / 1024).toFixed(1)} KB .bin` +
         (current.sensorCount ? ` · ${current.sensorCount} sensor slot${current.sensorCount === 1 ? "" : "s"}` : "")
       : "";
   }

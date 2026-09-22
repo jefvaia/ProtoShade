@@ -34,6 +34,12 @@ public:
   // Step budget handed to both halves (see ExecContext).
   void setStepLimit(uint32_t limit) { step_limit_ = limit; }
 
+  // Microseconds the given half spent inside renderRows() on the last frame - the wait for
+  // the other half is not in it. The split is a fixed 50/50 and core 0 has the rest of the
+  // system on it, so a frame costs whatever the SLOWER half costs: these two numbers are
+  // how far apart they actually are, which is the thing to know before splitting unevenly.
+  uint32_t halfMicros(uint8_t index) const { return index < 2 ? halves_[index].last_us : 0; }
+
 private:
   struct Half {
     ParallelRenderer* owner;
@@ -41,6 +47,7 @@ private:
     TaskHandle_t task;
     SemaphoreHandle_t start;
     ExecContext ctx;            // per-core scratch, never shared
+    uint32_t last_us;           // time in renderRows() on the last frame
   };
 
   static void taskEntry(void* arg);
@@ -83,6 +90,14 @@ public:
   // Hands a finished frame over. Blocks only until the previous push is done, which is the
   // back pressure that makes two buffers enough.
   void submit(const Pixel* frame);
+
+  // The same thing for a caller that must not block: hands the frame over if the previous
+  // push has finished, and says no if it has not. Upload mode is the caller - the loop that
+  // draws the waiting indicator is also the loop that runs the web server, and the push task
+  // sits on the core the radio owns. Waiting for a panel there means not answering the
+  // browser, which means the browser retries, which means the radio stays busy and the push
+  // stays starved: the head looks frozen exactly when someone is trying to reach it.
+  bool trySubmit(const Pixel* frame);
 
   // Blocks until nothing is in flight. Call it before you touch either buffer outside the
   // alternating pattern above - switching modes, or shutting down.

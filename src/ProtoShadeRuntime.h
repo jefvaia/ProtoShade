@@ -36,11 +36,15 @@ enum class AssetFormat : uint8_t {
   A8 = 2,       // 1 byte/px, masks: reads as white with that alpha
 };
 
+// An asset is one image, or a strip of them: `frames` frames of height/frames rows each,
+// stacked top to bottom. A still is just frames == 1, which is what a plain image packs as,
+// so every sampler works in frame space and there is no second code path for stills.
 struct Asset {
   const uint8_t* data;
   uint32_t length;
   uint16_t width, height;
   AssetFormat format;
+  uint16_t frames;
 };
 
 // Sensor readings, by slot, exactly as the program's Sensor nodes indexed them. Borrowed:
@@ -49,9 +53,12 @@ struct Asset {
 // They live in Frame rather than being read inside sample() because two cores render one
 // frame at the same time. A reading that changed halfway through would put a different
 // value in the top half of the face than the bottom, and you would see the seam.
+// Plain members, no default initialisers: that keeps it an aggregate under -std=gnu++11,
+// which the ESP32 Arduino core 2.x still compiles with, so Sensors{values, count} works
+// there too. Fields you leave out of the braces are zero-initialised.
 struct Sensors {
-  const float* values = nullptr;
-  uint8_t count = 0;
+  const float* values;
+  uint8_t count;
 };
 
 // Per-frame values, computed once and shared read-only by every core rendering that frame.
@@ -64,7 +71,7 @@ struct Frame {
 
 namespace format {
 constexpr uint8_t kMagic[4] = {'P', 'S', 'H', 'D'};
-constexpr uint16_t kVersion = 3;       // bump on every layout change; old firmware then refuses new bins
+constexpr uint16_t kVersion = 5;       // bump on every layout change; old firmware then refuses new bins
 constexpr size_t kHeaderSize = 48;
 constexpr size_t kAssetEntrySize = 16;
 constexpr size_t kInstrSize = 8;
@@ -76,6 +83,16 @@ constexpr uint16_t kMaxConstants = 128;  // operand encoding is 7 bits + the con
 // few KB on a chip with 512 KB of SRAM.
 constexpr uint16_t kMaxInstructions = 256;
 constexpr uint16_t kMaxAssets = 32;
+// Sprites one program may draw, across ALL its Particles instructions. It is the only loop
+// in the VM, so this is what keeps "cost of a pixel" knowable: 64 sprites is 64 texel
+// fetches, still well inside ExecContext::step_limit. It is also the size of the per-frame
+// state table in ExecContext, which is why it is a budget for the program and not per
+// instruction - two emitters share the 64 rather than each getting their own.
+constexpr uint8_t kMaxParticles = 64;
+// Constants one Particles instruction reads, starting at its src2 operand. Nineteen knobs
+// do not fit in an eight-byte instruction, so the instruction points at a block in the
+// constant pool instead. Mirrored by PARTICLE_QUADS in web/nodes.ts.
+constexpr uint8_t kParticleQuads = 5;
 }  // namespace format
 
 // The instruction set. Mirrored in web/nodes.ts (OP) - the numbering IS the format, so
@@ -88,17 +105,21 @@ enum class Op : uint8_t {
   Sensor,     // aux = slot, aux2 = range << 1 | unit; src0 = value used when the slot is absent
   Math,       // aux = op index; src0 = A, src1 = B
   Mix,        // src0 = fac, src1 = A, src2 = B
-  Over,       // src0 = fac, src1 = foreground, src2 = background
+  Over,       // aux = blend mode; src0 = fac, src1 = foreground, src2 = background
   Swizzle,    // aux = component 0..3, broadcast; src0 = vector
   Combine,    // src0..3 contribute their component 0
   Hsv,        // src0..3 = hue, sat, val, alpha
   Tex,        // aux = asset, aux2 = wrap | filter << 2 | alpha-out << 3; src0 = uv
   Output,     // src0 = colour, src1 = brightness. Always the last instruction.
+  Anim,       // aux = asset, aux2 = tex flags | crossfade << 4 | loop << 5; src0 = uv, src1 = phase
+  Particles,  // aux = asset, aux2 = filter << 2; src0 = position, src1 = time,
+              // src2 = the FIRST of kParticleQuads consecutive constants (see ParticleParams)
   kCount,
 };
 
 constexpr uint8_t kMathOpCount = 21;  // web/nodes.ts MATH_OPS
 constexpr uint8_t kRangeCount = 5;    // web/nodes.ts RANGES
+constexpr uint8_t kBlendCount = 7;    // web/nodes.ts BLEND_MODES
 
 // What a Tex instruction does outside the image (aux2 bits 0-1). web/nodes.ts WRAPS.
 enum class Wrap : uint8_t {
@@ -108,10 +129,26 @@ enum class Wrap : uint8_t {
   kCount,
 };
 
+// One particle, as the pixel loop needs it: where it is, how big, how turned, how faded.
+//
+// Worked out ONCE PER FRAME, not once per pixel. Everything in here comes from the particle's
+// index and the clock, neither of which varies across a frame, and computing it per pixel
+// would put four sines per particle inside the hottest loop in the firmware - on a chip where
+// sinf is software. This struct is that decision made concrete.
+struct Particle {
+  float x, y;          // centre, in whatever space the position input is in
+  float inv_scale;     // 1 / size, so the pixel loop multiplies
+  float cos_r, sin_r;  // rotation, resolved here so no pixel ever calls a trig function
+  float alpha;         // coverage after fade
+  uint16_t frame;      // which frame of the sprite strip this one drew
+  uint16_t reserved;
+};
+
 // Per-thread scratch. One per rendering thread - never share one across cores.
 //
-// ~1 KB because of the register file, so keep it a member or a global, not a stack local
-// inside loop(). That is also why it is caller-owned: the two render tasks each keep one.
+// A few KB because of the register file and the particle table, so keep it a member or a
+// global, not a stack local inside loop(). That is also why it is caller-owned: the two
+// render tasks each keep one.
 struct ExecContext {
   // Hard ceiling on work per pixel. A program from the web is untrusted input: without a
   // budget a bad loop is a watchdog reset with the visor on someone's head. The code has no
@@ -121,6 +158,9 @@ struct ExecContext {
   bool budget_exceeded = false;  // sticky, so a frame can be flagged without checking per pixel
 
   float regs[format::kMaxRegisters][4] = {};
+  // Filled by prepareParticles() once per frame, read by every pixel. Each Particles
+  // instruction owns a slice, handed out at load().
+  Particle particles[format::kMaxParticles] = {};
 };
 
 // Binary container layout, little-endian. Both targets are little-endian, but the fields are
@@ -149,9 +189,11 @@ struct ExecContext {
 //   0       4     data_offset
 //   4       4     data_length
 //   8       2     width
-//   10      2     height
+//   10      2     height            the WHOLE strip; one frame is height / frames rows
 //   12      1     format (AssetFormat)
-//   13      3     reserved
+//   13      2     frames            0 and 1 both mean "a still"; frames * (height/frames)
+//                                   must fit in height, so a frame is always inside the blob
+//   15      1     reserved
 //
 // Instruction (8 bytes): op, dst, src0, src1, src2, src3, aux, aux2.
 // An operand byte is a register index, or a constant index with bit 7 set.
@@ -185,6 +227,10 @@ public:
   bool asset(uint16_t index, Asset& out) const;
 
   uint16_t instructionCount() const { return instr_count_; }
+  // How that splits: uniform instructions run once per core per frame, the rest run per
+  // pixel. A shader whose animation comes only from time is mostly the first kind.
+  uint16_t uniformInstructions() const { return uniform_count_; }
+  uint16_t pixelInstructions() const { return varying_count_; }
   // Sensor slots the program reads. A head with fewer wired up still runs it: missing slots
   // read the value the author left in the Sensor node.
   uint8_t sensorCount() const { return sensor_count_; }
@@ -210,8 +256,29 @@ public:
 private:
   Pixel testPattern(const Frame& frame, uint16_t x, uint16_t y) const;
   bool validateCode();
-  // Reads one asset texel into rgba (0..1). Bounds are already validated at load().
-  void texel(uint16_t asset, int32_t x, int32_t y, Wrap wrap, float* rgba) const;
+  // Runs the instructions named by `list`. One interpreter, two passes: the frame-uniform
+  // one and the per-pixel one.
+  void exec(ExecContext& ctx, const Frame& frame, uint16_t x, uint16_t y, const uint8_t* list,
+            uint16_t count) const;
+  // Per-pixel pass only. Valid once the uniform pass has run into the same ExecContext.
+  Pixel shade(ExecContext& ctx, const Frame& frame, uint16_t x, uint16_t y) const;
+  // Reads one texel of one FRAME into rgba (0..1). Coordinates are frame-local: y runs
+  // 0..rows(frame)-1, and `base` is the row that frame starts at. Bounds are already
+  // validated at load().
+  void texel(uint16_t asset, int32_t x, int32_t y, int32_t base, int32_t rows, Wrap wrap,
+             float* rgba) const;
+  // One frame of one asset, sampled at (u, v) in 0..1 of that frame. flags are the Tex
+  // flags: wrap in bits 0-1, bilinear in bit 2. Tex, Anim and Particles all come through
+  // here, so there is exactly one bilinear fetch in the VM.
+  void sampleFrame(uint16_t asset, uint16_t frame, float u, float v, uint8_t flags,
+                   float* rgba) const;
+  // Sprites a Particles instruction draws, clamped to what is left of the program's budget.
+  // Its operand is required to be a constant (validateCode enforces it), so this is known at
+  // load - which is what keeps the per-pixel budget a number rather than a guess.
+  uint8_t particleCount(const uint8_t* instruction) const;
+  // Works out every particle of every Particles instruction for this frame, into ctx. Runs
+  // once per core per frame, right after the uniform instructions that feed it.
+  void prepareParticles(ExecContext& ctx, const Frame& frame) const;
 
   // Asset header, copied out of the blob at load. Four fields the sampler needs per texel,
   // in RAM, instead of re-parsing a 16-byte table entry out of mapped flash every time.
@@ -219,6 +286,8 @@ private:
     const uint8_t* data;
     int32_t w, h;
     AssetFormat format;
+    uint16_t frames;
+    int32_t rows;  // h / frames, precomputed: the one integer divide a texel fetch would cost
   };
 
   const uint8_t* blob_ = nullptr;
@@ -242,13 +311,40 @@ private:
   AssetRef assets_[format::kMaxAssets] = {};
   uint16_t const_count_ = 0;
 
-  // Work one pixel costs. The ISA has no jumps, so this is known before rendering starts.
+  // Instruction indices split by what they depend on.
+  //
+  // Anything not derived from the pixel position - time, sensors, constants, and everything
+  // computed from those - has the same value for every pixel in a frame, so it runs once per
+  // core per frame instead of once per pixel. A shader that drives a sine from time alone
+  // was paying for that sine on every one of 4096 pixels; now it pays twice a frame.
+  //
+  // Safe only because every register is written exactly once (validateCode proves it), so
+  // pulling those instructions out cannot change what anything downstream reads.
+  uint8_t uniform_[format::kMaxInstructions] = {};
+  uint8_t varying_[format::kMaxInstructions] = {};
+  uint16_t uniform_count_ = 0;
+  uint16_t varying_count_ = 0;
+  uint8_t result_reg_ = 0;  // where the Output instruction leaves the pixel
+
+  // Where each instruction's slice of ExecContext::particles starts, by instruction index,
+  // and the list of which instructions are emitters at all. Both worked out at load, so the
+  // frame setup knows what to fill and the pixel loop knows what to read without looking.
+  uint8_t particle_base_[format::kMaxInstructions] = {};
+  uint8_t particle_instr_[format::kMaxParticles] = {};
+  uint8_t particle_emitters_ = 0;
+  uint8_t particle_total_ = 0;
+
+  // Work one PIXEL costs, which is the varying half. The ISA has no jumps, so this is known
+  // before rendering starts.
   uint32_t cost_ = 0;
 
   uint16_t w_ = 8, h_ = 8;
   // Reciprocals, so the per-pixel coordinate is a multiply. The S3 has a single-precision
   // FPU with no divide worth the name; this is the one division that would run per pixel.
   float inv_w_ = 1.0f / 8.0f, inv_h_ = 1.0f / 8.0f;
+  // Aspect for Centered, worked out here rather than in the pixel loop, where it was the
+  // one division every pixel of every shader that uses centred coordinates paid for.
+  float aspect_ = 1.0f;
   mutable uint32_t frame_index_ = 0;  // only touched by beginFrame(), never while rendering
   Status status_ = Status::NoProgram;
 };

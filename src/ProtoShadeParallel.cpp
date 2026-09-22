@@ -2,6 +2,8 @@
 
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
 
+#include <Arduino.h>  // micros(), for the per-half timing below
+
 namespace protoshade {
 
 bool ParallelRenderer::begin(uint32_t stack_words, UBaseType_t priority) {
@@ -60,11 +62,16 @@ void ParallelRenderer::runHalf(Half& half) {
   const uint16_t split = h / 2;
   const uint16_t y0 = half.index == 0 ? 0 : split;
   const uint16_t y1 = half.index == 0 ? split : h;
-  if (y0 >= y1) return;  // 1-pixel-tall frame: the top half has nothing to do
+  if (y0 >= y1) {
+    half.last_us = 0;  // 1-pixel-tall frame: the top half has nothing to do
+    return;
+  }
 
   half.ctx.step_limit = step_limit_;
   half.ctx.budget_exceeded = false;
+  const uint32_t started = micros();
   rt_->renderRows(half.ctx, *frame_, y0, y1, dst_ + size_t(y0) * rt_->width());
+  half.last_us = micros() - started;
 }
 
 bool ParallelRenderer::render(const ProtoShadeRuntime& rt, const Frame& frame, Pixel* dst) {
@@ -145,6 +152,14 @@ void PanelPusher::submit(const Pixel* frame) {
   xSemaphoreTake(idle_, portMAX_DELAY);  // wait out the previous push
   frame_ = frame;
   xSemaphoreGive(start_);
+}
+
+bool PanelPusher::trySubmit(const Pixel* frame) {
+  if (!running_ || !frame) return false;
+  if (xSemaphoreTake(idle_, 0) != pdTRUE) return false;  // still pushing the last one
+  frame_ = frame;
+  xSemaphoreGive(start_);
+  return true;
 }
 
 void PanelPusher::wait() {
