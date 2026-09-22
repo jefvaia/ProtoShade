@@ -284,6 +284,15 @@ async function withFakeSerial(port, run) {
   assert.equal(p.takeText(), "psflash ready 10752\n", "and reset() is what lets go of it");
 }
 
+// Flashing needs a port somebody already opened. The editor has a connect button of its own
+// now, and mirroring and flashing are things you do to a head that is on the end of it -
+// neither opens the cable as a side effect any more, so this refusal is what stands where
+// that used to be.
+{
+  const failed = await new DeviceLink().flash(new Uint8Array(64)).then(() => null, (err) => String(err));
+  assert.match(failed, /connect to the head first/);
+}
+
 // A head that refuses mid-transfer must surface as an error, not as a stall.
 {
   const port = fakePort({ refuseAt: 1 });

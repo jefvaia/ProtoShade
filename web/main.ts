@@ -31,6 +31,7 @@ const previewInfo = el<HTMLElement>("preview-info");
 const hint = el<HTMLElement>("hint");
 const binInfo = el<HTMLElement>("bin-info");
 const mirrorInfo = el<HTMLElement>("mirror-info");
+const serialButton = el<HTMLButtonElement>("serial");
 const mirrorButton = el<HTMLButtonElement>("mirror");
 const flashButton = el<HTMLButtonElement>("flash");
 
@@ -297,54 +298,98 @@ let deviceFrames = 0;
 let deviceFps = 0;
 let deviceFpsAt = 0;
 
-function mirrorStatus(text: string): void {
+// Held until this moment before the once-a-second line below is allowed to overwrite it.
+// Without that, the answer to a flash - the head's own summary of what it is now running,
+// or why it refused - lived for half a second before the frame counter wrote over it.
+let statusHeldUntil = 0;
+
+function mirrorStatus(text: string, holdMs = 0): void {
   mirrorInfo.textContent = text;
+  statusHeldUntil = performance.now() + holdMs;
 }
 
-if (!serialSupported()) {
-  for (const button of [mirrorButton, flashButton]) {
-    button.disabled = true;
-    button.title = "Web Serial needs Chrome or Edge on the desktop";
-    button.classList.add("opacity-40");
+const unsupported = !serialSupported();
+if (unsupported) {
+  serialButton.title = "Web Serial needs Chrome or Edge on the desktop";
+}
+
+// What we believe the head is doing with its pixel stream. `p` toggles it at the other end
+// and the head remembers across a closed port, so this is a belief and not a fact - see the
+// frame callback, which corrects it the moment a frame proves it wrong.
+let streaming = false;
+
+/**
+ * The one place the three buttons' labels and enabled states are decided.
+ *
+ * Mirroring and flashing used to open the port themselves, which meant the cable was
+ * connected as a side effect of asking for something else and there was no way to ask for
+ * the connection on its own - or to see whether you had one. The port is its own button
+ * now, and the other two are things you do to a head that is already on the end of it.
+ */
+function syncSerial(): void {
+  serialButton.textContent = link.connected ? "disconnect" : "connect";
+  serialButton.disabled = unsupported;
+  mirrorButton.textContent = streaming ? "stop mirroring" : "mirror head";
+  for (const button of [mirrorButton, flashButton]) button.disabled = !link.connected;
+  for (const button of [serialButton, mirrorButton, flashButton]) {
+    button.classList.toggle("opacity-40", button.disabled);
   }
 }
 
-/** Opens the port, if it is not open already. Mirroring and flashing share the one cable. */
-async function openLink(): Promise<void> {
-  if (link.connected) return;
-  await link.connect(
-    (frame) => {
-      deviceFrame = frame;
-      deviceAt = performance.now();
-      deviceFrames++;
-    },
-    (why) => {
-      deviceFrame = null;
-      mirrorButton.textContent = "mirror head";
-      mirrorStatus(why === "disconnected" ? "" : why);
-    },
-  );
-}
-
-mirrorButton.onclick = async () => {
+serialButton.onclick = async () => {
   if (link.connected) {
-    await link.send("p"); // tell it to stop sending before the port goes away
+    // Tell it to stop sending before the port goes away: the head is writing frames into a
+    // buffer nobody will drain, and the next connection would start mid-picture.
+    if (streaming) await link.send("p");
     await link.disconnect();
+    streaming = false;
     deviceFrame = null;
-    mirrorButton.textContent = "mirror head";
     mirrorStatus("");
+    syncSerial();
     return;
   }
   try {
-    await openLink();
-    mirrorButton.textContent = "stop mirroring";
-    mirrorStatus("connected, waiting for frames...");
-    await link.send("p"); // same command the serial monitor takes
+    await link.connect(
+      (frame) => {
+        deviceFrame = frame;
+        deviceAt = performance.now();
+        deviceFrames++;
+        // A head left mirroring when the port last closed is still mirroring now, and the
+        // arriving frame is the proof. Believe it over whatever this page assumed.
+        if (!streaming) {
+          streaming = true;
+          syncSerial();
+        }
+      },
+      (why) => {
+        deviceFrame = null;
+        streaming = false;
+        mirrorStatus(why === "disconnected" ? "" : why);
+        syncSerial();
+      },
+    );
+    mirrorStatus("connected");
+    syncSerial();
   } catch (err) {
     // Includes the user simply closing the port picker, which is not worth shouting about.
     mirrorStatus(String(err).replace(/^Error:\s*/, ""));
+    syncSerial();
   }
 };
+
+mirrorButton.onclick = async () => {
+  try {
+    await link.send("p"); // the same command the serial monitor takes
+    streaming = !streaming;
+    if (!streaming) deviceFrame = null;
+    mirrorStatus(streaming ? "connected, waiting for frames..." : "connected");
+    syncSerial();
+  } catch (err) {
+    mirrorStatus(String(err).replace(/^Error:\s*/, ""));
+  }
+};
+
+syncSerial();
 
 // Flashing over the cable, in place of joining the head's access point - which is the only
 // way in on a computer with no WiFi. The head pauses the face, writes the .bin into its
@@ -358,17 +403,18 @@ flashButton.onclick = async () => {
   flashButton.disabled = true;
   const label = flashButton.textContent;
   try {
-    await openLink();
     flashButton.textContent = "flashing...";
     const summary = await link.flash(bin, (sent, total) => {
       flashButton.textContent = `flashing ${Math.round((100 * sent) / total)}%`;
     });
-    mirrorStatus(`flashed over USB: ${summary}`);
+    mirrorStatus(`flashed over USB: ${summary}`, 8000);
   } catch (err) {
-    mirrorStatus(String(err).replace(/^Error:\s*/, ""));
+    mirrorStatus(String(err).replace(/^Error:\s*/, ""), 8000);
   } finally {
     flashButton.textContent = label;
-    flashButton.disabled = false;
+    // Not `disabled = false`: a flash that failed because the cable came out must not leave
+    // a button that looks ready. syncSerial() asks the link what is actually true.
+    syncSerial();
   }
 };
 
@@ -478,11 +524,15 @@ function render(now: number): void {
       deviceFps = Math.round((deviceFrames * 1000) / Math.max(1, now - deviceFpsAt));
       deviceFrames = 0;
       deviceFpsAt = now;
-      mirrorStatus(
-        mirroring && deviceFrame
-          ? `live from the head · ${deviceFrame.w}×${deviceFrame.h} · ${deviceFps} fps over USB`
-          : "connected, waiting for frames...",
-      );
+      if (now >= statusHeldUntil) {
+        mirrorStatus(
+          mirroring && deviceFrame
+            ? `live from the head · ${deviceFrame.w}×${deviceFrame.h} · ${deviceFps} fps over USB`
+            : streaming
+              ? "connected, waiting for frames..."
+              : "connected",
+        );
+      }
     }
     const size = current ? packedSize(current) : 0;
     // Baking buys instructions with flash, so both numbers have to be on screen at once -
