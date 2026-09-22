@@ -154,6 +154,14 @@ void PanelPusher::submit(const Pixel* frame) {
   xSemaphoreGive(start_);
 }
 
+bool PanelPusher::trySubmit(const Pixel* frame) {
+  if (!running_ || !frame) return false;
+  if (xSemaphoreTake(idle_, 0) != pdTRUE) return false;  // still pushing the last one
+  frame_ = frame;
+  xSemaphoreGive(start_);
+  return true;
+}
+
 void PanelPusher::wait() {
   if (!running_) return;
   xSemaphoreTake(idle_, portMAX_DELAY);

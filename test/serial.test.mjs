@@ -170,6 +170,8 @@ function fakePort({ refuseAt = -1 } = {}) {
   let declared = 0;
   return {
     written,
+    /** Bytes straight onto the wire, for the things a head says outside the protocol. */
+    emitRaw: (bytes) => emit?.(bytes),
     opened: false,
     async open() {
       this.opened = true;
@@ -249,6 +251,37 @@ async function withFakeSerial(port, run) {
   assert.equal(port.written[1].length, FLASH_CHUNK);
   assert.equal(port.written[3].length, 17);
   assert.equal(port.written[3][0], bin[FLASH_CHUNK * 2], "the tail is the tail of the file");
+}
+
+// A frame that was cut short on the wire must not swallow the head's answers.
+//
+// The head drops bytes when the browser stops draining the port - its USB ring buffer is a
+// few hundred bytes and a mirrored frame is twelve kilobytes - and the parser is then left
+// waiting for a tail that is never coming. Every line after it counts towards that tail,
+// including "psflash ready", and the head goes quiet after saying it because it is waiting
+// for the file: the flash deadlocks and reports a head that is not answering. It was.
+{
+  const port = fakePort();
+  const bin = new Uint8Array(FLASH_CHUNK + 5).map((_, i) => i & 0xff);
+  const summary = await withFakeSerial(port, async () => {
+    const link = new DeviceLink();
+    await link.connect(() => {}, () => {});
+    port.emitRaw(frame(128, 32, 1).slice(0, 5000)); // mirroring, and the port dropped the rest
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return link.flash(bin);
+  });
+  assert.equal(summary, `${bin.length} bytes, 6 instructions, 0 images, 0 sensor slots`);
+}
+
+// The same thing one level down, where the fix lives.
+{
+  const p = new FrameParser();
+  p.push(frame(128, 32, 1).slice(0, 5000));
+  p.push(text("psflash ready 10752\n"));
+  assert.equal(p.takeText(), "", "the half-frame is still holding the line - this is the bug");
+  p.reset();
+  p.push(text("psflash ready 10752\n"));
+  assert.equal(p.takeText(), "psflash ready 10752\n", "and reset() is what lets go of it");
 }
 
 // A head that refuses mid-transfer must surface as an error, not as a stall.

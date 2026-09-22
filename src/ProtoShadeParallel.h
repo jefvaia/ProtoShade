@@ -91,6 +91,14 @@ public:
   // back pressure that makes two buffers enough.
   void submit(const Pixel* frame);
 
+  // The same thing for a caller that must not block: hands the frame over if the previous
+  // push has finished, and says no if it has not. Upload mode is the caller - the loop that
+  // draws the waiting indicator is also the loop that runs the web server, and the push task
+  // sits on the core the radio owns. Waiting for a panel there means not answering the
+  // browser, which means the browser retries, which means the radio stays busy and the push
+  // stays starved: the head looks frozen exactly when someone is trying to reach it.
+  bool trySubmit(const Pixel* frame);
+
   // Blocks until nothing is in flight. Call it before you touch either buffer outside the
   // alternating pattern above - switching modes, or shutting down.
   void wait();

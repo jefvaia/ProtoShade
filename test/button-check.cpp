@@ -53,6 +53,7 @@ bool PanelPusher::begin(const Panel*, size_t, uint16_t, uint16_t, Pixel*, BaseTy
   return true;
 }
 void PanelPusher::submit(const Pixel*) {}
+bool PanelPusher::trySubmit(const Pixel*) { return true; }
 void PanelPusher::wait() {}
 }  // namespace protoshade
 
@@ -134,6 +135,23 @@ int main() {
   assert(!buttonPolled());
   advance(kButtonHoldMs * 4);
   assert(!buttonPolled());
+
+  // A pin that is picking up the panel harness rather than a thumb. Every edge is an
+  // interrupt on a core that is rendering a face, so the head has to be able to give up on
+  // a pin that is clearly not being pressed - otherwise the frame rate stays on the floor
+  // until the upload window closes on its own.
+  armButton();
+  assert(!buttonNoisy() && "the first second is a measurement, not a verdict");
+  advance(1000);
+  assert(!buttonNoisy() && "a quiet pin is not noise");
+  for (uint32_t i = 0; i <= kButtonNoiseEdgesPerSecond; i++) {
+    setButton(true);
+    setButton(false);
+  }
+  advance(1000);
+  assert(buttonNoisy() && "hundreds of edges in a second is not a finger");
+  advance(1000);
+  assert(!buttonNoisy() && "and a pin that went quiet again is not accused twice");
 
   printf("button-check: ok\n");
   return 0;

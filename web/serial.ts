@@ -117,6 +117,24 @@ export class FrameParser {
     if (this.text.length > MAX_TEXT) this.text = this.text.slice(-MAX_TEXT);
   }
 
+  /**
+   * Throws away whatever is half-parsed and starts again at the next byte.
+   *
+   * A frame that was cut short on the wire - the head's USB ring buffer fills up when the
+   * browser stops draining it, and Serial.write() then sends fewer bytes than the frame
+   * says it has - leaves this parser waiting for a tail that is never coming, and every log
+   * line after it counts towards that tail instead of coming out as text. Mirroring recovers
+   * on its own: the next frames are more bytes, the phantom one fills up, one picture is
+   * garbled and the stream is back. A flash does not, and that is the deadlock this exists
+   * for - the head says "psflash ready" and then waits for the file, the browser waits for
+   * that line to appear out of a frame that needs another eight kilobytes, and neither of
+   * them ever sends another byte.
+   */
+  reset(): void {
+    this.buf = new Uint8Array(0);
+    this.text = "";
+  }
+
   /** How many trailing bytes could still turn into the frame magic once more arrive. */
   private magicTail(): number {
     for (let k = Math.min(FRAME_MAGIC.length - 1, this.buf.length); k > 0; k--) {
@@ -167,6 +185,9 @@ export class DeviceLink {
   // else the head says goes past unread, which is what the serial monitor is for.
   private lines: string[] = [];
   private partial = "";
+  // Owned by the link rather than by read(), because flash() has to be able to throw its
+  // half-parsed state away - see FrameParser.reset().
+  private parser = new FrameParser();
 
   /** Asks the user for a port, then reads until disconnect(). Must follow a click. */
   async connect(onFrame: (frame: SerialFrame) => void, onClose: (why: string) => void): Promise<void> {
@@ -182,7 +203,7 @@ export class DeviceLink {
   }
 
   private async read(onFrame: (frame: SerialFrame) => void, onClose: (why: string) => void): Promise<void> {
-    const parser = new FrameParser();
+    const parser = this.parser;
     try {
       while (this.port?.readable) {
         this.reader = this.port.readable.getReader();
@@ -231,6 +252,9 @@ export class DeviceLink {
     if (!this.port) throw new Error("connect to the head first");
     this.lines.length = 0;
     this.partial = "";
+    // The head is about to answer in log lines and then go quiet waiting for the file, so
+    // anything this parser is still holding on to would hold those lines with it.
+    this.parser.reset();
 
     await this.send(flashHeader(bin.length));
     // Generous because the head reads the port once per loop, and one turn of that loop is a

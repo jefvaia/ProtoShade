@@ -8,3 +8,4 @@ typedef void* TaskHandle_t;
 typedef void* SemaphoreHandle_t;
 #define portMAX_DELAY 0xFFFFFFFF
 #define pdPASS 1
+#define pdTRUE 1

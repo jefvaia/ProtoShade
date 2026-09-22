@@ -124,11 +124,13 @@ bool buttonDown() {
 constexpr uint32_t kButtonHoldMs = 50;
 volatile uint32_t button_down_at = 0;   // millis() when the current press started, 0 if up
 volatile uint32_t button_press_ms = 0;  // how long the last finished press lasted
+volatile uint32_t button_edges = 0;     // every edge ever seen, for the noise guard below
 
 // IRAM_ATTR because this can fire while the flash cache is off. digitalRead() is not itself
 // IRAM-safe, which is why the interrupt is detached before upload mode erases anything.
 void IRAM_ATTR onButtonEdge() {
   const uint32_t now = millis();
+  button_edges++;
   if (buttonDown()) {
     button_down_at = now;
   } else if (button_down_at != 0) {
@@ -157,11 +159,55 @@ bool buttonPressed() {
   if (finished != 0) {
     button_press_ms = 0;
     if (finished >= kButtonHoldMs) return true;
-    Serial.printf("button: a %lu ms press is too short - hold it a moment\n",
-                  (unsigned long)finished);
+    // Once a second at most. This runs inside the frame loop, and a line on a USB port that
+    // nobody is draining blocks until the driver gives up on it - so a pin that bounces
+    // every frame turns a diagnostic into the slowest thing in the render loop. The message
+    // is for a person pressing a button too briefly; it does not need to be every time.
+    static uint32_t complained_at = 0;
+    const uint32_t now = millis();
+    if (now - complained_at >= 1000) {
+      complained_at = now;
+      Serial.printf("button: a %lu ms press is too short - hold it a moment\n",
+                    (unsigned long)finished);
+    }
   }
   const uint32_t started = button_down_at;
   return started != 0 && millis() - started >= kButtonHoldMs;
+}
+
+// Edges no finger produced.
+//
+// A button pin is one long wire in a head full of them, and a HUB75 harness clocks tens of
+// megahertz right next to it. A pin picking that up fires edges continuously, and every one
+// of them is an interrupt on a core that is trying to render a face: the frame rate falls
+// through the floor until the upload window closes and the pin is let go of, which is a
+// minute of a head that looks broken and then fixes itself. Nothing in the log says why.
+//
+// So: count the edges, and past a rate a thumb cannot produce, let the pin go early and say
+// so. The upload button stops working for the rest of that boot - it was never going to
+// work, it was only going to cost frames - and `u` on the serial monitor and flashing over
+// USB are both still there.
+//
+// ponytail: a plain rate check, once a second, no filtering. If a head ever has a button
+// that genuinely chatters this hard and still has to work, the upgrade is a Schmitt input or
+// an RC on the pin, not a cleverer count.
+constexpr uint32_t kButtonNoiseEdgesPerSecond = 200;
+
+bool buttonNoisy() {
+  static uint32_t since = 0;
+  static uint32_t seen = 0;
+  const uint32_t now = millis();
+  if (since == 0) since = now;
+  if (now - since < 1000) return false;
+  const uint32_t edges = button_edges - seen;
+  seen = button_edges;
+  since = now;
+  if (edges <= kButtonNoiseEdgesPerSecond) return false;
+  Serial.printf("button: GPIO %d fired %lu edges in a second - that is not a press, it is\n"
+                "pickup from the panel harness. Letting the pin go; type u here for upload\n"
+                "mode, or flash over USB from the editor.\n",
+                BUTTON_PIN, (unsigned long)edges);
+  return true;
 }
 
 // Upload mode detaches the interrupt above - it cannot be allowed to run while an erase has
@@ -454,8 +500,14 @@ bool flashOverSerial() {
 void showUploadIndicator() {
   const uint8_t v = uint8_t(40.0f + 60.0f * (0.5f + 0.5f * sinf(millis() / 500.0f)));
   for (size_t i = 0; i < size_t(CANVAS_W) * CANVAS_H; i++) back[i] = Pixel{0, uint8_t(v / 3), v};
-  pusher.submit(back);
-  swapCanvases();
+  // trySubmit, not submit: this loop is also the web server. The push task is pinned to the
+  // core the radio owns, so while a browser is talking to the head the push is the thing
+  // that waits - and blocking here on it means not answering the request that is keeping
+  // the radio busy. The browser retries, the radio stays busy, and the head sits there doing
+  // neither: the page never loads and the panels never change, which is exactly what a
+  // frozen head looks like. A dropped indicator frame costs nothing; a dropped request costs
+  // upload mode.
+  if (pusher.trySubmit(back)) swapCanvases();
 }
 
 // ---------------------------------------------------------------------------
@@ -579,8 +631,11 @@ void loop() {
   // The window is measured from boot. Past it the button does nothing at all, which is the
   // point - but say so once, or a press at 61 seconds looks like a broken button.
   static bool window_closed = false;
-  if (millis() < UPLOAD_WINDOW_MS) {
-    if (buttonPressed()) {
+  if (!window_closed && millis() < UPLOAD_WINDOW_MS) {
+    if (buttonNoisy()) {
+      window_closed = true;
+      disarmButton();
+    } else if (buttonPressed()) {
       enterUploadMode();
       return;
     }
