@@ -61,7 +61,10 @@ bool loadProgramFromFlash(ProtoShadeRuntime&) { return false; }
 bool begin(ProtoShadeRuntime&, const char*, const char*) { return true; }
 bool receiveOverSerial(ProtoShadeRuntime&) { return true; }
 void handle() {}
+void end() {}
 bool lastUploadFailed() { return false; }
+uint32_t lastRequestAt() { return 0; }
+uint32_t lastUploadAt() { return 0; }
 }  // namespace upload
 
 int main() {
@@ -101,6 +104,36 @@ int main() {
   advance(kButtonHoldMs * 4);
   setButton(false);
   assert(!buttonPressed());
+
+  // The polled press, which is what upload mode has instead of the latch above: the
+  // interrupt is detached there, so nothing gets latched and loop() has to watch the pin.
+  detachInterrupt(digitalPinToInterrupt(BUTTON_PIN));
+  resetButtonPoll();
+
+  // Entering upload mode by holding the button: that same hold must not immediately take the
+  // head back out again, however long it lasts.
+  setButton(true);
+  advance(kButtonHoldMs * 10);
+  assert(!buttonPolled() && "the press that opened upload mode also closed it");
+
+  // Let go, and a fresh press counts once it has been held long enough. The clock starts at
+  // the first poll that SEES the pin down rather than at the press itself - there is no
+  // interrupt here to timestamp the edge - and upload mode's loop comes round every ten
+  // milliseconds, so the difference is not one a thumb can feel.
+  setButton(false);
+  assert(!buttonPolled());
+  setButton(true);
+  assert(!buttonPolled() && "a press counted before it had been held at all");
+  advance(kButtonHoldMs - 10);
+  assert(!buttonPolled() && "a bounce came out as a press");
+  advance(20);
+  assert(buttonPolled());
+
+  // A press that never finishes still reads as one; a released pin never does.
+  setButton(false);
+  assert(!buttonPolled());
+  advance(kButtonHoldMs * 4);
+  assert(!buttonPolled());
 
   printf("button-check: ok\n");
   return 0;

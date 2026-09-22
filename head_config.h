@@ -20,6 +20,10 @@ using namespace protoshade;
 // This is one drawing covering everything the head shows. Panels below cut their own
 // rectangles out of it. Canvas area no panel reads is rendered and thrown away - that
 // costs time but nothing else, so size this to the face, not to the biggest panel.
+//
+// Both sides, not one: the default map below puts the second panel at x = 64, so a 64 wide
+// canvas would have it reading past the edge and showing black. One 64x32 side of a face is
+// a panel; the face is the two of them.
 
 constexpr uint16_t CANVAS_W = 128;  // two 64x32 panels side by side
 constexpr uint16_t CANVAS_H = 32;
@@ -37,6 +41,20 @@ constexpr bool BUTTON_ACTIVE_LOW = true;    // BOOT shorts to ground
 constexpr uint32_t UPLOAD_WINDOW_MS = 60000;
 constexpr const char* AP_SSID = "ProtoShade";
 constexpr const char* AP_PASSWORD = "protogen";  // 8 characters minimum, or the AP is open
+
+// Coming back OUT of upload mode. The face stops while the head is an access point - the VM
+// renders straight out of the partition an upload erases - so these say when it starts again
+// without anyone having to reach for the power.
+//
+//   UPLOAD_RETURN_MS  after a .bin has landed and loaded. The wait is so the browser gets
+//                     its answer before the access point disappears under it.
+//   UPLOAD_IDLE_MS    with nothing asked of the web server at all. A head that went into
+//                     upload mode by accident puts its face back on by itself.
+//
+// 0 disables either one. Whatever these say, the button and `u` on the serial monitor bring
+// the face back at any time, and flashing over USB does too.
+constexpr uint32_t UPLOAD_RETURN_MS = 2000;
+constexpr uint32_t UPLOAD_IDLE_MS = 5 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // 3. Display drivers

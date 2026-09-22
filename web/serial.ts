@@ -233,7 +233,11 @@ export class DeviceLink {
     this.partial = "";
 
     await this.send(flashHeader(bin.length));
-    await this.expect("psflash ready", 5000);
+    // Generous because the head reads the port once per loop, and one turn of that loop is a
+    // whole frame: a slow display driver can hold it for seconds. Five was not enough on a
+    // head whose panels take their time, and a head that is genuinely not listening says so
+    // just as clearly ten seconds later.
+    await this.expect("psflash ready", 10000);
     for (let sent = 0; sent < bin.length; ) {
       const end = Math.min(sent + FLASH_CHUNK, bin.length);
       await this.send(bin.subarray(sent, end));
@@ -256,7 +260,12 @@ export class DeviceLink {
           throw new Error(line.replace(/^psflash error\s*-?\s*/, "the head refused it: "));
         }
       }
-      if (performance.now() > deadline) throw new Error(`the head went quiet waiting for "${prefix}"`);
+      if (performance.now() > deadline) {
+        throw new Error(
+          `the head went quiet waiting for "${prefix}" - is it running this firmware, and is` +
+            " Tools > USB CDC On Boot enabled?",
+        );
+      }
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
   }

@@ -20,6 +20,7 @@ public:
   void on(const char*, HTTPMethod, void (*)(), void (*)()) {}
   void onNotFound(void (*)()) {}
   void begin() {}
+  void stop() {}
   void handleClient() {}
   void send(int, const char*, const String&) {}
   void send(int, const char*, const char*) {}
