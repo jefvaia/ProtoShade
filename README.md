@@ -467,6 +467,20 @@ The sketch validates the header *before* erasing anything, so a garbage upload c
 program that works, then streams it into flash a sector at a time and loads it. It survives
 power loss because it is in flash, not RAM.
 
+**Getting back out** does not need the power switch. Upload mode ends, WiFi goes down and the
+face comes back, on any of:
+
+- a `.bin` landing and loading - `UPLOAD_RETURN_MS` after, so the browser gets its answer
+  before the access point disappears under it
+- `UPLOAD_IDLE_MS` with nothing asked of the web server, for a head that got there by accident
+- the button, or `u` on the serial monitor, at any time
+- a flash over USB, which also puts the face back when it succeeds
+
+Both timeouts are in `head_config.h`, and `0` turns either off. Upload mode reads the serial
+port too, so the editor's **flash over USB** works from an access point as well as from the
+face - it used not to, and the editor's report of a head that "went quiet waiting for psflash
+ready" was a head that was not listening.
+
 `npm run build:device` also puts the whole editor (gzipped, 133 KB) into `data/` for the
 LittleFS partition, so the head serves the editor itself at `http://192.168.4.1/` with no
 computer involved. Skip it and `/upload` still works.

@@ -11,6 +11,7 @@ public:
 class FsStub {
 public:
   bool begin(bool = false) { return false; }
+  void end() {}
   bool exists(const String&) { return false; }
   File open(const String&, const char*) { return File(); }
 };

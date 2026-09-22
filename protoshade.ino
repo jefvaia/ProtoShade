@@ -164,6 +164,31 @@ bool buttonPressed() {
   return started != 0 && millis() - started >= kButtonHoldMs;
 }
 
+// Upload mode detaches the interrupt above - it cannot be allowed to run while an erase has
+// the flash cache down - so a press in upload mode is polled instead. loop() is idle enough
+// there for that to be reliable, which it is not while frames are being pushed.
+//
+// The pin has to be seen RELEASED first, or the press that opened upload mode is also the
+// one that closes it half a second later.
+bool button_was_released = false;
+uint32_t button_held_since = 0;
+
+void resetButtonPoll() {
+  button_was_released = false;
+  button_held_since = 0;
+}
+
+bool buttonPolled() {
+  if (!buttonDown()) {
+    button_was_released = true;
+    button_held_since = 0;
+    return false;
+  }
+  if (!button_was_released) return false;
+  if (button_held_since == 0) button_held_since = millis();
+  return millis() - button_held_since >= kButtonHoldMs;
+}
+
 // Mirrors the canvas to whoever is on the other end of the USB cable. The editor picks the
 // frames out of the log stream and draws them, so you can watch what the head is actually
 // rendering while it is on your head.
@@ -351,15 +376,44 @@ void enterUploadMode() {
   pusher.wait();
   renderer.end();
 
+  resetButtonPoll();
   if (!upload::begin(runtime, AP_SSID, AP_PASSWORD)) {
     fail("upload mode failed to start");
   }
 }
 
+// And back again. Upload mode used to be a one-way door: the only way out of an access point
+// was the power switch, which is a poor thing to reach for with a head on.
+//
+// Order matters. WiFi and the web server go first, because the reason the renderer was
+// stopped on the way in was to give them its stacks - start the render tasks before letting
+// go of that and begin() fails on a heap that is still full.
+void leaveUploadMode(const char* why) {
+  Serial.printf("leaving upload mode (%s): WiFi goes down, the face comes back\n", why);
+  upload::end();
+
+  // Whatever is in the partition now, mapped again. After an upload this is the new program;
+  // after an idle timeout it is the same one as before, and either way the runtime must hold
+  // a live mapping before a render task reads a pixel out of it.
+  if (!upload::loadProgramFromFlash(runtime)) {
+    Serial.println("nothing valid in the partition - the face is the test pattern");
+  }
+  if (!renderer.begin()) {
+    fail("renderer.begin() failed coming out of upload mode - out of memory?");
+    return;
+  }
+
+  mode = Mode::Face;
+  // The button is not re-armed: the window it belonged to is long shut, and an interrupt
+  // that fires during the next erase is exactly what disarming it was for.
+  stats = Stats{};
+  stats.since = millis();
+}
+
 // Flashing over USB, which is upload mode's job without any of upload mode: no WiFi, no
 // access point, no browser, and the face is back a second later. The editor drives it over
 // the cable it already uses to mirror the head.
-void flashOverSerial() {
+bool flashOverSerial() {
   Serial.println("flashing over USB: the face pauses while flash is written");
   // Both for the same reason: erasing flash takes the cache down with it, and neither the
   // VM nor an interrupt handler may be reading out of flash while that happens.
@@ -374,7 +428,7 @@ void flashOverSerial() {
   const bool was_streaming = streaming;
   streaming = false;
 
-  upload::receiveOverSerial(runtime);
+  const bool ok = upload::receiveOverSerial(runtime);
 
   streaming = was_streaming;
 
@@ -382,6 +436,7 @@ void flashOverSerial() {
   // running at 0.4 fps for the next two seconds.
   stats = Stats{};
   stats.since = millis();
+  return ok;
 }
 
 // A slow blue pulse across every panel, so you can see from the other side of the room that
@@ -449,6 +504,39 @@ void setup() {
 void loop() {
   if (mode == Mode::Upload) {
     upload::handle();
+
+    // The port is read here too. It used to be read only in face mode, which meant that once
+    // the head was an access point it answered nothing over USB at all - the editor sent its
+    // header, waited five seconds for "psflash ready" and reported a head that had gone
+    // quiet. It had not; nobody was listening.
+    switch (serialRequest()) {
+      case Request::Flash:
+        if (flashOverSerial()) {
+          leaveUploadMode("flashed over USB");
+          return;
+        }
+        break;  // refused: stay put so the next attempt has somewhere to land
+      case Request::UploadMode:
+        leaveUploadMode("asked on the serial monitor");
+        return;
+      case Request::None:
+        break;
+    }
+
+    if (buttonPolled()) {
+      leaveUploadMode("the button");
+      return;
+    }
+    const uint32_t landed = upload::lastUploadAt();
+    if (UPLOAD_RETURN_MS != 0 && landed != 0 && millis() - landed >= UPLOAD_RETURN_MS) {
+      leaveUploadMode("a .bin landed");
+      return;
+    }
+    if (UPLOAD_IDLE_MS != 0 && millis() - upload::lastRequestAt() >= UPLOAD_IDLE_MS) {
+      leaveUploadMode("nothing asked of it for a while");
+      return;
+    }
+
     // Blue while it waits; red if the last .bin was refused, so you can see a bad upload
     // without going back to the browser tab.
     setLed(fault || upload::lastUploadFailed() ? LedState::Error : LedState::Upload,

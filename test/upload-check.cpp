@@ -98,6 +98,11 @@ SerialStub Serial;
 WiFiStub WiFi;
 FsStub LittleFS;  // upload_mode serves the editor off it; nothing here asks it for a file
 
+// A clock this file owns, so the timestamps upload mode leaves behind can be read back. It
+// starts past zero because lastUploadAt() uses 0 to mean "nothing has landed".
+unsigned long now_ms = 1000;
+unsigned long millis() { return now_ms; }
+
 namespace {
 
 void put16(std::vector<uint8_t>& v, size_t at, uint16_t x) {
@@ -332,10 +337,38 @@ void testSingleSectorUpload() {
   assert(rt.hasProgram());
 }
 
+// When upload mode gets to put the face back on. Both of the head's ways out of an access
+// point hang off these two numbers, and a .bin that stored fine but left lastUploadAt() at
+// zero is a head that stays an access point until someone pulls the power.
+void testUploadTimestamps() {
+  resetFlash(0xFF);
+  ProtoShadeRuntime rt(64, 32);
+
+  now_ms = 5000;
+  const std::vector<uint8_t> wire = serialTransfer(animationProgram(64, 32, 2));
+  queue(wire);
+  assert(upload::receiveOverSerial(rt));
+  assert(upload::lastUploadAt() == 5000 && "a .bin landed and nothing noticed");
+
+  // A refused one must not move it: the head would go back to the face announcing a program
+  // it never stored.
+  const uint32_t landed = upload::lastUploadAt();
+  now_ms = 9000;
+  std::vector<uint8_t> broken = serialTransfer(animationProgram(64, 32, 2));
+  broken[8] = 'X';  // the magic, which feed() checks before erasing anything
+  queue(broken);
+  assert(!upload::receiveOverSerial(rt));
+  assert(upload::lastUploadAt() == landed && "a rejected .bin counted as one that landed");
+
+  // And end() has to be safe to call: it is the first thing on the way back to the face.
+  upload::end();
+}
+
 }  // namespace
 
 int main() {
   testSerialUpload();
+  testUploadTimestamps();
   testSingleSectorUpload();
   testTruncatedUpload();
   testBadHeaderKeepsTheOldProgram();

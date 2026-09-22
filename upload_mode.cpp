@@ -26,6 +26,13 @@ esp_partition_mmap_handle_t mapping = 0;
 bool mapped = false;
 String address_;
 bool last_failed = false;
+uint32_t request_at = 0;  // the last thing the server was asked for
+uint32_t upload_at = 0;   // the last .bin that landed and loaded
+
+// Every request goes through one of the handlers registered in begin(), and each one starts
+// here. It is what the idle timeout counts from: a browser sitting on the editor page is not
+// activity, a browser asking for something is.
+void touched() { request_at = millis(); }
 
 // Upload state. The handler is called chunk by chunk from loop(), never concurrently.
 // Named `state`, not `upload`: a variable with the same name as the enclosing namespace
@@ -239,6 +246,7 @@ bool serveFromFs(String path) {
 }
 
 void handleStatus() {
+  touched();
   String json = "{\"status\":" + String(int(runtime_->status()));
   json += ",\"loaded\":" + String(runtime_->hasProgram() ? "true" : "false");
   json += ",\"instructions\":" + String(runtime_->instructionCount());
@@ -307,6 +315,7 @@ bool beginWrite() {
 
 // Streams the upload straight into flash.
 void handleUploadChunk() {
+  touched();
   HTTPUpload& chunk = server.upload();
 
   if (chunk.status == UPLOAD_FILE_START) {
@@ -325,6 +334,7 @@ void handleUploadChunk() {
 }
 
 void handleUploadDone() {
+  touched();
   last_failed = state.failed || state.declared == 0;
   if (state.failed) {
     server.send(400, "text/plain", String("upload rejected: ") + state.error);
@@ -344,6 +354,7 @@ void handleUploadDone() {
                     "). The head is showing its test pattern.");
     return;
   }
+  upload_at = millis();
   server.send(200, "text/plain",
               String("ok - ") + state.declared + " bytes stored and running: " +
                   runtime_->instructionCount() + " instructions, " + runtime_->assetCount() +
@@ -418,6 +429,7 @@ bool receiveOverSerial(ProtoShadeRuntime& runtime) {
     return false;
   }
   last_failed = false;
+  upload_at = millis();
   Serial.printf("psflash done %lu bytes, %u instructions, %u images, %u sensor slots\n",
                 (unsigned long)declared, runtime_->instructionCount(), runtime_->assetCount(),
                 runtime_->sensorCount());
@@ -448,11 +460,15 @@ bool begin(ProtoShadeRuntime& runtime, const char* ap_ssid, const char* ap_passw
   address_ = WiFi.softAPIP().toString();
   Serial.printf("upload mode: join %s, open http://%s/\n", ap_ssid, address_.c_str());
 
-  server.on("/upload", HTTP_GET, []() { server.send_P(200, "text/html", kUploadPage); });
+  server.on("/upload", HTTP_GET, []() {
+    touched();
+    server.send_P(200, "text/html", kUploadPage);
+  });
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/program.bin", HTTP_POST, handleUploadDone, handleUploadChunk);
   // Anything else: the editor out of LittleFS, or a pointer at the upload page.
   server.onNotFound([]() {
+    touched();
     if (serveFromFs(server.uri())) return;
     if (server.uri() == "/") {
       server.send_P(200, "text/html", kUploadPage);
@@ -461,10 +477,28 @@ bool begin(ProtoShadeRuntime& runtime, const char* ap_ssid, const char* ap_passw
     server.send(404, "text/plain", "not found - try /upload");
   });
   server.begin();
+  // So the idle timeout counts from here rather than from boot: a head that has just come up
+  // in upload mode has not been idle for as long as it has been powered.
+  request_at = millis();
+  upload_at = 0;
   return true;
 }
 
 void handle() { server.handleClient(); }
+
+void end() {
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  // The editor is a megabyte of LittleFS cache the render tasks would rather have. The
+  // mapping is NOT touched: the runtime is about to render out of it again.
+  LittleFS.end();
+  address_ = "";
+}
+
+uint32_t lastRequestAt() { return request_at; }
+
+uint32_t lastUploadAt() { return upload_at; }
 
 bool lastUploadFailed() { return last_failed; }
 

@@ -14,6 +14,7 @@ class WiFiStub {
 public:
   void mode(WiFiMode) {}
   void softAP(const char*, const char*) {}
+  bool softAPdisconnect(bool = false) { return true; }
   IPAddress softAPIP() { return IPAddress(); }
   int status() { return 0; }
 };

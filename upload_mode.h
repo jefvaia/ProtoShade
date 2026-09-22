@@ -31,6 +31,20 @@ bool begin(protoshade::ProtoShadeRuntime& runtime, const char* ap_ssid, const ch
 // Call from loop() while in upload mode.
 void handle();
 
+// Takes the web server and the access point back down. The mapped partition is left alone -
+// the runtime is still reading its program out of it - so the caller can restart the
+// renderer straight afterwards and have the face back.
+void end();
+
+// millis() when the server last answered anything. Set by begin(), so "nothing has happened
+// since upload mode started" and "nothing has happened since the last page" read the same.
+uint32_t lastRequestAt();
+
+// millis() when a .bin last landed AND loaded, over WiFi or over USB. 0 when none has this
+// time round - which is never a real timestamp, since a head cannot be in upload mode at
+// millis() == 0.
+uint32_t lastUploadAt();
+
 // Where to point a browser, once begin() has run.
 const char* address();
 
