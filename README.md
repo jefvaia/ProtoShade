@@ -71,6 +71,19 @@ clock operand is therefore required to be frame-uniform, and `load()` refuses a 
 feeds it a pixel coordinate - the compiler refuses it first, with a sentence rather than a
 status code.
 
+Of those four, the rotate and the scale decide whether the fetch happens at all. A swarm
+covers a few texels each on a panel of thousands, so for most pixels most particles are
+simply not there: the sprite is clipped, the fetch would return alpha 0 and the composite
+would leave the register exactly as it found it. Both VMs work out the sprite-local
+coordinate - which the fetch needs anyway - and skip the rest when it falls outside the
+sprite, with one texel of slack so a bilinear fetch can still reach the edge texel. It is
+the same pixel either way, and `test/crosscheck.mjs` holds both implementations to that. On
+the `embers` example at 64x32 it is the difference between 1.9 ms and 0.24 ms a frame.
+
+The budget is unchanged by this: `cost_` still prices every particle at every pixel, because
+that is the worst case and the worst case is what a step limit is for. The skip only makes
+the real frame cheaper than the number `load()` guaranteed.
+
 The runtime has its own `sinCos()` rather than calling `sinf`, for the same reason: the
 browser's `Math.sin` is a double's answer and newlib's is not, and one ulp of difference in a
 rotation puts a sprite's edge on the other side of a texel. The same polynomial in the same
@@ -521,19 +534,25 @@ computer involved. Skip it and `/upload` still works.
 Every two seconds (`STATS_INTERVAL_MS` in `head_config.h`, 0 to silence it) face mode prints:
 
 ```
-stats: 143.2 fps  render 5.94 ms  panels 0.81 ms
+stats: 143.2 fps  render 5.94 ms (2.901 us/px)  halves 2.98 / 2.96 ms  panels 0.81 ms
 ```
 
-Split into the two things that can be the bottleneck, because "it is slow" on its own tells
-you nothing:
+Split into the things that can be the bottleneck, because "it is slow" on its own tells you
+nothing:
 
 - **render** - inside `renderer.render()`, both cores. Big here means the shader is too
-  heavy for this canvas: fewer instructions, or fewer pixels.
+  heavy for this canvas: fewer instructions, or fewer pixels. The `us/px` in brackets says
+  which of the two - a heavy shader raises it, a bigger canvas does not.
+- **halves** - the same render, measured per core: top (core 0) then bottom (core 1). The
+  split is a fixed 50/50, but core 0 also carries `loop()`, the serial port and the push
+  task, so the two are not the same job. A frame costs whatever the *slower* half costs, so
+  the gap between these two numbers is what an uneven split would be worth. Even numbers
+  mean there is nothing there to win.
 - **panels** - blocked in `pusher.submit()`, waiting for the *previous* frame to finish
   going out. Big here means the display driver is the limit, not the shader, and the push
   task is already doing its job of overlapping the two.
 
-Both are per frame, averaged over the window.
+All per frame, averaged over the window.
 
 ### Mirroring the head in the editor
 

@@ -342,6 +342,9 @@ private:
   // Reciprocals, so the per-pixel coordinate is a multiply. The S3 has a single-precision
   // FPU with no divide worth the name; this is the one division that would run per pixel.
   float inv_w_ = 1.0f / 8.0f, inv_h_ = 1.0f / 8.0f;
+  // Aspect for Centered, worked out here rather than in the pixel loop, where it was the
+  // one division every pixel of every shader that uses centred coordinates paid for.
+  float aspect_ = 1.0f;
   mutable uint32_t frame_index_ = 0;  // only touched by beginFrame(), never while rendering
   Status status_ = Status::NoProgram;
 };

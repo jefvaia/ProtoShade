@@ -34,6 +34,12 @@ public:
   // Step budget handed to both halves (see ExecContext).
   void setStepLimit(uint32_t limit) { step_limit_ = limit; }
 
+  // Microseconds the given half spent inside renderRows() on the last frame - the wait for
+  // the other half is not in it. The split is a fixed 50/50 and core 0 has the rest of the
+  // system on it, so a frame costs whatever the SLOWER half costs: these two numbers are
+  // how far apart they actually are, which is the thing to know before splitting unevenly.
+  uint32_t halfMicros(uint8_t index) const { return index < 2 ? halves_[index].last_us : 0; }
+
 private:
   struct Half {
     ParallelRenderer* owner;
@@ -41,6 +47,7 @@ private:
     TaskHandle_t task;
     SemaphoreHandle_t start;
     ExecContext ctx;            // per-core scratch, never shared
+    uint32_t last_us;           // time in renderRows() on the last frame
   };
 
   static void taskEntry(void* arg);

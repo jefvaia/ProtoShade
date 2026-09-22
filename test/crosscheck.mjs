@@ -376,6 +376,32 @@ check(
 );
 check("particles:empty", graph([[1, "texture/particles", emitter({ count: 0 }), null, null], out(2, 10)], { 10: [1, 0] }));
 
+// The slack on "is this pixel inside the sprite at all". Both VMs skip a particle before
+// fetching when the pixel falls outside its sprite, and both leave one texel of margin,
+// because a linear fetch a hair outside 0..1 still reaches the edge texel. Too tight and a
+// sprite loses its outline - on a 2x2 image the outline is most of the sprite. Big, slow,
+// overlapping sprites, so plenty of them also hang off the edge of the panel.
+for (const filter of ["nearest", "linear"]) {
+  check(
+    `particles:edges:${filter}`,
+    graph(
+      [
+        [
+          1,
+          "texture/particles",
+          emitter({ count: 24, filter, size: 0.9, sizeSpread: 0.5, spread: 360, speed: 0.3, fade: 0, life: 4, seed: 11 }),
+          null,
+          null,
+        ],
+        out(2, 10),
+      ],
+      { 10: [1, 0] },
+    ),
+    new Map([[1, testImage(2, 2, false)]]),
+    2600,
+  );
+}
+
 // --- bake: the branch is rendered here, the strip is what the head runs -------
 //
 // What is checked is what always mattered: the .bin the bake produces renders the same in
